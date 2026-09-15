@@ -1,0 +1,20 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPathWin": "f:\\esp_idf_6.0.1\\esp_tool\\v6.0.1\\esp-idf",
+  "idf.pythonInstallPath": "f:\\esp_tool\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.portWin": "COM8",
+  "idf.toolsPathWin": "f:\\esp_tool",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "f:\\esp_tool\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=f:\\EmbeddedProject\\MusicPlaySyncSpeakers\\Play_Slave\\build"
+],
+"idf.flashType": "UART"
+}

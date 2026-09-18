@@ -5,11 +5,43 @@
  * 本模块把 ESP32-S3 的 I2S 外设封装为"物理总线"句柄，供上层
  * middlewares/audio_bus 与普通调用方使用。设计要点：
  *
- *   1. 不写死活引脚/采样率/格式：全部通过参数结构体由调用方传入；
+ *   1. 不写死引脚/采样率/格式：全部通过参数结构体由调用方传入；
  *   2. 一个句柄绑定一个 I2S 控制器端口，可创建 TX 或 RX 单向通道；
  *   3. 本层是"裸物理通道"，只做配置、收发、采样率切换；
  *      多生产者/多消费者的同步仲裁放在 middlewares/audio_bus 中；
  *   4. 发送/接收函数内部会校验句柄方向，方向不匹配返回 ESP_ERR_INVALID_ARG。
+ *
+ * 使用示例：
+ * @code
+ *     // 创建 TX 总线（接功放 NS4168）
+ *     i2s_pin_cfg_t txPin = {
+ *         .mclk = -1,
+ *         .bclk = GPIO_NUM_26,
+ *         .ws   = GPIO_NUM_27,
+ *         .dout = GPIO_NUM_13,
+ *         .din  = -1,
+ *         .ws_pol = false,
+ *         .bit_shift = false,
+ *     };
+ *     i2s_bus_cfg_t txCfg = {
+ *         .sample_rate = 44100,
+ *         .bit_width = I2S_DATA_BIT_WIDTH_16BIT,
+ *         .slot_mode = I2S_SLOT_MODE_STEREO,
+ *         .slot_mask = I2S_STD_SLOT_BOTH,
+ *         .dma_desc_num = 8,
+ *         .dma_frame_num = 256,
+ *         .tx_auto_clear = true,
+ *     };
+ *     i2s_bus_handle_t txBus;
+ *     i2s_bus_phy_create(I2S_NUM_1, true, &txPin, &txCfg, &txBus);
+ *
+ *     // 写入 PCM 数据
+ *     size_t written;
+ *     i2s_bus_phy_write(txBus, pcmData, dataSize, &written, pdMS_TO_TICKS(1000));
+ *
+ *     // 销毁
+ *     i2s_bus_phy_destroy(txBus);
+ * @endcode
  *
  * 硬件说明（当前板卡）：
  *   - TX（功放 NS4168）  ：I2S_NUM_1，bclk=GPIO26 ws=GPIO27 dout=GPIO13
@@ -31,40 +63,46 @@ extern "C" {
 
 /* ======================== 类型定义 =============================================== */
 
-/** I2S 物理总线句柄（不透明结构体） */
 /** I2S 控制器端口号（ESP-IDF 6.x 驱动已无此类型，自行定义以兼容旧代码风格） */
 typedef int i2s_port_t;
+
+/** I2S 物理总线句柄（不透明指针，指向 i2s_bus_phy_s 结构体） */
 typedef struct i2s_bus_phy_s *i2s_bus_handle_t;
 
 /**
- * @brief I2S 引脚配置
+ * @brief I2S 引脚配置结构体
  *
- * 未使用的引脚填 -1（I2S_GPIO_UNUSED）。
- * ws_pol / bit_shift 仅对 RX 麦克风需要调整，TX 通常保持默认。
+ * 定义 I2S 总线所需的 GPIO 引脚分配。
+ * 未使用的引脚填 -1（等同于 I2S_GPIO_UNUSED）。
+ *
+ * @note ws_pol / bit_shift 仅对 RX 麦克风需要调整，TX 通常保持默认 false
  */
 typedef struct {
-    int mclk;            /**< 主时钟引脚，一般未使用 */
-    int bclk;            /**< 位时钟引脚 */
-    int ws;              /**< 左右声道时钟引脚 */
-    int dout;            /**< 数据输出引脚（TX，接功放 DIN） */
-    int din;             /**< 数据输入引脚（RX，接麦克风 SD） */
-    bool ws_pol;         /**< WS 极性反转（INMP441 需要 true） */
-    bool bit_shift;      /**< 位偏移 */
+    int mclk;            /**< 主时钟引脚（一般未使用，填 -1） */
+    int bclk;            /**< 位时钟引脚（BCLK/SCK） */
+    int ws;              /**< 左右声道时钟引脚（WS/LRCK） */
+    int dout;            /**< 数据输出引脚（TX 通道，接功放 DIN） */
+    int din;             /**< 数据输入引脚（RX 通道，接麦克风 SD） */
+    bool ws_pol;         /**< WS 极性反转（INMP441 麦克风需要 true） */
+    bool bit_shift;      /**< 位偏移调整（通常保持 false） */
 } i2s_pin_cfg_t;
 
 /**
- * @brief I2S 音频格式与 DMA 配置
+ * @brief I2S 音频格式与 DMA 配置结构体
+ *
+ * 定义 I2S 总线的音频参数和 DMA 缓冲区配置。
+ * 这些参数直接影响音质和系统实时性表现。
  */
 typedef struct {
-    uint32_t sample_rate;                 /**< 采样率（Hz） */
+    uint32_t sample_rate;                 /**< 采样率（Hz），常用 44100/48000 */
     i2s_data_bit_width_t bit_width;       /**< 数据位宽（16/24/32bit） */
-    i2s_slot_mode_t slot_mode;            /**< 单声道/立体声 */
-    i2s_std_slot_mask_t slot_mask;        /**< 槽位掩码（I2S_STD_SLOT_LEFT/RIGHT/BOTH） */
-    bool slot_ws_pol;                     /**< 标准模式槽位 WS 极性（INMP441 通常需要 true） */
+    i2s_slot_mode_t slot_mode;            /**< 声道模式：单声道/立体声 */
+    i2s_std_slot_mask_t slot_mask;        /**< 槽位掩码（LEFT/RIGHT/BOTH） */
+    bool slot_ws_pol;                     /**< 标准模式槽位 WS 极性 */
     bool slot_bit_shift;                  /**< 标准模式槽位位偏移 */
-    int dma_desc_num;                      /**< DMA 描述符数量（建议 8） */
-    int dma_frame_num;                     /**< 每个描述符的帧数（建议 256） */
-    bool tx_auto_clear;                    /**< TX 复用 DMA 时自动清零（推荐 true） */
+    int dma_desc_num;                      /**< DMA 描述符数量（建议 8，影响延迟） */
+    int dma_frame_num;                     /**< 每个描述符的帧数（建议 256，影响缓冲深度） */
+    bool tx_auto_clear;                    /**< TX 复用 DMA 时自动清零（推荐 true，防噪声） */
 } i2s_bus_cfg_t;
 
 /* ======================== API 函数 =============================================== */

@@ -8,7 +8,7 @@ foreach(child ${children})
         list(APPEND MID_INCLUDE_DIRS ${child})
     endif()
 endforeach()
-   
+    
 # 2. 搜集所有的 .c 文件
 file(GLOB_RECURSE SOURCES "*.c")
 
@@ -18,4 +18,4 @@ idf_component_register(
     INCLUDE_DIRS ${MID_INCLUDE_DIRS}
     # Middlewares 的传感器通常需要调用 BSP 层的底层通信逻辑
     REQUIRES bsp
-)
+) 

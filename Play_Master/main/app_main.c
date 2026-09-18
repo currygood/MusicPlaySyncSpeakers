@@ -3,9 +3,14 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_psram.h"
+#include "driver/gpio.h"
+#include "StartAndStop.h"
 
 void app_main(void)
 {
+	SystemStart();
+	StartAndStop_Init();
+
 	if (esp_psram_is_initialized()) {
         printf("PSRAM 初始化成功！可用大小: %d 字节\n", esp_psram_get_size());
     } else {

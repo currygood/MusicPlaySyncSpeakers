@@ -2,11 +2,24 @@
  * @file i2s_driver.c
  * @brief I2S 物理总线驱动实现（句柄化、参数化）
  *
- * 实现说明：
- *   - 每个句柄对应一个 I2S 控制器上的单向通道（TX 或 RX）
- *   - 所有硬件参数（引脚、采样率、位宽、DMA）均来自调用方配置
- *   - write/read 内部校验句柄方向，方向不匹配返回 ESP_ERR_INVALID_ARG
- *   - 本层不做任何锁与仲裁，互斥由上层 audio_bus 负责
+ * 本文件实现 BSP 层 I2S 驱动的所有接口函数：
+ *
+ *   - i2s_bus_phy_create()      ：创建 I2S 物理总线（TX/RX 单向通道）
+ *   - i2s_bus_phy_write()       ：写入 PCM 数据（仅 TX）
+ *   - i2s_bus_phy_read()        ：读取 PCM 数据（仅 RX）
+ *   - i2s_bus_phy_flush()       ：冲刷 DMA 缓冲区
+ *   - i2s_bus_phy_set_sample_rate()：动态切换采样率
+ *   - i2s_bus_phy_destroy()     ：销毁总线释放资源
+ *
+ * 设计要点：
+ *   - 每个句柄对应一个 I2S 控制器上的单向通道（TX 或 RX），一柄一方向；
+ *   - 所有硬件参数（引脚、采样率、位宽、DMA）均来自调用方配置；
+ *   - write/read 内部校验句柄方向，方向不匹配返回 ESP_ERR_INVALID_ARG；
+ *   - 本层不做任何锁与仲裁，互斥由上层 audio_bus 负责。
+ *
+ * 硬件说明（当前板卡）：
+ *   - TX（功放 NS4168）  ：I2S_NUM_1，bclk=GPIO26 ws=GPIO27 dout=GPIO13
+ *   - RX（麦克风 INMP441）: I2S_NUM_0，bclk=GPIO2 ws=GPIO5 din=GPIO34
  */
 
 #include "i2s_driver.h"
@@ -15,31 +28,67 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ======================== 私有宏定义 ============================================= */
+
+/** 日志标签 */
 #define TAG "I2S_PHY"
 
-/** 句柄魔数，用于校验非法/悬空句柄 */
+/**
+ * @brief 句柄魔数，用于校验非法/悬空句柄
+ *
+ * ASCII 码 'I' '2' 'S' 'P' = 0x49325350，
+ * 在 destroy 时清零，防止 use-after-free。
+ */
 #define I2S_PHY_MAGIC 0x49325350u /* 'I2SP' */
 
-/** I2S 物理总线实例 */
+/* ======================== 私有类型定义 =========================================== */
+
+/**
+ * @brief I2S 物理总线实例结构体（不透明句柄）
+ *
+ * 封装 ESP-IDF I2S 通道句柄及配置备份，
+ * 上层通过 i2s_bus_handle_t 不透明指针访问。
+ */
 struct i2s_bus_phy_s {
-    uint32_t magic;            /**< 魔数校验 */
-    i2s_port_t port;           /**< I2S 控制器端口 */
-    bool is_tx;                /**< true=TX 通道，false=RX 通道 */
-    i2s_chan_handle_t chan;    /**< 底层通道句柄 */
-    i2s_pin_cfg_t pin_cfg;     /**< 引脚配置备份 */
-    i2s_bus_cfg_t bus_cfg;     /**< 音频格式配置备份 */
+    uint32_t magic;            /**< 魔数校验（I2S_PHY_MAGIC） */
+    i2s_port_t port;           /**< I2S 控制器端口号 */
+    bool is_tx;                /**< 通道方向：true=TX 发送，false=RX 接收 */
+    i2s_chan_handle_t chan;    /**< ESP-IDF 底层通道句柄 */
+    i2s_pin_cfg_t pin_cfg;     /**< 引脚配置备份（用于日志和重配置） */
+    i2s_bus_cfg_t bus_cfg;     /**< 音频格式与 DMA 配置备份 */
 };
 
-/* ======================== 内部工具 =============================================== */
+/* ======================== 内部工具函数 =========================================== */
 
-/** @brief 校验句柄合法性 */
+/**
+ * @brief 校验句柄合法性
+ *
+ * 检查句柄非 NULL 且魔数匹配，防止悬空指针或已销毁句柄被误用。
+ *
+ * @param bus  待校验的句柄
+ *
+ * @return true  合法句柄
+ * @return false 非法或已销毁句柄
+ */
 static bool i2s_phy_valid(i2s_bus_handle_t bus)
 {
     return (bus != NULL) && (bus->magic == I2S_PHY_MAGIC);
 }
 
-/* ======================== 公共 API ========================================== */
+/* ======================== 公共 API 实现 ========================================== */
 
+/**
+ * @brief 创建 I2S 物理总线
+ *
+ * 完整创建流程：
+ *   1. 参数校验（非空检查、引脚有效性）；
+ *   2. 分配并初始化句柄结构体；
+ *   3. 调用 i2s_new_channel() 创建底层通道；
+ *   4. 调用 i2s_channel_init_std_mode() 配置 Philips 标准模式；
+ *   5. 调用 i2s_channel_enable() 启动时钟。
+ *
+ * 任意步骤失败都会回滚已分配资源。
+ */
 esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
                              const i2s_pin_cfg_t *pin_cfg,
                              const i2s_bus_cfg_t *bus_cfg,
@@ -150,10 +199,17 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
     return ESP_OK;
 }
 
+/**
+ * @brief 写入 PCM 数据（仅限 TX 总线）
+ *
+ * 将 PCM 音频数据通过 DMA 发送到 I2S 外设。
+ * 内部校验句柄合法性及方向（必须是 TX），不匹配则返回错误。
+ *
+ * @note 若 DMA 缓冲区满，会阻塞等待至超时
+ */
 esp_err_t i2s_bus_phy_write(i2s_bus_handle_t bus, const uint8_t *buffer,
                             size_t size, size_t *bytes_written, uint32_t timeout)
 {
-    /* 校验句柄、方向与参数 */
     if (!i2s_phy_valid(bus) || !bus->is_tx || buffer == NULL || size == 0)
     {
         return ESP_ERR_INVALID_ARG;
@@ -161,10 +217,17 @@ esp_err_t i2s_bus_phy_write(i2s_bus_handle_t bus, const uint8_t *buffer,
     return i2s_channel_write(bus->chan, buffer, size, bytes_written, timeout);
 }
 
+/**
+ * @brief 读取 PCM 数据（仅限 RX 总线）
+ *
+ * 从 I2S DMA 接收缓冲区读取音频数据。
+ * 内部校验句柄合法性及方向（必须是 RX），TX 句柄调用此函数返回错误。
+ *
+ * @note 若缓冲区空，会阻塞等待至超时
+ */
 esp_err_t i2s_bus_phy_read(i2s_bus_handle_t bus, uint8_t *buffer,
                            size_t size, size_t *bytes_read, uint32_t timeout)
 {
-    /* 校验句柄、方向与参数 */
     if (!i2s_phy_valid(bus) || bus->is_tx || buffer == NULL || size == 0)
     {
         return ESP_ERR_INVALID_ARG;
@@ -172,13 +235,20 @@ esp_err_t i2s_bus_phy_read(i2s_bus_handle_t bus, uint8_t *buffer,
     return i2s_channel_read(bus->chan, buffer, size, bytes_read, timeout);
 }
 
+/**
+ * @brief 冲刷物理总线（丢弃未处理的数据）
+ *
+ * 通过禁能后重新使能 I2S 通道，清空 DMA 中排队而未播放（TX）
+ * 或未读出（RX）的残留数据。可用于：
+ *   - TX：强制丢弃旧数据，立即播放新数据（抢占切换场景）；
+ *   - RX：清空硬件/DMA 缓冲区，重新开始采集。
+ */
 esp_err_t i2s_bus_phy_flush(i2s_bus_handle_t bus)
 {
     if (!i2s_phy_valid(bus))
     {
         return ESP_ERR_INVALID_ARG;
     }
-    /* 禁能再使能：清空 DMA 中排队而未播放/未读出的数据 */
     esp_err_t ret = i2s_channel_disable(bus->chan);
     if (ret != ESP_OK)
     {
@@ -194,6 +264,17 @@ esp_err_t i2s_bus_phy_flush(i2s_bus_handle_t bus)
     return ESP_OK;
 }
 
+/**
+ * @brief 动态切换采样率（无需销毁重建）
+ *
+ * 实现流程：
+ *   1. 禁能 I2S 通道；
+ *   2. 调用 i2s_channel_reconfig_std_clock() 重新配置时钟；
+ *   3. 重新使能通道；
+ *   4. 更新内部备份的采样率值。
+ *
+ * @note 切换过程中会有短暂静音（禁能→使能间隙）
+ */
 esp_err_t i2s_bus_phy_set_sample_rate(i2s_bus_handle_t bus, uint32_t sample_rate)
 {
     if (!i2s_phy_valid(bus))
@@ -225,6 +306,17 @@ esp_err_t i2s_bus_phy_set_sample_rate(i2s_bus_handle_t bus, uint32_t sample_rate
     return ret;
 }
 
+/**
+ * @brief 销毁 I2S 物理总线，释放所有资源
+ *
+ * 释放流程：
+ *   1. 校验句柄合法性（NULL 句柄直接返回成功）；
+ *   2. 禁能并删除底层 I2S 通道；
+ *   3. 清零魔数（防止 use-after-free）；
+ *   4. 释放句柄结构体内存。
+ *
+ * @note 销毁后原句柄指针变为悬空，调用方应置 NULL
+ */
 esp_err_t i2s_bus_phy_destroy(i2s_bus_handle_t bus)
 {
     if (bus == NULL)

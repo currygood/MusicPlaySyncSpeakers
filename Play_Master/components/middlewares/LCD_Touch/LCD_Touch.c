@@ -4,12 +4,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
+#include <stdio.h>
 
 static const char *TAG = "LCD_Touch";
 static Spi_Handle_t LcdSpiHandle;
 static i2c_master_dev_handle_t Ft6336I2cHandle = NULL;
 static TaskHandle_t TouchTaskHandle = NULL;
 static Touch_Point_t LastTouchData = {0};
+static uint32_t s_touchReadFailCount = 0;   /* 连续读失败计数，用于限流打印 */
 
 
 /**
@@ -120,6 +122,7 @@ static void LCD_Hardware_Reset(void)
  * 并在中断处理完成后返回到主任务。
  * @param arg 未使用参数，保持与中断服务函数签名一致
  */
+#if LCD_TOUCH_FT6336_INT >= 0
 static void IRAM_ATTR LCD_TOUCH_FT6336G_Int_Isr_Handler(void *arg)
 {
     BaseType_t highPriorityTaskWoken = pdFALSE;
@@ -129,6 +132,7 @@ static void IRAM_ATTR LCD_TOUCH_FT6336G_Int_Isr_Handler(void *arg)
         portYIELD_FROM_ISR();
     }
 }
+#endif
 
 /**
  * @brief 处理LCD_TOUCH_FT6336G触摸事件的任务
@@ -149,7 +153,8 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
 
     while(1)
     {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        /* CTP_INT 未接（轮询模式）：定时唤醒读点；以后若接上 INT，notify 仍可立即唤醒 */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
 
         if(Ft6336I2cHandle == NULL)
         {
@@ -163,8 +168,17 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
         esp_err_t ret = I2c_Read_Bytes(Ft6336I2cHandle, LCD_TOUCH_FT6336G_REG_TD_STATUS, touchBuf, sizeof(touchBuf));
         if(ret != ESP_OK)
         {
+            /* 读失败（如芯片忙/总线被拖住）：清除假的按下状态，限流打印 */
+            LastTouchData.touchCount = 0;
+            s_touchReadFailCount++;
+            if(s_touchReadFailCount == 1 || s_touchReadFailCount % 50 == 0)
+            {
+                ESP_LOGW(TAG, "[FT6336G] read fail #%lu: %s",
+                         (unsigned long)s_touchReadFailCount, esp_err_to_name(ret));
+            }
             continue;
         }
+        s_touchReadFailCount = 0;
 
         uint8_t touchCount = touchBuf[0] & 0x0F;
         uint8_t eventFlag = (touchBuf[1] >> 6) & 0x03;
@@ -178,10 +192,13 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
 
 			// ESP_LOGI(TAG, "Touch point: (%d, %d)", rawX, rawY);
 
-            if(rawX <= LCD_WIDTH && rawY <= LCD_HEIGHT)
+            if(rawX <= 240 && rawY <= 320)   /* 触摸屏原始 240x320(竖屏) */
             {
-                LastTouchData.touchX = rawX;
-                LastTouchData.touchY = rawY;
+                
+                /* 原始触摸坐标 -> 横屏显示坐标(320x240)：
+                 * 实测角点 左上角(0,320)->(0,0)、右下角(240,0)->(319,239) */
+                LastTouchData.touchX = (rawY >= 320) ? 0 : (319 - rawY);   // 0..319 左->右
+                LastTouchData.touchY = (rawX >= 240) ? 239 : rawX;         // 0..239 上->下
             }
         }
         else	// 无触摸事件
@@ -212,6 +229,7 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
  */
 static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
 {
+#if LCD_TOUCH_FT6336_RST != LCD_TOUCH_SPI_RST
     ESP_LOGI(TAG, "[FT6336G] Step 1: Hardware reset...");
 
     gpio_config_t rstConf = {
@@ -225,6 +243,10 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
     gpio_set_level((gpio_num_t)LCD_TOUCH_FT6336_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
     ESP_LOGI(TAG, "[FT6336G] Step 1: Reset complete");
+#else
+    /* CTP_RST 与 LCD_RST 共用 GPIO25：LCD 复位时已同时复位触摸，这里不能再拉低 */
+    ESP_LOGI(TAG, "[FT6336G] Step 1: reset shared with LCD_RST, skip");
+#endif
 
     if(i2cBusHandle == NULL)
     {
@@ -270,6 +292,7 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
     }
     ESP_LOGI(TAG, "[FT6336G] Step 4: Registers configured successfully");
 
+#if LCD_TOUCH_FT6336_INT >= 0
     ESP_LOGI(TAG, "[FT6336G] Step 5: Setting up interrupt (GPIO%d)...", LCD_TOUCH_FT6336_INT);
 
     gpio_install_isr_service(0);
@@ -285,6 +308,9 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
     gpio_isr_handler_add((gpio_num_t)LCD_TOUCH_FT6336_INT, LCD_TOUCH_FT6336G_Int_Isr_Handler, NULL);
     gpio_intr_enable((gpio_num_t)LCD_TOUCH_FT6336_INT);
     ESP_LOGI(TAG, "[FT6336G] Step 5: Interrupt configured (falling edge)");
+#else
+    ESP_LOGI(TAG, "[FT6336G] Step 5: INT not wired, polling every 20ms");
+#endif
 
     ESP_LOGI(TAG, "[FT6336G] Step 6: Creating touch processing task...");
     xTaskCreatePinnedToCore(LCD_TOUCH_FT6336G_Process_Task, "Touch_Task", 8192, NULL, 3, &TouchTaskHandle, 0);
@@ -624,7 +650,7 @@ void LCD_TOUCH_Init(i2c_master_bus_handle_t i2cBusHandle)
     // MV=1: X/Y轴交换（横屏模式）
     // BGR=1: 红蓝颜色通道交换（硬件要求）
     LCD_Write_Cmd(ILI9341_MADCTL);
-    LCD_Write_Data(MADCTL_MV | MADCTL_BGR);
+    LCD_Write_Data(MADCTL_MV | MADCTL_BGR | MADCTL_MX | MADCTL_MY);
 
     // 像素格式设置：配置为16位RGB565模式（每个像素2字节）
     LCD_Write_Cmd(ILI9341_PIXFMT);
@@ -739,3 +765,239 @@ TaskHandle_t LCD_TOUCH_FT6336G_Get_Task_Handle(void)
 {
     return TouchTaskHandle;
 }
+
+#if LCD_TOUCH_SELF_TEST    /* 无 LVGL 时的点亮/触摸自测；接入 LVGL 后改 0 → 整段不编译 */
+/* ======================== LCD + 触摸屏测试（不用 LVGL） =========================
+ * 显示一行字并轮询触摸：按下时屏幕显示坐标 + 画色块，松开恢复。
+ * 注意：LCD 的 SPI 与 SD 卡共用总线，且触摸 I2C 的 SDA 与 SD 卡 MISO
+ * 都在 GPIO21，本测试与 SD 卡测试不能同时跑。
+ */
+static const uint8_t Lcd_Test_Font5x7[95][5] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00}, /* ' ' 0x20 */
+    {0x00, 0x00, 0x5F, 0x00, 0x00}, /* ! */
+    {0x00, 0x07, 0x00, 0x07, 0x00}, /* " */
+    {0x14, 0x7F, 0x14, 0x7F, 0x14}, /* # */
+    {0x24, 0x2A, 0x7F, 0x2A, 0x12}, /* $ */
+    {0x23, 0x13, 0x08, 0x64, 0x62}, /* % */
+    {0x36, 0x49, 0x55, 0x22, 0x50}, /* & */
+    {0x00, 0x05, 0x03, 0x00, 0x00}, /* ' */
+    {0x00, 0x1C, 0x22, 0x41, 0x00}, /* ( */
+    {0x00, 0x41, 0x22, 0x1C, 0x00}, /* ) */
+    {0x14, 0x08, 0x3E, 0x08, 0x14}, /* * */
+    {0x08, 0x08, 0x3E, 0x08, 0x08}, /* + */
+    {0x00, 0x50, 0x30, 0x00, 0x00}, /* , */
+    {0x08, 0x08, 0x08, 0x08, 0x08}, /* - */
+    {0x00, 0x60, 0x60, 0x00, 0x00}, /* . */
+    {0x20, 0x10, 0x08, 0x04, 0x02}, /* / */
+    {0x3E, 0x51, 0x49, 0x45, 0x3E}, /* 0 */
+    {0x00, 0x42, 0x7F, 0x40, 0x00}, /* 1 */
+    {0x42, 0x61, 0x51, 0x49, 0x46}, /* 2 */
+    {0x21, 0x41, 0x45, 0x4B, 0x31}, /* 3 */
+    {0x18, 0x14, 0x12, 0x7F, 0x10}, /* 4 */
+    {0x27, 0x45, 0x45, 0x45, 0x39}, /* 5 */
+    {0x3C, 0x4A, 0x49, 0x49, 0x30}, /* 6 */
+    {0x01, 0x71, 0x09, 0x05, 0x03}, /* 7 */
+    {0x36, 0x49, 0x49, 0x49, 0x36}, /* 8 */
+    {0x06, 0x49, 0x49, 0x29, 0x1E}, /* 9 */
+    {0x00, 0x36, 0x36, 0x00, 0x00}, /* : */
+    {0x00, 0x56, 0x36, 0x00, 0x00}, /* ; */
+    {0x00, 0x08, 0x14, 0x22, 0x41}, /* < */
+    {0x14, 0x14, 0x14, 0x14, 0x14}, /* = */
+    {0x41, 0x22, 0x14, 0x08, 0x00}, /* > */
+    {0x02, 0x01, 0x51, 0x09, 0x06}, /* ? */
+    {0x32, 0x49, 0x79, 0x41, 0x3E}, /* @ */
+    {0x7E, 0x11, 0x11, 0x11, 0x7E}, /* A */
+    {0x7F, 0x49, 0x49, 0x49, 0x36}, /* B */
+    {0x3E, 0x41, 0x41, 0x41, 0x22}, /* C */
+    {0x7F, 0x41, 0x41, 0x22, 0x1C}, /* D */
+    {0x7F, 0x49, 0x49, 0x49, 0x41}, /* E */
+    {0x7F, 0x09, 0x09, 0x01, 0x01}, /* F */
+    {0x3E, 0x41, 0x41, 0x51, 0x32}, /* G */
+    {0x7F, 0x08, 0x08, 0x08, 0x7F}, /* H */
+    {0x00, 0x41, 0x7F, 0x41, 0x00}, /* I */
+    {0x20, 0x40, 0x41, 0x3F, 0x01}, /* J */
+    {0x7F, 0x08, 0x14, 0x22, 0x41}, /* K */
+    {0x7F, 0x40, 0x40, 0x40, 0x40}, /* L */
+    {0x7F, 0x02, 0x04, 0x02, 0x7F}, /* M */
+    {0x7F, 0x04, 0x08, 0x10, 0x7F}, /* N */
+    {0x3E, 0x41, 0x41, 0x41, 0x3E}, /* O */
+    {0x7F, 0x09, 0x09, 0x09, 0x06}, /* P */
+    {0x3E, 0x41, 0x51, 0x21, 0x5E}, /* Q */
+    {0x7F, 0x09, 0x19, 0x29, 0x46}, /* R */
+    {0x26, 0x49, 0x49, 0x49, 0x32}, /* S */
+    {0x01, 0x01, 0x7F, 0x01, 0x01}, /* T */
+    {0x3F, 0x40, 0x40, 0x40, 0x3F}, /* U */
+    {0x1F, 0x20, 0x40, 0x20, 0x1F}, /* V */
+    {0x7F, 0x20, 0x18, 0x20, 0x7F}, /* W */
+    {0x63, 0x14, 0x08, 0x14, 0x63}, /* X */
+    {0x03, 0x04, 0x78, 0x04, 0x03}, /* Y */
+    {0x61, 0x51, 0x49, 0x45, 0x43}, /* Z */
+    {0x00, 0x00, 0x7F, 0x41, 0x41}, /* [ */
+    {0x02, 0x04, 0x08, 0x10, 0x20}, /* \ */
+    {0x41, 0x41, 0x7F, 0x00, 0x00}, /* ] */
+    {0x04, 0x02, 0x01, 0x02, 0x04}, /* ^ */
+    {0x40, 0x40, 0x40, 0x40, 0x40}, /* _ */
+    {0x00, 0x01, 0x02, 0x04, 0x00}, /* ` */
+    {0x20, 0x54, 0x54, 0x54, 0x78}, /* a */
+    {0x7F, 0x48, 0x44, 0x44, 0x38}, /* b */
+    {0x38, 0x44, 0x44, 0x44, 0x20}, /* c */
+    {0x38, 0x44, 0x44, 0x48, 0x7F}, /* d */
+    {0x38, 0x54, 0x54, 0x54, 0x18}, /* e */
+    {0x08, 0x7E, 0x09, 0x01, 0x02}, /* f */
+    {0x08, 0x14, 0x54, 0x54, 0x3C}, /* g */
+    {0x7F, 0x08, 0x04, 0x04, 0x78}, /* h */
+    {0x00, 0x44, 0x7D, 0x40, 0x00}, /* i */
+    {0x20, 0x40, 0x44, 0x3D, 0x00}, /* j */
+    {0x00, 0x7F, 0x10, 0x28, 0x44}, /* k */
+    {0x00, 0x41, 0x7F, 0x40, 0x00}, /* l */
+    {0x7C, 0x04, 0x18, 0x04, 0x78}, /* m */
+    {0x7C, 0x08, 0x04, 0x04, 0x78}, /* n */
+    {0x38, 0x44, 0x44, 0x44, 0x38}, /* o */
+    {0x7C, 0x14, 0x14, 0x14, 0x08}, /* p */
+    {0x08, 0x14, 0x14, 0x18, 0x7C}, /* q */
+    {0x7C, 0x08, 0x04, 0x04, 0x08}, /* r */
+    {0x48, 0x54, 0x54, 0x54, 0x20}, /* s */
+    {0x04, 0x3F, 0x44, 0x40, 0x20}, /* t */
+    {0x3C, 0x40, 0x40, 0x20, 0x7C}, /* u */
+    {0x1C, 0x20, 0x40, 0x20, 0x1C}, /* v */
+    {0x3C, 0x40, 0x30, 0x40, 0x3C}, /* w */
+    {0x44, 0x28, 0x10, 0x28, 0x44}, /* x */
+    {0x0C, 0x50, 0x50, 0x50, 0x3C}, /* y */
+    {0x44, 0x64, 0x54, 0x4C, 0x44}, /* z */
+    {0x00, 0x08, 0x36, 0x41, 0x00}, /* { */
+    {0x00, 0x00, 0x7F, 0x00, 0x00}, /* | */
+    {0x00, 0x41, 0x36, 0x08, 0x00}, /* } */
+    {0x08, 0x08, 0x2A, 0x1C, 0x08}, /* ~ */
+};
+
+/** 在指定位置画一个字符（含背景色，便于整行刷新） */
+static void Lcd_Test_Draw_Char(uint16_t x, uint16_t y, char ch,
+                               uint16_t fg, uint16_t bg, uint8_t scale)
+{
+    static uint16_t cellBuf[5 * 4 * 7 * 4];
+
+    if (ch < 0x20 || ch > 0x7E)
+    {
+        ch = ' ';
+    }
+    if (scale < 1 || scale > 4)
+    {
+        scale = 1;
+    }
+
+    const uint8_t *glyph = Lcd_Test_Font5x7[ch - 0x20];
+    uint32_t n = 0;
+    for (uint8_t row = 0; row < 7; row++)
+    {
+        for (uint8_t sy = 0; sy < scale; sy++)
+        {
+            for (uint8_t col = 0; col < 5; col++)
+            {
+                uint16_t color = (glyph[col] & (1 << row)) ? fg : bg;
+                for (uint8_t sx = 0; sx < scale; sx++)
+                {
+                    cellBuf[n++] = color;
+                }
+            }
+        }
+    }
+
+    LCD_Set_Window(x, y, x + 5 * scale - 1, y + 7 * scale - 1);
+    LCD_Write_PixelData(cellBuf, n);
+}
+
+/** 画一行 ASCII 字符串 */
+static void Lcd_Test_Draw_String(uint16_t x, uint16_t y, const char *str,
+                                 uint16_t fg, uint16_t bg, uint8_t scale)
+{
+    while (*str)
+    {
+        Lcd_Test_Draw_Char(x, y, *str++, fg, bg, scale);
+        x += 6 * scale;
+    }
+}
+
+/** 在触摸点附近画一个 8x8 色块（坐标越界自动收敛到屏内） */
+static void Lcd_Test_Draw_Touch_Block(uint16_t x, uint16_t y, uint16_t color)
+{
+    static uint16_t block[8 * 8];
+
+    if (x > LCD_WIDTH - 8)
+    {
+        x = (x < 4) ? 0 : (LCD_WIDTH - 8);
+    }
+    if (y > LCD_HEIGHT - 8)
+    {
+        y = (y < 4) ? 0 : (LCD_HEIGHT - 8);
+    }
+
+    for (uint32_t i = 0; i < sizeof(block) / sizeof(block[0]); i++)
+    {
+        block[i] = color;
+    }
+    LCD_Set_Window(x, y, x + 7, y + 7);
+    LCD_Write_PixelData(block, sizeof(block) / sizeof(block[0]));
+}
+
+/**
+ * @brief LCD 显示 + 触摸检测测试（不依赖 LVGL）
+ *
+ * 流程：I2C 初始化 -> LCD/触摸初始化 -> 清屏画字 -> 轮询 INT 引脚，
+ * 按下时显示坐标并画色块，松开时恢复提示文字，串口同步打印状态。
+ */
+void Lcd_Touch_Test(void)
+{
+    ESP_LOGI(TAG, "=== LCD + Touch Test Start ===");
+
+    i2c_master_bus_handle_t i2cBus = NULL;
+    esp_err_t err = I2c_Init_Bus(I2C_PORT, (gpio_num_t)I2C_SDA_GPIO,
+                                 (gpio_num_t)I2C_SCL_GPIO, I2C_FREQ, &i2cBus);
+    if (err != ESP_OK || i2cBus == NULL)
+    {
+        ESP_LOGE(TAG, "I2C bus init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    LCD_TOUCH_Init(i2cBus);
+
+    const uint16_t colorBg   = RGB565(0, 0, 0);
+    const uint16_t colorText = RGB565(255, 255, 255);
+    const uint16_t colorOk   = RGB565(0, 255, 0);
+    const uint16_t colorMark = RGB565(255, 0, 0);
+
+    LCD_Fill_Color(colorBg);
+    Lcd_Test_Draw_String(20, 40, "LCD TEST OK", colorText, colorBg, 3);
+    Lcd_Test_Draw_String(20, 120, "TOUCH: --,--", colorOk, colorBg, 2);
+
+    bool lastPressed = false;
+    char line[32];
+    while (1)
+    {
+        /* 触摸任务每 20ms 轮询 FT6336G：按下 touchCount>0，松开自动清零 */
+        Touch_Point_t tp = {0};
+        bool pressed = LCD_TOUCH_FT6336G_Get_Touch_Points(&tp);
+
+        if (pressed != lastPressed)
+        {
+            if (pressed)
+            {
+                ESP_LOGI(TAG, "Touch pressed: x=%u y=%u",
+                         (unsigned)tp.touchX, (unsigned)tp.touchY);
+                snprintf(line, sizeof(line), "TOUCH:%3u,%3u",
+                         (unsigned)tp.touchX, (unsigned)tp.touchY);
+                Lcd_Test_Draw_Touch_Block(tp.touchX, tp.touchY, colorMark);
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Touch released");
+                snprintf(line, sizeof(line), "TOUCH: --,--");
+            }
+            Lcd_Test_Draw_String(20, 120, line, colorOk, colorBg, 2);
+            lastPressed = pressed;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+#endif /* LCD_TOUCH_SELF_TEST */

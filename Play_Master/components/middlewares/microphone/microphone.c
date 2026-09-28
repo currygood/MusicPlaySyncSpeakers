@@ -35,7 +35,7 @@
 /** INMP441 SD（DOUT）数据引脚 */
 #define INMP441_SD_GPIO    34
 
-/** 采集 FIFO 容量：16KB ≈ 64ms @16kHz×4 字节 */
+/** 采集 FIFO 容量：16KB ≈ 93ms @44.1kHz×4 字节 */
 #define MICROPHONE_FIFO_BYTES  (16 * 1024)
 
 /** 麦克风物理引脚配置 */
@@ -49,7 +49,7 @@ static const i2s_pin_cfg_t Mic_PinCfg = {
     .bit_shift = false,
 };
 
-/** 麦克风音频格式：16kHz / 32-bit / 立体声槽位（仅收 RIGHT） */
+/** 麦克风音频格式：44.1kHz / 32-bit / 立体声槽位（仅收 RIGHT） */
 static const i2s_bus_cfg_t Mic_BusCfg = {
     .sample_rate    = MICROPHONE_SAMPLE_RATE,
     .bit_width      = I2S_DATA_BIT_WIDTH_32BIT,

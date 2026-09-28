@@ -10,18 +10,25 @@
 #include "i2c_driver.h"
 
 
-// 模块的引脚定义
-#define LCD_TOUCH_SPI_CS 					1
-#define LCD_TOUCH_SPI_RST 					40
-#define LCD_TOUCH_SPI_RS					42
-#define LCD_TOUCH_SPI_LED					41
-#define LCD_TOUCH_FT6336_INT				48
-#define LCD_TOUCH_FT6336_RST				47
-#define LCD_TOUCH_SD_CS						45
+/* ======================== 调试开关 ========================================== */
+/** 屏上自检测试（无 LVGL 的纯驱动验证）：
+ *  1 = 编译 Lcd_Touch_Test()（main/app_main.c 的自测任务会调用它）；
+ *  0 = 测试代码整体不编译，接入 LVGL 后请改为 0。 */
+#define LCD_TOUCH_SELF_TEST  1
 
 
-#define LCD_WIDTH				240
-#define LCD_HEIGHT				320
+// 模块的引脚定义（主节点 PCB，见 项目文档.md 引脚表）
+#define LCD_TOUCH_SPI_CS 					4
+#define LCD_TOUCH_SPI_RST 					25
+#define LCD_TOUCH_SPI_RS					22
+#define LCD_TOUCH_SPI_LED					23
+#define LCD_TOUCH_FT6336_INT				-1		/* 文档：CTP_INT 不接，触摸用轮询 */
+#define LCD_TOUCH_FT6336_RST				25		/* 与 LCD_RST 共用 GPIO25，触摸初始化时不可再复位 */
+#define LCD_TOUCH_SD_CS						15
+
+
+#define LCD_WIDTH				320
+#define LCD_HEIGHT				240
 
 
 #define LCD_TOUCH_FT6336G_DEV_ADDR                0x38		// FT6636的I2C地址

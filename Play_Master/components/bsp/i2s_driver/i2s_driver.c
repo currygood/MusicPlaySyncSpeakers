@@ -24,6 +24,9 @@
 
 #include "i2s_driver.h"
 #include "esp_log.h"
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+#include "hal/i2s_ll.h"
+#endif
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -180,6 +183,57 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
         return ret;
     }
 
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+    /*
+     * 步骤 2.4：经典 ESP32/ESP32-S2 使用片上 legacy DMA 驱动 I2S，
+     * 必须打开 out_auto_wrback 与 out_eof_mode，否则 DMA 只输出一轮
+     * 就停住，之后 i2s_channel_write() 拿不到 TX 描述符返回 ESP_ERR_TIMEOUT。
+     * （官方 DAC 驱动 dac_dma.c 正是这样配置；新版 I2S 驱动漏配了这两项。）
+     */
+    {
+        i2s_dev_t *hw = I2S_LL_GET_HW((int)port);
+        if (hw != NULL)
+        {
+            i2s_ll_dma_enable_auto_write_back(hw, true);
+            i2s_ll_dma_enable_eof_on_fifo_empty(hw, true);
+        }
+    }
+#endif
+
+    /*
+     * 步骤 2.5：TX 通道预载 DMA 缓冲区（关键步骤，必须在 enable 之前调用）。
+     * 官方例程（i2s_basic/i2s_std）在 i2s_channel_enable() 前会反复调用
+     * i2s_channel_preload_data() 把 DMA 描述符队列预填满：
+     *  - 经典 ESP32 若不预载，DMA 不会持续触发"描述符已发送"中断，
+     *    导致 i2s_channel_write() 第二次写入就返回 ESP_ERR_TIMEOUT
+     *    （现象：第一块能放出 32ms，第二块立即超时）；
+     *  - ESP32-S3 走 GDMA 不受影响，因此同样的代码在 S3 开发板上正常。
+     */
+    if (is_tx)
+    {
+        size_t preload_chunk = 512;
+        uint8_t *preload_zero = calloc(1, preload_chunk);
+        if (preload_zero == NULL)
+        {
+            i2s_del_channel(bus->chan);
+            free(bus);
+            return ESP_ERR_NO_MEM;
+        }
+        size_t loaded = preload_chunk;
+        while (loaded == preload_chunk)
+        {
+            ret = i2s_channel_preload_data(bus->chan, preload_zero, preload_chunk, &loaded);
+            if (ret != ESP_OK)
+            {
+                ESP_LOGE(TAG, "i2s_channel_preload_data failed: %s", esp_err_to_name(ret));
+                free(preload_zero);
+                i2s_del_channel(bus->chan);
+                free(bus);
+                return ret;
+            }
+        }
+        free(preload_zero);
+    }
     /* 步骤 3：使能通道，启动 SCK/WS 时钟 */
     ret = i2s_channel_enable(bus->chan);
     if (ret != ESP_OK)
@@ -190,10 +244,34 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
         return ret;
     }
 
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+    /*
+     * 步骤 3.5：使能后再确认一次 legacy DMA 关键位（保险起见，重复设置无害），
+     * 并打印关键寄存器状态，方便定位 TIMEOUT。
+     */
+    {
+        i2s_dev_t *hw = I2S_LL_GET_HW((int)port);
+        if (hw != NULL)
+        {
+            i2s_ll_dma_enable_auto_write_back(hw, true);
+            i2s_ll_dma_enable_eof_on_fifo_empty(hw, true);
+            ESP_LOGI(TAG, "DMA cfg: lc_conf=0x%08" PRIx32 ", dscr_en=%u, tx_start=%u, link_start=%u",
+                     (uint32_t)hw->lc_conf.val,
+                     (uint32_t)hw->fifo_conf.dscr_en,
+                     (uint32_t)hw->conf.tx_start,
+                     (uint32_t)hw->out_link.start);
+        }
+    }
+#endif
+
     ESP_LOGI(TAG, "I2S phy created: port=%d, %s, sample_rate=%" PRIu32
              ", bclk=%d, ws=%d, dout=%d, din=%d",
              (int)port, is_tx ? "TX" : "RX", bus_cfg->sample_rate,
              pin_cfg->bclk, pin_cfg->ws, pin_cfg->dout, pin_cfg->din);
+    /* BCLK = 采样率 x 总槽数 x 位宽（STD 帧固定 2 槽；MONO 只影响数据重复不影响时钟） */
+    ESP_LOGI(TAG, "BCLK = %" PRIu32 " Hz (fs=%" PRIu32 " x %dch x %u bit)",
+             (uint32_t)bus_cfg->sample_rate * 2 * (uint32_t)bus_cfg->bit_width,
+             (uint32_t)bus_cfg->sample_rate, 2, (uint32_t)bus_cfg->bit_width);
 
     *out_handle = bus;
     return ESP_OK;
@@ -214,8 +292,58 @@ esp_err_t i2s_bus_phy_write(i2s_bus_handle_t bus, const uint8_t *buffer,
     {
         return ESP_ERR_INVALID_ARG;
     }
-    return i2s_channel_write(bus->chan, buffer, size, bytes_written, timeout);
+
+    esp_err_t ret = i2s_channel_write(bus->chan, buffer, size, bytes_written, timeout);
+
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+    /*
+     * 经典 ESP32 的新版 I2S 驱动长跑后会"永久卡死"：
+     * DMA 环里的描述符不再产生 EOF，i2s_channel_write() 拿不到空闲缓冲
+     * 持续返回 ESP_ERR_TIMEOUT（日志现象：开始几百块正常，之后全超时）。
+     * 此处每次超时都做一次标准 flush（disable→enable，与官方 flush 一致）
+     * 让 DMA 描述符环重新转起来，并立即重试一次；仍失败则返回超时。
+     */
+    if (ret == ESP_ERR_TIMEOUT)
+    {
+        ESP_LOGW(TAG, "tx timeout, restarting channel and retrying...");
+        if (i2s_channel_disable(bus->chan) == ESP_OK &&
+            i2s_channel_enable(bus->chan) == ESP_OK)
+        {
+            ret = i2s_channel_write(bus->chan, buffer, size, bytes_written, timeout);
+            if (ret == ESP_OK)
+            {
+                ESP_LOGW(TAG, "tx recovered after channel restart");
+            }
+        }
+    }
+#endif
+    return ret;
 }
+
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+void i2s_bus_phy_debug_dma(i2s_bus_handle_t bus)
+{
+    if (!i2s_phy_valid(bus))
+    {
+        return;
+    }
+    i2s_dev_t *hw = I2S_LL_GET_HW((int)bus->port);
+    if (hw == NULL)
+    {
+        return;
+    }
+    uint32_t eof_addr = 0;
+    i2s_ll_tx_get_eof_des_addr(hw, &eof_addr);
+    uint32_t intr = (uint32_t)i2s_ll_get_intr_status(hw);
+    ESP_LOGI(TAG, "[dbg] intr=0x%08" PRIx32 " (out_eof=%u) eof_desc=0x%" PRIx32
+                  " dscr_en=%u tx_start=%u link_start=%u lc_conf=0x%08" PRIx32,
+             intr, (uint32_t)((intr & I2S_LL_EVENT_TX_EOF) ? 1 : 0), eof_addr,
+             (uint32_t)hw->fifo_conf.dscr_en,
+             (uint32_t)hw->conf.tx_start,
+             (uint32_t)hw->out_link.start,
+             (uint32_t)hw->lc_conf.val);
+}
+#endif
 
 /**
  * @brief 读取 PCM 数据（仅限 RX 总线）

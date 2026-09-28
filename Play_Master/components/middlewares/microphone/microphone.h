@@ -7,8 +7,8 @@
 
 /* ======================== 麦克风音频配置 ========================================= */
 
-/** 音频采样率（Hz）：16kHz，满足语音频段需求（0~8kHz） */
-#define MICROPHONE_SAMPLE_RATE    16000
+/** 音频采样率（Hz）：44.1kHz，与全链路（audio_bus）统一 */
+#define MICROPHONE_SAMPLE_RATE    44100
 
 /** I2S 接收位深度：32-bit（INMP441 输出 24-bit 数据，I2S 标准以 32-bit 对齐） */
 #define MICROPHONE_BIT_DEPTH      32
@@ -104,7 +104,7 @@ esp_err_t Microphone_Read_Raw(uint8_t *buffer, size_t size, size_t *bytes_read, 
  * 高 24 位中。取高 16 位（右移 16 位）即可获得有效的 16-bit PCM 数据。
  *
  * 数据格式：
- *   - 采样率：16kHz
+ *   - 采样率：44.1kHz
  *   - 位深度：16-bit
  *   - 通道数：1（单声道）
  *

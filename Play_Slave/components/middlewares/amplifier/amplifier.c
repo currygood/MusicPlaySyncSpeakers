@@ -27,6 +27,9 @@ static const char *TAG = "AMPLIFIER";  /* 日志标签 */
 static audio_bus_handle_t Amp_Bus = NULL;
 static audio_writer_handle_t Amp_Writer = NULL;
 
+/* 当前软件音量（0~100），默认 80% */
+static uint8_t Amplifier_Volume = 80;
+
 /* ======================== 硬编码引脚与格式配置 ==================================== */
 
 /** I2S TX 位时钟 GPIO（BCLK 接 NS4168 BCLK） */
@@ -49,7 +52,7 @@ static const i2s_pin_cfg_t Amp_PinCfg = {
     .bit_shift = false,
 };
 
-/** 功放音频格式：16kHz / 16-bit / 单声道 */
+/** 功放音频格式：44.1kHz / 16-bit / 单声道 */
 static const i2s_bus_cfg_t Amp_BusCfg = {
     .sample_rate    = AMPLIFIER_SAMPLE_RATE,
     .bit_width      = I2S_DATA_BIT_WIDTH_16BIT,
@@ -146,4 +149,20 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
         *bytes_written = samples * sizeof(int16_t);
     }
     return ESP_OK;
+}
+
+esp_err_t Amplifier_Set_Volume(uint8_t volume)
+{
+    if (volume > AMPLIFIER_VOLUME_MAX)
+    {
+        volume = AMPLIFIER_VOLUME_MAX;
+    }
+    Amplifier_Volume = volume;
+    ESP_LOGI(TAG, "Volume set to %d%%", Amplifier_Volume);
+    return ESP_OK;
+}
+
+uint8_t Amplifier_Get_Volume(void)
+{
+    return Amplifier_Volume;
 }

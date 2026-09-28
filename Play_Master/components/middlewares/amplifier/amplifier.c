@@ -18,6 +18,7 @@
 #include "amplifier.h"
 #include "audio_bus.h"
 #include "esp_log.h"
+#include "i2s_driver.h"
 
 /* ======================== 模块静态变量 =========================================== */
 
@@ -52,16 +53,17 @@ static const i2s_pin_cfg_t Amp_PinCfg = {
     .bit_shift = false,
 };
 
-/** 功放音频格式：16kHz / 16-bit / 单声道 */
+/** 功放音频格式：44.1kHz / 16-bit / 双声道（L/R 槽写同一份，NS4168 单声道） */
 static const i2s_bus_cfg_t Amp_BusCfg = {
     .sample_rate    = AMPLIFIER_SAMPLE_RATE,
     .bit_width      = I2S_DATA_BIT_WIDTH_16BIT,
-    .slot_mode      = I2S_SLOT_MODE_MONO,
+    /* STEREO: duplicate the same frame into both L/R slots */
+    .slot_mode      = I2S_SLOT_MODE_STEREO,
     .slot_mask      = I2S_STD_SLOT_LEFT | I2S_STD_SLOT_RIGHT,
     .slot_ws_pol    = false,
     .slot_bit_shift = true,    /* Philips 标准默认行为（保持与原驱动一致） */
-    .dma_desc_num   = 8,
-    .dma_frame_num  = 256,
+    .dma_desc_num   = 16,       /* 增大 DMA 描述符数量 */
+    .dma_frame_num  = 512,      /* 增大每帧采样数 */
     .tx_auto_clear  = true,
 };
 
@@ -133,9 +135,9 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
 
     /*
      * 通过音频总线写入（原子块，默认 BLOCK 策略）：
-     *  PCM 为 16-bit 单声道，采样数 = 字节数 / 2
+     *  PCM 为 16-bit 双声道（L/R 槽各一份），帧数 = size / (2 x 2B)
      */
-    size_t samples = size / sizeof(int16_t);
+    size_t samples = size / (sizeof(int16_t) * AMPLIFIER_CHANNEL_NUM);
     esp_err_t ret = audio_writer_write(Amp_Writer, (const int16_t *)buffer,
                                        samples, timeout, AUDIO_WRITE_BLOCK);
     if (ret != ESP_OK)
@@ -145,9 +147,18 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
     }
     if (bytes_written != NULL)
     {
-        *bytes_written = samples * sizeof(int16_t);
+        *bytes_written = size;
     }
     return ESP_OK;
+}
+
+void Amplifier_Debug_DMA(void)
+{
+    i2s_bus_handle_t phy = audio_bus_get_phy(Amp_Bus);
+    if (phy != NULL)
+    {
+        i2s_bus_phy_debug_dma(phy);
+    }
 }
 
 esp_err_t Amplifier_Set_Volume(uint8_t volume)

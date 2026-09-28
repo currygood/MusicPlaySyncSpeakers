@@ -28,14 +28,14 @@
 
 /* ======================== 功放音频配置 =========================================== */
 
-/** 音频采样率（Hz）：16kHz，满足语音频段需求（0~8kHz） */
-#define AMPLIFIER_SAMPLE_RATE  16000
+/** 音频采样率（Hz）：44.1kHz，与全链路（audio_bus）统一 */
+#define AMPLIFIER_SAMPLE_RATE  44100
 
 /** 音频位深度：16-bit，每个采样点 2 字节 */
 #define AMPLIFIER_BIT_DEPTH    16
 
-/** 音频通道数：1（单声道），语音播放不需要立体声 */
-#define AMPLIFIER_CHANNEL_NUM  1
+/* 音频通道数：2（双声道，L/R 槽写同一份数据，兼容 NS4168 两种接法） */
+#define AMPLIFIER_CHANNEL_NUM  2
 
 /** 最大音量值（百分比），范围 0~100 */
 #define AMPLIFIER_VOLUME_MAX   100
@@ -76,13 +76,21 @@ esp_err_t Amplifier_Deinit(void);
  * @param buffer        指向 PCM 音频数据的指针（16-bit 单声道，小端字节序）
  * @param size          缓冲区大小（字节）
  * @param bytes_written 输出参数，返回实际写入的字节数（可为 NULL）
- * @param timeout       超时时间（FreeRTOS tick 数），若 I2S DMA 缓冲区满则等待
+ * @param timeout       超时时间（毫秒），若 I2S DMA 缓冲区满则等待
  *
  * @return ESP_OK             播放成功
  *         ESP_ERR_INVALID_ARG buffer 为 NULL 或 size 为 0
  *         ESP_FAIL            I2S 写入失败
  */
 esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *bytes_written, uint32_t timeout);
+
+/**
+ * @brief 打印功放 I2S 物理层的 DMA 调试寄存器（仅 ESP32/ESP32-S2）
+ *
+ * 用于解决 i2s_channel_write() 返回 ESP_ERR_TIMEOUT 时，
+ * 确认 legacy DMA 是否在运行、EOF 中断是否产生。
+ */
+void Amplifier_Debug_DMA(void);
 
 /**
  * @brief 设置功放音量

@@ -7,8 +7,8 @@
 
 // --- I2C硬件配置宏 ---
 #define I2C_PORT I2C_NUM_0
-#define I2C_SDA_GPIO 21
-#define I2C_SCL_GPIO 20
+#define I2C_SDA_GPIO 32
+#define I2C_SCL_GPIO 33
 #define I2C_FREQ 100000
 
 // I2C 总线句柄

@@ -9,6 +9,7 @@
  * 核心功能：
  *   - 初始化：配置 I2S TX 接口（I2S_NUM_1），启动时钟输出
  *   - 播放：将 PCM 16-bit 单声道音频数据通过 I2S 发送到 NS4168
+ *   - 音量：软件音量保存/查询（播放链路写 PCM 时应用，供主节点 SYNC_CMD_VOLUME 落地）
  *
  * 硬件连接（I2S TX）：
  *   - BCLK  GPIO8  （I2S 位时钟，Bit Clock）
@@ -27,14 +28,20 @@
 
 /* ======================== 功放音频配置 =========================================== */
 
-/** 音频采样率（Hz）：16kHz，满足语音频段需求（0~8kHz） */
-#define AMPLIFIER_SAMPLE_RATE  16000
+/** 音频采样率（Hz）：44.1kHz，与全链路（audio_bus）统一 */
+#define AMPLIFIER_SAMPLE_RATE  44100
 
 /** 音频位深度：16-bit，每个采样点 2 字节 */
 #define AMPLIFIER_BIT_DEPTH    16
 
 /** 音频通道数：1（单声道），语音播放不需要立体声 */
 #define AMPLIFIER_CHANNEL_NUM  1
+
+/** 最大音量值（百分比），范围 0~100 */
+#define AMPLIFIER_VOLUME_MAX   100
+
+/** 最小音量值（百分比），0 表示静音 */
+#define AMPLIFIER_VOLUME_MIN   0
 
 /* ======================== API 函数 =============================================== */
 
@@ -76,5 +83,21 @@ esp_err_t Amplifier_Deinit(void);
  *         ESP_FAIL            I2S 写入失败
  */
 esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *bytes_written, uint32_t timeout);
+
+/**
+ * @brief 设置功放音量（软件音量）
+ *
+ * 保存目标音量值，播放链路写 PCM 时应用（配合主节点 SYNC_CMD_VOLUME 落地）。
+ *
+ * @param volume 音量值（0~100），超出范围自动截断到 100
+ * @return ESP_OK 设置成功
+ */
+esp_err_t Amplifier_Set_Volume(uint8_t volume);
+
+/**
+ * @brief 获取当前音量值
+ * @return 当前音量值（0~100）
+ */
+uint8_t Amplifier_Get_Volume(void);
 
 #endif

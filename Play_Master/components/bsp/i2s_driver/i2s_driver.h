@@ -37,7 +37,7 @@
  *
  *     // 写入 PCM 数据
  *     size_t written;
- *     i2s_bus_phy_write(txBus, pcmData, dataSize, &written, pdMS_TO_TICKS(1000));
+ *     i2s_bus_phy_write(txBus, pcmData, dataSize, &written, 1000);
  *
  *     // 销毁
  *     i2s_bus_phy_destroy(txBus);
@@ -133,13 +133,13 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
  * @brief 写入 PCM 数据（仅限 TX 总线）
  *
  * 将 PCM 数据通过 DMA 发送到 I2S 外设。若数据区满，会阻塞等待
- * 至超时（timeout 单位为 tick）。
+ * 至超时（timeout 单位为毫秒）。
  *
  * @param bus           句柄（必须 通过 create 创建且 is_tx=true）
  * @param buffer         数据缓冲区
  * @param size           数据长度（字节）
  * @param bytes_written  输出实际写入字节数（可为 NULL）
- * @param timeout        超时时间（tick）
+ * @param timeout        超时时间（毫秒）
  * @return
  *     ESP_OK               写入成功
  *     ESP_ERR_INVALID_ARG 句柄不匹配或参数为空
@@ -157,7 +157,7 @@ esp_err_t i2s_bus_phy_write(i2s_bus_handle_t bus, const uint8_t *buffer,
  * @param buffer    接收缓冲区
  * @param size      期望读取字节数
  * @param bytes_read 输出实际读取字节数
- * @param timeout 超时时间（tick）
+ * @param timeout 超时时间（毫秒）
  * @return
  *     ESP_OK               读取成功
  *     ESP_ERR_INVALID_ARG  句柄不匹配或参数为空
@@ -185,6 +185,17 @@ esp_err_t i2s_bus_phy_flush(i2s_bus_handle_t bus);
  * @return ESP_OK 成功
  */
 esp_err_t i2s_bus_phy_set_sample_rate(i2s_bus_handle_t bus, uint32_t sample_rate);
+
+/**
+ * @brief 打印 ESP32/ESP32-S2 legacy DMA / I2S 关键寄存器（调试用）
+ *
+ * 仅 ESP32/ESP32-S2 有实际输出；其他芯片为无操作。
+ * 用于定位 i2s_channel_write() 返回 ESP_ERR_TIMEOUT 时，
+ * DMA 是否在运行、EOF 中断是否产生。
+ *
+ * @param bus 句柄
+ */
+void i2s_bus_phy_debug_dma(i2s_bus_handle_t bus);
 
 /**
  * @brief 销毁物理总线，释放 DMA、GPIO 等资源

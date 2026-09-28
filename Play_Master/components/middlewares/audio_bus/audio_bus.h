@@ -14,6 +14,9 @@
  *
  * 本层位于 middlewares，只依赖 bsp 的 i2s_driver（物理驱动），
  * 不包含任何业务逻辑。
+ *
+ * 采样率约束：全链路固定 44.1kHz（见 AUDIO_BUS_SAMPLE_RATE），
+ * create() 时会对 bus_cfg->sample_rate 做一致性校验，强制覆盖并告警。
  */
 
 #ifndef AUDIO_BUS_H
@@ -27,6 +30,15 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ======================== 固定采样率 ============================================== */
+
+/**
+ * 全链路固定采样率：44.1kHz。
+ * 手机 A2DP（典型 44.1k）、SD 卡解码、麦克风采集、功放输出均以此为基线；
+ * 若音源协商到其它采样率（48k/32k/16k 等），由对应音源模块内部重采样对齐。
+ */
+#define AUDIO_BUS_SAMPLE_RATE  44100
 
 /* ======================== 类型定义 =============================================== */
 
@@ -82,7 +94,7 @@ typedef enum {
  * @param dir     总线方向
  * @param port    I2S 控制器端口（I2S_NUM_0 / I2S_NUM_1）
  * @param pin_cfg 物理引脚配置（功放/麦克风）
- * @param bus_cfg 音频格式与 DMA 配置
+ * @param bus_cfg 音频格式与 DMA 配置（采样率会被强制为 AUDIO_BUS_SAMPLE_RATE=44100，不一致时覆盖并告警）
  * @return 总线句柄，失败返回 NULL
  */
 audio_bus_handle_t audio_bus_create(audio_bus_dir_t dir, i2s_port_t port,
@@ -95,6 +107,14 @@ audio_bus_handle_t audio_bus_create(audio_bus_dir_t dir, i2s_port_t port,
  * @return ESP_OK 成功
  */
 esp_err_t audio_bus_destroy(audio_bus_handle_t bus);
+
+/**
+ * @brief 获取音频总线内部的 I2S 物理总线句柄（调试/底层访问用）
+ *
+ * @param bus 音频总线句柄
+ * @return I2S 物理总线句柄；bus 为 NULL 时返回 NULL
+ */
+i2s_bus_handle_t audio_bus_get_phy(audio_bus_handle_t bus);
 
 /* ======================== TX：多生产者接口 ========================================= */
 
@@ -147,8 +167,8 @@ esp_err_t audio_writer_unregister(audio_writer_handle_t writer);
  *
  * @param bus        RX 总线；传入 TX 总线返回 ESP_ERR_INVALID_ARG
  * @param name       读者名称（调试用）
- * @param fifo_bytes FIFO 容量（字节）。按采样率 16kHz×4 字节/样本，
- *                   1 秒 ≈ 64KB，建议至少 4~16KB
+ * @param fifo_bytes FIFO 容量（字节）。按固定采样率 44.1kHz×4 字节/样本，
+ *                   1 秒 ≈ 176KB，建议至少 8~32KB
  * @param overflow   FIFO 满时的溢出策略
  * @param out        输出读者句柄
  * @return ESP_OK / 错误码

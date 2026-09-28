@@ -17,10 +17,10 @@
 #include "esp_log.h"
 #include "gpio_driver.h"
 
-/* ======================== 私有变量 =============================================== */
+/* === 日志标签 === */
+#define TAG "StartAndStop"
 
-/** 日志标签 */
-static const char *TAG = "StartAndStop";
+/* ======================== 私有变量 =============================================== */
 
 /** 软件定时器句柄 */
 static TimerHandle_t StartAndStop_PowerBtnTimer = NULL;

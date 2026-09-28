@@ -24,6 +24,15 @@
 extern "C" {
 #endif
 
+/* ======================== 固定采样率 ============================================== */
+
+/**
+ * 全链路固定采样率：44.1kHz（与主节点一致）。
+ * 主节点组播到从节点的 PCM 即为 44.1kHz 单声道，从节点按此值直接播放；
+ * 若调用方传入其它采样率，create() 会强制覆盖并告警。
+ */
+#define AUDIO_BUS_SAMPLE_RATE  44100
+
 /* ======================== 类型定义 =============================================== */
 
 /** 音频总线句柄（仅 TX：功放输出） */
@@ -57,7 +66,8 @@ typedef enum {
  *
  * @param port       I2S 控制器端口（I2S_NUM_0 / I2S_NUM_1）
  * @param pin_cfg    物理引脚配置（功放）
- * @param bus_cfg    音频格式与 DMA 配置
+ * @param bus_cfg    音频格式与 DMA 配置（采样率会被强制为 AUDIO_BUS_SAMPLE_RATE=44100，
+ *                   不一致时覆盖并告警）
  * @return 总线句柄，失败返回 NULL
  */
 audio_bus_handle_t audio_bus_create(i2s_port_t port,

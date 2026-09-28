@@ -79,13 +79,22 @@ audio_bus_handle_t audio_bus_create(i2s_port_t port,
         ESP_LOGE(TAG, "no memory for bus");
         return NULL;
     }
+    /* 采样率强制为全链路统一的 44.1kHz（与主节点对齐） */
+    i2s_bus_cfg_t cfg = *bus_cfg;
+    if (cfg.sample_rate != AUDIO_BUS_SAMPLE_RATE)
+    {
+        ESP_LOGW(TAG, "sample_rate=%u != %u, forcing to unified 44.1kHz",
+                 (unsigned)cfg.sample_rate, (unsigned)AUDIO_BUS_SAMPLE_RATE);
+        cfg.sample_rate = AUDIO_BUS_SAMPLE_RATE;
+    }
+
     bus->magic = AUDIO_BUS_MAGIC;
     bus->port = port;
     memcpy(&bus->pin_cfg, pin_cfg, sizeof(bus->pin_cfg));
-    memcpy(&bus->bus_cfg, bus_cfg, sizeof(bus->bus_cfg));
+    memcpy(&bus->bus_cfg, &cfg, sizeof(bus->bus_cfg));
 
     /* 创建物理层发送句柄（从节点总线固定为 TX 功放） */
-    esp_err_t ret = i2s_bus_phy_create(port, true, pin_cfg, bus_cfg, &bus->phy);
+    esp_err_t ret = i2s_bus_phy_create(port, true, pin_cfg, &cfg, &bus->phy);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "phy create failed: %s", esp_err_to_name(ret));

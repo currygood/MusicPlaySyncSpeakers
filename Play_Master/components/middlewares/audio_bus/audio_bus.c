@@ -152,7 +152,7 @@ static void audio_bus_rx_task(void *arg)
         size_t bytes_read = 0;
         esp_err_t ret = i2s_bus_phy_read(bus->phy, bus->rx_chunk,
                                          sizeof(bus->rx_chunk), &bytes_read,
-                                         pdMS_TO_TICKS(AUDIO_BUS_RX_READ_TIMEOUT_MS));
+                                         AUDIO_BUS_RX_READ_TIMEOUT_MS);
         if (ret != ESP_OK)
         {
             if (ret == ESP_ERR_TIMEOUT)
@@ -204,15 +204,25 @@ audio_bus_handle_t audio_bus_create(audio_bus_dir_t dir, i2s_port_t port,
         ESP_LOGE(TAG, "no memory for bus");
         return NULL;
     }
+
+    /* 采样率强制为全链路统一的 44.1kHz（防止调用方配错/遗漏） */
+    i2s_bus_cfg_t cfg = *bus_cfg;
+    if (cfg.sample_rate != AUDIO_BUS_SAMPLE_RATE)
+    {
+        ESP_LOGW(TAG, "sample_rate=%u != %u, forcing to unified 44.1kHz",
+                 (unsigned)cfg.sample_rate, (unsigned)AUDIO_BUS_SAMPLE_RATE);
+        cfg.sample_rate = AUDIO_BUS_SAMPLE_RATE;
+    }
+
     bus->magic = AUDIO_BUS_MAGIC;
     bus->dir = dir;
     bus->port = port;
     memcpy(&bus->pin_cfg, pin_cfg, sizeof(bus->pin_cfg));
-    memcpy(&bus->bus_cfg, bus_cfg, sizeof(bus->bus_cfg));
+    memcpy(&bus->bus_cfg, &cfg, sizeof(bus->bus_cfg));
 
     /* 创建物理层句柄（一柄一方向） */
     esp_err_t ret = i2s_bus_phy_create(port, (dir == AUDIO_BUS_TX),
-                                       pin_cfg, bus_cfg, &bus->phy);
+                                       pin_cfg, &cfg, &bus->phy);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "phy create failed: %s", esp_err_to_name(ret));
@@ -303,6 +313,15 @@ esp_err_t audio_bus_destroy(audio_bus_handle_t bus)
     return ESP_OK;
 }
 
+i2s_bus_handle_t audio_bus_get_phy(audio_bus_handle_t bus)
+{
+    if (!audio_bus_valid(bus))
+    {
+        return NULL;
+    }
+    return bus->phy;
+}
+
 /* ======================== TX：多生产者接口 ========================================= */
 
 esp_err_t audio_writer_register(audio_bus_handle_t bus, const char *name,
@@ -387,8 +406,9 @@ esp_err_t audio_writer_write(audio_writer_handle_t writer, const int16_t *pcm,
     size_t bytes = samples * bytes_per_sample;
 
     size_t bytes_written = 0;
+    /* i2s_bus_phy_write() forwards timeout to i2s_channel_write() as ms */
     esp_err_t ret = i2s_bus_phy_write(bus->phy, (const uint8_t *)pcm, bytes,
-                                      &bytes_written, wait_ticks);
+                                      &bytes_written, timeout_ms);
     xSemaphoreGive(bus->write_mutex);
 
     if (ret != ESP_OK)

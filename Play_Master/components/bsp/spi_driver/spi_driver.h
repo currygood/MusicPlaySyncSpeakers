@@ -67,6 +67,9 @@ esp_err_t Spi_Init(Spi_Config_t *config);
  *
  * @return ESP_OK 释放成功
  */
+/** @brief 查询 SPI2 总线是否由本驱动本次创建（false 表示被其他模块占用复用） */
+bool Spi_Is_Bus_Created(void);
+
 esp_err_t Spi_Deinit(void);
 
 /**
@@ -79,6 +82,19 @@ esp_err_t Spi_Deinit(void);
  * @return 设备句柄；失败返回 NULL
  */
 Spi_Handle_t Spi_Register_Device(const Spi_DeviceConfig_t *config);
+
+/**
+ * @brief 修改已注册从设备的 SPI 时钟（如 SD 卡初始化 400kHz -> 正常 10MHz）
+ *
+ * 底层通过"移除设备并重新注册"实现（ESP-IDF 无运行中改频接口，
+ * 官方 sdspi_host 同样采用 remove/re-add 方案）。
+ * 注意：必须在设备会话之外调用（先 Spi_Device_Release 再调用本函数）。
+ *
+ * @param handle           设备句柄（须已注册）
+ * @param clock_speed_hz  新时钟频率（Hz）
+ * @return ESP_OK 成功
+ */
+esp_err_t Spi_Device_Set_Clock(Spi_Handle_t handle, int clock_speed_hz);
 
 /**
  * @brief 发送（按句柄，选中句柄绑定的 CS 从设备）

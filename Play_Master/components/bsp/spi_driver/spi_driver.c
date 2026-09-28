@@ -19,6 +19,7 @@ struct spi_device_s
     int                 cs_pin;           /* 片选 GPIO，注册时指定 */
     int                 clock_speed_hz;   /* 该从设备时钟 */
     int                 mode;             /* SPI 模式 0~3 */
+    int                 queue_size;       /* 事务队列深度（改时钟重建设备时沿用） */
     bool                cs_manual;        /* 手动片选（SD 卡协议需要会话级 CS 控制） */
     spi_device_handle_t espidf_handle;    /* ESP-IDF 底层设备句柄 */
 };
@@ -43,6 +44,9 @@ static Spi_Handle_t Spi_Find_By_Cs(int cs_pin)
 }
 
 /* ======================== 总线初始化 / 释放 ====================================== */
+
+/* SPI2 总线是否由本驱动本次创建（供复用方判断释放权） */
+static bool s_bus_created = false;
 
 esp_err_t Spi_Init(Spi_Config_t *config)
 {
@@ -73,7 +77,7 @@ esp_err_t Spi_Init(Spi_Config_t *config)
     if (ret == ESP_ERR_INVALID_STATE)
     {
         ESP_LOGW(TAG, "SPI bus already initialized by other module, reuse it");
-        return ret;
+        return ESP_OK;
     }
     if (ret != ESP_OK)
     {
@@ -83,7 +87,13 @@ esp_err_t Spi_Init(Spi_Config_t *config)
 
     ESP_LOGI(TAG, "SPI bus initialized on SPI2, speed=%dMHz",
              config->clockSpeedHz / 1000000);
+    s_bus_created = true;
     return ESP_OK;
+}
+
+bool Spi_Is_Bus_Created(void)
+{
+    return s_bus_created;
 }
 
 esp_err_t Spi_Deinit(void)
@@ -95,6 +105,7 @@ esp_err_t Spi_Deinit(void)
         return ret;
     }
     memset(Spi_Devices, 0, sizeof(Spi_Devices));
+    s_bus_created = false;
     ESP_LOGI(TAG, "SPI bus released");
     return ESP_OK;
 }
@@ -169,12 +180,68 @@ Spi_Handle_t Spi_Register_Device(const Spi_DeviceConfig_t *config)
     dev->cs_pin           = config->csPin;
     dev->clock_speed_hz   = dev_cfg.clock_speed_hz;
     dev->mode             = dev_cfg.mode;
+    dev->queue_size       = config->queueSize;
     dev->cs_manual        = cs_manual;
     dev->espidf_handle    = espidf_handle;
 
     ESP_LOGI(TAG, "SPI device registered (CS pin %d, %dMHz, mode%d)",
              dev->cs_pin, dev->clock_speed_hz / 1000000, dev->mode);
     return (Spi_Handle_t)dev;
+}
+
+esp_err_t Spi_Device_Set_Clock(Spi_Handle_t handle, int clock_speed_hz)
+{
+    if (handle == NULL || clock_speed_hz <= 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* ESP-IDF 无运行时改频接口，与官方 sdspi_host 一致：移除设备并重建 */
+    spi_device_interface_config_t dev_cfg = {
+        .clock_speed_hz = clock_speed_hz,
+        .mode           = handle->mode,
+        .spics_io_num   = handle->cs_manual ? -1 : handle->cs_pin,
+        .queue_size     = handle->queue_size,
+        .command_bits   = 0,
+        .address_bits   = 0,
+        .dummy_bits     = 0,
+    };
+
+    esp_err_t ret = spi_bus_remove_device(handle->espidf_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "device remove failed (CS %d): %s",
+                 handle->cs_pin, esp_err_to_name(ret));
+        return ret;
+    }
+
+    spi_device_handle_t new_handle;
+    ret = spi_bus_add_device(SPI2_HOST, &dev_cfg, &new_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "device re-add failed (CS %d): %s",
+                 handle->cs_pin, esp_err_to_name(ret));
+        /* 尝试用旧配置恢复，避免句柄悬空 */
+        spi_device_interface_config_t old_cfg = dev_cfg;
+        old_cfg.clock_speed_hz = handle->clock_speed_hz;
+        spi_device_handle_t restore;
+        if (spi_bus_add_device(SPI2_HOST, &old_cfg, &restore) == ESP_OK)
+        {
+            handle->espidf_handle = restore;
+        }
+        else
+        {
+            handle->espidf_handle = NULL;
+        }
+        return ret;
+    }
+
+    handle->espidf_handle  = new_handle;
+    handle->clock_speed_hz = clock_speed_hz;
+    handle->queue_size     = dev_cfg.queue_size;
+    ESP_LOGI(TAG, "device clock updated (CS %d) -> %d kHz",
+             handle->cs_pin, clock_speed_hz / 1000);
+    return ESP_OK;
 }
 
 /* ======================== 传输 API（按句柄，句柄内绑定 CS） ===================== */
@@ -205,17 +272,30 @@ esp_err_t Spi_Transmit_16Bit(Spi_Handle_t handle, uint16_t data)
     return Spi_Transmit(handle, data_buf, 2);
 }
 
+/** RX dummy：只收不发时 MOSI 也要输出时钟，SD 协议要求 MOSI 恒为高 */
+static uint8_t s_rx_dummy[2048];
+
 esp_err_t Spi_Receive(Spi_Handle_t handle, uint8_t *buffer, size_t length)
 {
     if (handle == NULL || buffer == NULL || length == 0)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    if (length > sizeof(s_rx_dummy))
+    {
+        ESP_LOGW(TAG, "Spi_Receive length %d > dummy %d, rejected",
+                 (int)length, (int)sizeof(s_rx_dummy));
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_rx_dummy[0] != 0xFF)
+    {
+        memset(s_rx_dummy, 0xFF, sizeof(s_rx_dummy));
+    }
 
     spi_transaction_t trans = {
         .length    = length * 8,
+        .tx_buffer = s_rx_dummy,      /* 显式发 0xFF：SD 协议要求 MOSI 恒高 */
         .rx_buffer = buffer,
-        /* tx_buffer 为 NULL，主机会自动发送全 1 时钟 */
     };
 
     esp_err_t ret = spi_device_transmit(handle->espidf_handle, &trans);

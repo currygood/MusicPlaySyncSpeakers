@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* I2C 事务超时（毫秒）：-1 会永久阻塞，卡死时会饿死任务触发看门狗 */
+#define I2C_TRANS_TIMEOUT_MS  100
+
 // 全局I2C总线句柄
 static i2c_master_bus_handle_t global_i2c_bus = NULL;
 
@@ -39,17 +42,17 @@ esp_err_t I2c_Add_Device(i2c_master_bus_handle_t bus_handle, uint16_t dev_addr, 
 // 写寄存器
 esp_err_t I2c_Write_Reg(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8_t data) {
     uint8_t buf[2] = {reg, data};
-    return i2c_master_transmit(dev_handle, buf, sizeof(buf), -1);
+    return i2c_master_transmit(dev_handle, buf, sizeof(buf), I2C_TRANS_TIMEOUT_MS);
 }
 
 // 读寄存器
 esp_err_t I2c_Read_Reg(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8_t *data) {
-    return i2c_master_transmit_receive(dev_handle, &reg, 1, data, 1, -1);
+    return i2c_master_transmit_receive(dev_handle, &reg, 1, data, 1, I2C_TRANS_TIMEOUT_MS);
 }
 
 // 读多字节
 esp_err_t I2c_Read_Bytes(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8_t *buffer, size_t count) {
-    return i2c_master_transmit_receive(dev_handle, &reg, 1, buffer, count, -1);
+    return i2c_master_transmit_receive(dev_handle, &reg, 1, buffer, count, I2C_TRANS_TIMEOUT_MS);
 }
 
 // 删除设备
@@ -76,7 +79,7 @@ esp_err_t I2c_Write_Bytes(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8
     temp_buf[0] = reg;
     memcpy(&temp_buf[1], buffer, count);
     
-    esp_err_t ret = i2c_master_transmit(dev_handle, temp_buf, count + 1, -1);
+    esp_err_t ret = i2c_master_transmit(dev_handle, temp_buf, count + 1, I2C_TRANS_TIMEOUT_MS);
     free(temp_buf);
     return ret;
 }

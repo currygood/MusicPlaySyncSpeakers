@@ -53,6 +53,9 @@
 /** SPI 时钟频率（Hz）：SD 卡 SPI 模式上限 25MHz，10MHz 兼顾稳定性 */
 #define SD_CARD_SPI_FREQ_HZ   (10 * 1000 * 1000)
 
+/** SPI 上电/识别时钟（Hz）：SD 规范要求初始化命令 <=400kHz */
+#define SD_CARD_INIT_FREQ_HZ   (400 * 1000)
+
 /** 同时打开的文件句柄上限（音乐解码 2~3 + UI 资源若干） */
 #define SD_CARD_MAX_OPEN_FILES 8
 
@@ -83,6 +86,38 @@ esp_err_t SD_Card_Init(void);
  * @return ESP_OK 成功
  */
 esp_err_t SD_Card_Deinit(void);
+
+/**
+ * @brief 裸扇区自检（调试用）：读引导扇区，并对最后一个扇区做写入回环测试
+ *
+ * 注意：会在最后一个扇区临时写入测试图案，之后恢复原内容；
+ *       结果是否通过以日志中的 RAW loopback 行判定。
+ *
+ * @return ESP_OK 自检流程完成（不代表回环通过，需看日志）
+ */
+esp_err_t SD_Card_Diag(void);
+
+/**
+ * @brief 文件系统诊断（调试用）：打印 FAT 几何信息、根目录中文件名对应的
+ *        起始簇/FAT 表项，并直接物理读取其数据扇区，判定“FAT 逻辑映射”
+ *        与“卡上实际数据”是否一致。
+ */
+void SD_Card_Diag_File(void);
+
+/**
+ * @brief 格式化整张卡并重新挂载（调试用，一次性重置）
+ *
+ * 警告：会删除卡上所有数据。格式化为 FAT（自动 FAT12/16/32），
+ *       完成后重建 /sdcard/music、/sdcard/ui 目录。
+ *
+ * @return ESP_OK 格式化并重新挂载成功
+ */
+esp_err_t SD_Card_Format(void);
+
+/**
+ * @brief 一次性格式化开关（见实现文件注释）
+ */
+void SD_Card_Set_Format_Once(bool enable);
 
 /**
  * @brief 查询 SD 卡是否已挂载

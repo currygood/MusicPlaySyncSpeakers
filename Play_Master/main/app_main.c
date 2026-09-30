@@ -16,7 +16,8 @@
 #include "LCD_Touch.h"
 #include "i2c_driver.h"
 #include "audio_bus.h"
-#include "bt_test.h"
+#include <stdbool.h>
+#include "bt_audio.h"
 
 
 static const char *TAG = "AppMain";
@@ -444,6 +445,323 @@ static void Mic_Record_Playback_Test(void)
 }
 
 
+
+
+/* ======================== 蓝牙 A2DP 测试（bt_audio 模块） ======================= */
+
+static bool s_btA2dpConnected = false;
+static TaskHandle_t s_btHfpTestTask = NULL;   /* HFP 语音测试任务句柄 */
+
+/** bt_audio PCM 回调（bt_audio 任务上下文）：直喂功放验证音频链路 */
+static void App_Bt_Pcm_Cb(bt_audio_pcm_source_t source, const int16_t *pcm,
+                          size_t samples, uint32_t sample_rate, void *user_ctx)
+{
+    (void)source;
+    (void)sample_rate;
+    (void)user_ctx;
+
+    if (pcm == NULL || samples == 0)
+    {
+        return;
+    }
+    /* A2DP 需等连接；HFP 下行（44.1kHz 单声道）直接播放便于测试应答 */
+    if (source == BT_AUDIO_PCM_SOURCE_A2DP && !s_btA2dpConnected)
+    {
+        return;
+    }
+    Amplifier_Play_Buffer((const uint8_t *)pcm, samples * sizeof(int16_t), NULL, 200);
+}
+
+/** bt_audio 事件回调：打印连接/流状态，并同步播放开关 */
+static void App_Bt_Evt_Cb(const bt_audio_event_t *evt, void *user_ctx)
+{
+    (void)user_ctx;
+    if (evt == NULL)
+    {
+        return;
+    }
+
+    switch (evt->id)
+    {
+    case BT_AUDIO_EVT_A2DP_CONNECTED:
+        ESP_LOGI(TAG, "A2DP connected");
+        s_btA2dpConnected = true;
+        break;
+    case BT_AUDIO_EVT_A2DP_DISCONNECTED:
+        ESP_LOGI(TAG, "A2DP disconnected");
+        s_btA2dpConnected = false;
+        break;
+    case BT_AUDIO_EVT_A2DP_STREAM_STARTED:
+        ESP_LOGI(TAG, "A2DP stream started");
+        break;
+    case BT_AUDIO_EVT_A2DP_STREAM_STOPPED:
+        ESP_LOGI(TAG, "A2DP stream stopped");
+        break;
+    case BT_AUDIO_EVT_A2DP_SAMPLE_RATE_CHANGED:
+        ESP_LOGI(TAG, "A2DP sample rate: %lu Hz", (unsigned long)evt->data.sample_rate);
+        break;
+    case BT_AUDIO_EVT_HFP_CONNECTED:
+        ESP_LOGI(TAG, "HFP SLC connected");
+        if (s_btHfpTestTask != NULL)
+        {
+            xTaskNotifyGive(s_btHfpTestTask);
+        }
+        break;
+    case BT_AUDIO_EVT_HFP_DISCONNECTED:
+        ESP_LOGI(TAG, "HFP SLC disconnected");
+        break;
+    case BT_AUDIO_EVT_HFP_AUDIO_OPEN:
+        ESP_LOGI(TAG, "HFP SCO open (%lu Hz)", (unsigned long)evt->data.sample_rate);
+        break;
+    case BT_AUDIO_EVT_HFP_AUDIO_CLOSE:
+        ESP_LOGI(TAG, "HFP SCO closed");
+        break;
+    case BT_AUDIO_EVT_PLAY_STATE_CHANGED:
+        ESP_LOGI(TAG, "AVRCP play state: %d", evt->data.play_state);
+        break;
+    case BT_AUDIO_EVT_TRACK_CHANGED:
+        ESP_LOGI(TAG, "AVRCP track changed");
+        break;
+    case BT_AUDIO_EVT_TRACK_INFO:
+        ESP_LOGI(TAG, "AVRCP track: %s | %s | %s (dur=%lu ms)",
+                 evt->data.track_info.title,
+                 evt->data.track_info.artist,
+                 evt->data.track_info.album,
+                 (unsigned long)evt->data.track_info.duration_ms);
+        break;
+    case BT_AUDIO_EVT_VOLUME_CHANGED:
+        ESP_LOGI(TAG, "AVRCP volume: %u", evt->data.volume);
+        /* 手机侧调音量（绝对音量命令/通知）→ 同步本机功放 */
+        Amplifier_Set_Volume(evt->data.volume);
+        break;
+    default:
+        break;
+    }
+}
+
+/** HFP 语音测试任务：HFP SLC 连接后自动发送 AT+BVRA=1 唤醒手机语音助手 */
+static void BtHfp_Test_Task(void *arg)
+{
+    bt_audio_handle_t audio = (bt_audio_handle_t)arg;
+
+    ESP_LOGI(TAG, "HFP test: waiting for HFP SLC connected...");
+    for (;;)
+    {
+        /* 等待 HFP SLC 建立（事件回调通知） */
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000)) != pdTRUE)
+        {
+            continue;   /* 超时未连接，继续等待 */
+        }
+
+        /* SLC 刚建立，稍作延迟再发送激活命令 */
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        esp_err_t err = bt_audio_hfp_start_voice(audio);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "HFP start_voice failed: %s", esp_err_to_name(err));
+            continue;
+        }
+        ESP_LOGI(TAG, "HFP start_voice OK, waiting SCO open...");
+
+        /* 等待 SCO 打开（手机语音助手界面出现） */
+        if (bt_audio_hfp_wait_audio_open(audio, 5000) == ESP_OK)
+        {
+            ESP_LOGI(TAG, "HFP SCO opened! 下行应答已送往功放（如手机有播报会听到）");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "HFP SCO not opened within 5s");
+        }
+    }
+}
+
+/** ===== 临时测试：HFP 上行（麦克风 -> SCO -> 手机） =====
+ *  验证用：读 INMP441 -> 去交错选槽 -> 44.1kHz 单声道 -> bt_audio_hfp_send_pcm
+ *  等 CallPhone 实现后由它接管这条链路，本任务删除。
+ */
+static void BtHfp_UpTest_Task(void *arg)
+{
+    bt_audio_handle_t audio = (bt_audio_handle_t)arg;
+    int16_t raw[512];    /* 交错双槽样本（每 I2S 帧 2 个槽） */
+    int16_t mono[256];   /* 去交错后的单声道 PCM */
+    int keepLane = -1;   /* 语音所在槽位（首次能量统计后固定） */
+    uint32_t drops = 0;
+
+    esp_err_t ret;
+    ESP_LOGI(TAG, "HFP up test: mic ready, waiting SCO open...");
+
+    for (;;)
+    {
+        /* SCO 未打开就不读麦克风，避免白丢数据 */
+        if (!bt_audio_hfp_is_audio_open(audio))
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        size_t got = 0;
+        ret = Microphone_Read_Pcm16(raw, sizeof(raw) / sizeof(raw[0]), &got, pdMS_TO_TICKS(1000));
+        if (ret != ESP_OK || got < 2)
+        {
+            continue;
+        }
+
+        size_t frames = got / 2;   /* 每帧两个槽 */
+        size_t lane0 = 0, lane1 = 0;
+        for (size_t i = 0; i < frames; i++)
+        {
+            int a = raw[i * 2 + 0];
+            int b = raw[i * 2 + 1];
+            lane0 += (a < 0) ? (size_t)(-a) : (size_t)a;
+            lane1 += (b < 0) ? (size_t)(-b) : (size_t)b;
+        }
+        if (keepLane < 0)
+        {
+            keepLane = (lane0 >= lane1) ? 0 : 1;
+            ESP_LOGI(TAG, "HFP up test: keep I2S slot %d", keepLane);
+        }
+        for (size_t i = 0; i < frames; i++)
+        {
+            mono[i] = raw[i * 2 + keepLane];
+        }
+
+        esp_err_t sret = bt_audio_hfp_send_pcm(audio, mono, frames, 50);
+        if (sret != ESP_OK)
+        {
+            if (++drops % 100 == 1)
+            {
+                ESP_LOGW(TAG, "HFP up test: send_pcm %s", esp_err_to_name(sret));
+            }
+        }
+    }
+}
+
+/** AVRCP 测试任务：手机连接后依次发控制命令 + 分档调音量（UI 音量走 set_volume） */
+static void BtAvrc_Test_Task(void *arg)
+{
+    bt_audio_handle_t audio = (bt_audio_handle_t)arg;
+    static const bt_audio_cmd_t seq[] = {
+        BT_AUDIO_CMD_TOGGLE_PLAY,   /* 按当前播放状态自动播放/暂停 */
+        BT_AUDIO_CMD_PLAY,
+        BT_AUDIO_CMD_PAUSE,
+        BT_AUDIO_CMD_NEXT,
+        BT_AUDIO_CMD_PREV,
+        BT_AUDIO_CMD_VOLUME_UP,     /* 走 SetAbsoluteVolume */
+        BT_AUDIO_CMD_VOLUME_DOWN,
+    };
+
+    ESP_LOGI(TAG, "AVRCP test: waiting for phone A2DP connected...");
+    while (!s_btA2dpConnected)
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    vTaskDelay(pdMS_TO_TICKS(1500));   /* 给 AVRCP 链路建立留时间 */
+
+    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
+    {
+        esp_err_t err = bt_audio_send_ctrl_cmd(audio, seq[i]);
+        ESP_LOGI(TAG, "AVRCP ctrl cmd %d -> %s", seq[i], esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(1200));
+    }
+
+    /* 音量分档测试（UI 旋钮/按键最终都调 bt_audio_set_volume） */
+    static const uint8_t vols[] = { 100, 70, 40, 10, 60, 85 };
+    for (size_t i = 0; i < sizeof(vols) / sizeof(vols[0]); i++)
+    {
+        esp_err_t err = bt_audio_set_volume(audio, vols[i]);
+        Amplifier_Set_Volume(vols[i]);   /* 测试：本机功放音量跟随 */
+        ESP_LOGI(TAG, "set volume %u -> %s", vols[i], esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+    /* 曲目/状态查询（元数据事件也已在 App_Bt_Evt_Cb 打印） */
+    const bt_audio_track_info_t *ti = NULL;
+    esp_err_t err = bt_audio_get_track_info(audio, &ti);
+    if (err == ESP_OK && ti != NULL)
+    {
+        ESP_LOGI(TAG, "query track: %s | %s | %s", ti->title, ti->artist, ti->album);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "get_track_info: %s", esp_err_to_name(err));
+    }
+
+    bt_audio_play_state_t st = BT_AUDIO_PLAY_STATE_UNKNOWN;
+    err = bt_audio_get_play_state(audio, &st);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "query play state: %d", st);
+    }
+
+    ESP_LOGI(TAG, "AVRCP test done, volume=%u", bt_audio_get_volume(audio));
+    vTaskDelete(NULL);
+}
+
+/** 蓝牙 A2DP 测试：创建并启动 bt_audio，等手机连接后 on_pcm 直连功放 */
+static void BtA2dp_Test(void)
+{
+    /* 注意：必须先初始化麦克风（I2S RX）再初始化功放（I2S TX），否则麦克风不可用 */
+    esp_err_t ret = Microphone_Init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Microphone_Init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ret = Amplifier_Init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Amplifier_Init failed: %s", esp_err_to_name(ret));
+        Microphone_Deinit();
+        return;
+    }
+    Amplifier_Set_Volume(100);
+
+    bt_audio_cfg_t cfg = {
+        .device_name = "MPS-Sync-Test",
+        .on_pcm      = App_Bt_Pcm_Cb,
+        .on_event    = App_Bt_Evt_Cb,
+    };
+    bt_audio_handle_t audio = bt_audio_create(&cfg);
+    if (audio == NULL)
+    {
+        ESP_LOGE(TAG, "bt_audio_create failed");
+        Amplifier_Deinit();
+        return;
+    }
+
+    ret = bt_audio_start(audio);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "bt_audio_start failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "A2DP test: waiting for phone...");
+    ESP_LOGI(TAG, "free heap after bt start: internal=%lu B, psram=%lu B",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    // /* HFP 语音测试任务：SLC 连接后自动唤醒手机语音助手 */
+    // if (xTaskCreate(BtHfp_Test_Task, "bt_hfp_test", 8192, audio, 5,
+    //                 &s_btHfpTestTask) != pdPASS)
+    // {
+    //     ESP_LOGE(TAG, "bt_hfp_test task create failed");
+    // }
+
+    /* AVRCP 测试任务：连接后自动发控制命令 + 音量分档 */
+    if (xTaskCreate(BtAvrc_Test_Task, "bt_avrc_test", 8192, audio, 5, NULL) != pdPASS)
+    {
+        ESP_LOGE(TAG, "bt_avrc_test task create failed");
+    }
+
+    // /* ===== 临时测试：麦克风上行 -> bt_audio -> 手机（CallPhone 落地后删除） ===== */
+    // if (xTaskCreatePinnedToCore(BtHfp_UpTest_Task, "bt_hfp_uptest",
+    //                             8192, audio, 5, NULL, 1) != pdPASS)
+    // {
+    //     ESP_LOGE(TAG, "bt_hfp_uptest task create failed");
+    // }
+}
+
 void app_main(void)
 {
 	SystemStart();
@@ -458,13 +776,14 @@ void app_main(void)
 	/* 麦克风录音 10s -> 功放回放测试（测试完请注释掉） */
 	// Mic_Record_Playback_Test();
 
-	/* 蓝牙功放测试 */
-	BtAmpTest_Start();
+	/* 蓝牙 A2DP 测试（bt_audio 模块） */
+	BtA2dp_Test();
 
 	/* SD 卡测试与 LCD 测试各自为任务：同一条 SPI2 总线，SD 测完再通知 LCD */
 	//xTaskCreatePinnedToCore(Sd_Card_Test_Task, "sd_test", 8192, NULL, 5, NULL, 0);
 	//xTaskCreatePinnedToCore(Lcd_Touch_Test_Task, "lcd_test", 8192, NULL, 4, &s_lcdTestTask, 0);
 
+	
 	while(1)
 	{
 		vTaskDelay(pdMS_TO_TICKS(1000));

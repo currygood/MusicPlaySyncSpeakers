@@ -18,6 +18,7 @@
 #include "amplifier.h"
 #include "audio_bus.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "i2s_driver.h"
 
 /* ======================== 模块静态变量 =========================================== */
@@ -30,6 +31,10 @@ static uint8_t Amplifier_Volume = 80;
 /* 功放所属音频总线与写者句柄 */
 static audio_bus_handle_t Amp_Bus = NULL;
 static audio_writer_handle_t Amp_Writer = NULL;
+
+/* 软件音量衰减工作缓冲（PSRAM；NS4168 无硬件增益，只能衰减 PCM） */
+static int16_t *s_amp_scaled = NULL;
+#define AMP_SCALED_CAP_BYTES  8192   /* 最大单块 PCM：2048 帧 × 2ch × 2B */
 
 /* ======================== 硬编码引脚与格式配置 ==================================== */
 
@@ -99,6 +104,21 @@ esp_err_t Amplifier_Init(void)
         return ret;
     }
 
+    /* 音量衰减工作缓冲：优先 PSRAM（内部 RAM 紧张） */
+    if (s_amp_scaled == NULL)
+    {
+        s_amp_scaled = heap_caps_malloc(AMP_SCALED_CAP_BYTES,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_amp_scaled == NULL)
+        {
+            s_amp_scaled = heap_caps_malloc(AMP_SCALED_CAP_BYTES, MALLOC_CAP_8BIT);
+        }
+        if (s_amp_scaled == NULL)
+        {
+            ESP_LOGW(TAG, "volume buffer alloc failed, volume will not take effect");
+        }
+    }
+
     ESP_LOGI(TAG, "NS4168 amplifier initialized, volume=%d%%", Amplifier_Volume);
     return ESP_OK;
 }
@@ -114,6 +134,11 @@ esp_err_t Amplifier_Deinit(void)
     {
         audio_bus_destroy(Amp_Bus);
         Amp_Bus = NULL;
+    }
+    if (s_amp_scaled != NULL)
+    {
+        heap_caps_free(s_amp_scaled);
+        s_amp_scaled = NULL;
     }
     ESP_LOGI(TAG, "NS4168 amplifier deinitialized");
     return ESP_OK;
@@ -134,12 +159,38 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
     }
 
     /*
-     * 通过音频总线写入（原子块，默认 BLOCK 策略）：
-     *  PCM 为 16-bit 双声道（L/R 槽各一份），帧数 = size / (2 x 2B)
+     * 软件音量：NS4168 是固定增益 D 类功放，音量只能通过衰减 PCM 实现。
+     * 采用平方曲线（更接近人耳等响感知）：gain = (vol/100)^2。
+     * 音量 100 时原样直通（零开销），0 时输出静音。
      */
     size_t samples = size / (sizeof(int16_t) * AMPLIFIER_CHANNEL_NUM);
-    esp_err_t ret = audio_writer_write(Amp_Writer, (const int16_t *)buffer,
-                                       samples, timeout, AUDIO_WRITE_BLOCK);
+    const int16_t *out = (const int16_t *)buffer;
+
+    if (Amplifier_Volume < AMPLIFIER_VOLUME_MAX)
+    {
+        uint16_t vol = (Amplifier_Volume > 0) ? Amplifier_Volume : 0;
+        if (s_amp_scaled != NULL && vol > 0 && samples <=
+            (AMP_SCALED_CAP_BYTES / (sizeof(int16_t) * AMPLIFIER_CHANNEL_NUM)))
+        {
+            /* 定点增益：(vol/100)^2 * 32768，右移 15 位保证不溢出 */
+            uint32_t gain = ((uint32_t)vol * vol * 32768) / 10000u;
+            const int16_t *in = (const int16_t *)buffer;
+            size_t total = samples * AMPLIFIER_CHANNEL_NUM;
+
+            for (size_t i = 0; i < total; i++)
+            {
+                s_amp_scaled[i] = (int16_t)(((int32_t)in[i] * (int32_t)gain) >> 15);
+            }
+            out = s_amp_scaled;
+        }
+        else if (s_amp_scaled != NULL && vol == 0)
+        {
+            memset(s_amp_scaled, 0, size);   /* 静音 */
+            out = s_amp_scaled;
+        }
+    }
+
+    esp_err_t ret = audio_writer_write(Amp_Writer, out, samples, timeout, AUDIO_WRITE_BLOCK);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Play buffer failed: %s", esp_err_to_name(ret));

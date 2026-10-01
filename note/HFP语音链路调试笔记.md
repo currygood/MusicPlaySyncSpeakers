@@ -1,6 +1,6 @@
-# HFP 语音链路调试笔记（未完成，待 CallPhone 阶段再测）
+# HFP 语音链路调试笔记（已解决，2026-10-01 更新）
 
-> 日期：2026-09-30 ｜ 项目：Play_Master（bt_audio HFP）
+> 日期：2026-09-30（2026-10-01 更新为已解决） ｜ 项目：Play_Master（bt_audio HFP）
 
 ## 1. 现状
 
@@ -51,3 +51,43 @@ I (...): bt_audio: A2DP stream started
 
 - 目前 HFP 仅验证了连接/下行收包、“上行听不到”属于遗留问题；
 - 后续若调通，记得回填本文件：根因 + 解决方案 + 验证日志。
+
+
+## 6. 已定位并解决（2026-10-01 更新）
+
+### 6.1 根因
+
+bt_audio.c 的 bt_hfp_data_send_cb()（HFP 协议栈每 7.5ms 回调要一帧 SCO 数据）：
+
+- 每帧从 hfp_up_fifo 取 in_need（约 331 个）新来的 44.1k 单声道样本；
+- 经内部 bt_audio_hfp_resample_16_16() 降采样到 mSBC 16k（120 样本/帧）送出；
+- 但重采样游标 s_bt_audio.hfp_rs_pos 是跨回调累计的绝对游标，而缓冲每帧只装最新样本：
+  第 2 次回调起 idx = pos>>16 越界，被钳到“窗口最后一个样本”上——整帧输出恒为同一数值（约等于静音）。
+
+所以手机端其实一直在收“恒定电平”，语音识别 VAD 判定无语音，约 4.8s 后自动
+HFP voice recognition DISABLED 并关闭 SCO。这正是本文件 1、2.3 节遗留的“麦克风上行送不到手机”。
+
+### 6.2 修复（bt_audio.c，send 回调内）
+
+在每个回调的重采样完成后，把游标折回本帧窗口：
+
+```c
+s_bt_audio.hfp_rs_pos -= (uint64_t)in_need << 16;
+if ((int64_t)s_bt_audio.hfp_rs_pos < 0)
+{
+    s_bt_audio.hfp_rs_pos = 0;
+}
+```
+
+（与 CallPhone 监听侧 44.1k → 16k 唤醒重采样是同一类 bug、同一修法。）
+
+### 6.3 验证
+
+- 唤醒词正常（wn9s_nihaoxiaozhi，sdkconfig 配置）；
+- SCO 打开后说话，手机语音助手能正常识别并回复（“现在几点”场景验证通过）；
+- SCO 不再被自动关闭；第四阶段联调日志见《主音频节点开发过程.md》第四阶段。
+
+### 6.4 备注
+
+- 原 2.1 内存问题（osi_alarm 失败断言）：CallPhone + bt_audio 运行时 internal heap 仍有约 33KB 余量，本次验证未再复现；
+- 原 2.2 的 SCO xmit Q overflow 本次验证未出现。

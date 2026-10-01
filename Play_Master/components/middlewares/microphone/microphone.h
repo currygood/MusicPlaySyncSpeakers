@@ -4,6 +4,7 @@
 #include "esp_err.h"
 #include <stdint.h>
 #include <stddef.h>
+#include "audio_bus.h"
 
 /* ======================== 麦克风音频配置 ========================================= */
 
@@ -118,5 +119,17 @@ esp_err_t Microphone_Read_Raw(uint8_t *buffer, size_t size, size_t *bytes_read, 
  *         ESP_FAIL            未读取到任何采样
  */
 esp_err_t Microphone_Read_Pcm16(int16_t *pcmBuffer, size_t sampleCount, size_t *samplesRead, uint32_t timeout);
+
+/**
+ * @brief 获取麦克风模块的 RX 音频总线句柄（仅供装配层接线复用）
+ *
+ * 必须在 Microphone_Init() 成功之后调用；未初始化返回 NULL。
+ * 总线归属：RX 总线由 microphone 模块私有创建并持有，Microphone_GetBus()
+ * 仅供装配层借出句柄（如 CallPhone 注册 reader），不转让所有权；
+ * 销毁统一由 Microphone_Deinit() 负责，调用方不得单独调用 audio_bus_destroy()。
+ *
+ * @return RX 音频总线句柄；未初始化返回 NULL
+ */
+audio_bus_handle_t Microphone_GetBus(void);
 
 #endif

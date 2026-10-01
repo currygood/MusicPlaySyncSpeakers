@@ -16,6 +16,6 @@ file(GLOB_RECURSE SOURCES "*.c")
 idf_component_register(
     SRCS ${SOURCES}
     INCLUDE_DIRS ${MID_INCLUDE_DIRS}
-    # Middlewares 的传感器通常需要调用 BSP 层的底层通信逻辑
-    REQUIRES middlewares
+    # Middlewares 的传感器通常需要调用 BSP 层的底层通信逻辑；esp-sr 供 CallPhone 唤醒词检测
+    REQUIRES middlewares esp-sr
 )

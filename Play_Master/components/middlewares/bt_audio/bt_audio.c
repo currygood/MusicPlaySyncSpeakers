@@ -470,6 +470,14 @@ static uint32_t bt_hfp_data_send_cb(uint8_t *out, uint32_t length)
     bt_audio_hfp_resample_16_16(s_bt_audio.hfp_rs_in, got / 2,
                                 (int16_t *)out, out_samples,
                                 bt_audio_hfp_up_step(), &s_bt_audio.hfp_rs_pos);
+
+    /* 游标折回本帧窗口：数据每次只提供 in_need 个新样本，
+     * 16.16 定点位置不反折回将在第二帧起全部取到末尾样本（静音等效）。 */
+    s_bt_audio.hfp_rs_pos -= (uint64_t)in_need << 16;
+    if ((int64_t)s_bt_audio.hfp_rs_pos < 0)
+    {
+        s_bt_audio.hfp_rs_pos = 0;
+    }
     return length;
 }
 

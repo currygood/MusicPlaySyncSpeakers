@@ -73,6 +73,13 @@ typedef struct
 
 static sd_card_ctx_t Sd;
 
+/** 上电自动裸扇区回环诊断开关（调试用）：
+ *  0 = 关闭（默认）。SD_Card_Init() 不再自动对引导扇区/FAT 等区域做
+ *      “覆写测试图案→恢复” 的物理写回环，避免异常断电或恢复失败损坏卡上数据。
+ *  1 = 开启：仅排查卡故障时临时打开，跑完立即改回 0。
+ */
+#define SD_CARD_DIAG_ON_BOOT 0
+
 /** 一次性格式化开关：SD_Card_Set_Format_Once(true) 后，本次初始化中
  *  无论挂载失败还是成功，都先 f_mkfs 重建干净 FAT 卷（调试用，重启自动失效） */
 static bool s_format_once = false;
@@ -446,7 +453,9 @@ static esp_err_t Sd_Card_Init_Hw(void)
     }
     Sd_Session_End();
 
-    SD_Card_Diag();   /* 调试团：释放会话后可自由做多点位回环 */
+#if SD_CARD_DIAG_ON_BOOT
+    SD_Card_Diag();   /* 上电裸扇区回环诊断（默认关闭，见 SD_CARD_DIAG_ON_BOOT） */
+#endif
     return ESP_OK;
 }
 
@@ -611,37 +620,50 @@ static void sd_loopback(uint32_t sector)
     {
         pat[i] = (uint8_t)i;
     }
+    bool dirty = false;
     if (Sd_Write_Sector(sector, pat) != ESP_OK)
     {
         ESP_LOGE(TAG, "LB[%lu]: write FAIL", (unsigned long)sector);
-        return;
-    }
-    if (Sd_Read_Sector(sector, chk) != ESP_OK)
-    {
-        ESP_LOGE(TAG, "LB[%lu]: re-read FAIL", (unsigned long)sector);
-        return;
-    }
-    sd_hex_log("LB read :", sector, chk, 8);
-    int diff = 0, first = -1;
-    for (int i = 0; i < 512; i++)
-    {
-        if (chk[i] != pat[i])
-        {
-            diff++;
-            if (first < 0)
-            {
-                first = i;
-            }
-        }
-    }
-    if (diff == 0)
-    {
-        ESP_LOGI(TAG, "LB[%lu]: PASS (512B identical)", (unsigned long)sector);
     }
     else
     {
-        ESP_LOGE(TAG, "LB[%lu]: FAIL diff=%d first@%d",
-                 (unsigned long)sector, diff, first);
+        dirty = true;
+        if (Sd_Read_Sector(sector, chk) != ESP_OK)
+        {
+            ESP_LOGE(TAG, "LB[%lu]: re-read FAIL", (unsigned long)sector);
+        }
+        else
+        {
+            sd_hex_log("LB read :", sector, chk, 8);
+            int diff = 0, first = -1;
+            for (int i = 0; i < 512; i++)
+            {
+                if (chk[i] != pat[i])
+                {
+                    diff++;
+                    if (first < 0)
+                    {
+                        first = i;
+                    }
+                }
+            }
+            if (diff == 0)
+            {
+                ESP_LOGI(TAG, "LB[%lu]: PASS (512B identical)", (unsigned long)sector);
+            }
+            else
+            {
+                ESP_LOGE(TAG, "LB[%lu]: FAIL diff=%d first@%d",
+                         (unsigned long)sector, diff, first);
+            }
+        }
+    }
+
+    /* 只要测试图案写入成功过，无论回读/比对是否失败都必须恢复原内容，
+     * 避免把测试图案残留在卡上（引导扇区/FAT 区残留会造成文件系统损坏） */
+    if (!dirty)
+    {
+        return;
     }
 
     /* 恢复原内容并校验 */

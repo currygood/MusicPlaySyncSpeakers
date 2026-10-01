@@ -190,6 +190,11 @@ esp_err_t Microphone_Init(void)
     return ESP_OK;
 }
 
+audio_bus_handle_t Microphone_GetBus(void)
+{
+    return Mic_Bus;
+}
+
 esp_err_t Microphone_Deinit(void)
 {
     if (Mic_Reader != NULL)

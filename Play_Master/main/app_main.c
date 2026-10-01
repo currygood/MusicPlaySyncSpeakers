@@ -1,4 +1,4 @@
-﻿#include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -18,6 +18,7 @@
 #include "audio_bus.h"
 #include <stdbool.h>
 #include "bt_audio.h"
+#include "call_phone.h"
 
 
 static const char *TAG = "AppMain";
@@ -762,6 +763,189 @@ static void BtA2dp_Test(void)
     // }
 }
 
+/* ======================== 第四阶段：CallPhone 接线测试 ======================== */
+
+/*
+ * 接线顺序（见《主音频节点开发过程》第四阶段）：
+ *   Microphone_Init()（自建 RX 总线 + INMP441 使能）→ bt_audio_create
+ *   → call_phone_create
+ *
+ * 说明：RX 总线句柄由 microphone 模块导出（Microphone_GetBus()），
+ * 测试不再自建总线、不重复 INMP441 使能步骤。
+ */
+
+/* 监视任务上下文 */
+typedef struct {
+    call_phone_handle_t cp;
+    bt_audio_handle_t   audio;   /* 供打印 SCO 状态 */
+} call_test_ctx_t;
+
+/** 演示用：STREAMING 持续 CALL_STREAM_KEEP_SECS 秒后自动挂断 */
+#define CALL_STREAM_KEEP_SECS  20
+
+static const char *Call_State_Name(call_phone_state_t state)
+{
+    switch (state)
+    {
+    case CALL_PHONE_STATE_IDLE:       return "IDLE";
+    case CALL_PHONE_STATE_LISTENING:  return "LISTENING";
+    case CALL_PHONE_STATE_CONNECTING: return "CONNECTING";
+    case CALL_PHONE_STATE_STREAMING:  return "STREAMING";
+    default:                          return "??";
+    }
+}
+
+/** CallPhone 状态监视任务：打印状态迁移 + 自动挂断演示 + 周期打印内存 */
+static void CallPhone_Test_Monitor(void *arg)
+{
+    call_test_ctx_t    *ctx  = (call_test_ctx_t *)arg;
+    call_phone_state_t  last = CALL_PHONE_STATE_IDLE;
+    uint32_t            stream_sec = 0;
+    uint32_t            tick = 0;
+    call_phone_state_t  st;
+
+    for (;;)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        if (call_phone_get_state(ctx->cp, &st) != ESP_OK)
+        {
+            continue;
+        }
+
+        if (st != last)
+        {
+            ESP_LOGI(TAG, "CallPhone state: %s -> %s",
+                     Call_State_Name(last), Call_State_Name(st));
+            last = st;
+            stream_sec = 0;
+        }
+
+        if (st == CALL_PHONE_STATE_STREAMING)
+        {
+            stream_sec++;
+            ESP_LOGI(TAG, "CallPhone streaming: SCO %s, %u s",
+                     bt_audio_hfp_is_audio_open(ctx->audio) ? "open" : "closed",
+                     (unsigned int)stream_sec);
+            if (stream_sec >= CALL_STREAM_KEEP_SECS)
+            {
+                ESP_LOGI(TAG, "CallPhone demo: auto hangup after %u s",
+                         (unsigned int)stream_sec);
+                call_phone_hangup(ctx->cp);
+                stream_sec = 0;
+                last = CALL_PHONE_STATE_IDLE;   /* 强制下一轮打印回 LISTENING */
+            }
+        }
+        else if (st == CALL_PHONE_STATE_CONNECTING && (++stream_sec % 5) == 0)
+        {
+            ESP_LOGI(TAG, "CallPhone connecting: waiting SCO open %u s...",
+                     (unsigned int)stream_sec);
+        }
+
+        /* 每 10s 打印内存余量（对照阶段三问题6：内部 RAM 紧张） */
+        if (++tick % 10 == 0)
+        {
+            ESP_LOGI(TAG, "CallPhone heap: internal=%lu B, psram=%lu B",
+                     (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        }
+    }
+}
+
+/** 第四阶段接线测试：Microphone_Init()（RX 总线）→ bt_audio_create → call_phone_create */
+static void CallPhone_Test(void)
+{
+    esp_err_t ret;
+
+    /* 1) microphone 模块初始化（自建 RX 总线 + INMP441 使能；先于 TX） */
+    ret = Microphone_Init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Microphone_Init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    audio_bus_handle_t rx_bus = Microphone_GetBus();
+    if (rx_bus == NULL)
+    {
+        ESP_LOGE(TAG, "Microphone_GetBus failed");
+        Microphone_Deinit();
+        return;
+    }
+
+    /* 2) 功放（TX）——HFP 下行经 on_pcm 播放 */
+    ret = Amplifier_Init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Amplifier_Init failed: %s", esp_err_to_name(ret));
+        Microphone_Deinit();
+        return;
+    }
+    Amplifier_Set_Volume(100);
+
+    /* 3) bt_audio：复用 HFP 能力 + 下行/事件回调 */
+    bt_audio_cfg_t bt_cfg = {
+        .device_name = "MPS-Sync-Test",
+        .on_pcm      = App_Bt_Pcm_Cb,
+        .on_event    = App_Bt_Evt_Cb,
+    };
+    bt_audio_handle_t audio = bt_audio_create(&bt_cfg);
+    if (audio == NULL)
+    {
+        ESP_LOGE(TAG, "bt_audio_create failed");
+        Amplifier_Deinit();
+        Microphone_Deinit();
+        return;
+    }
+
+    ret = bt_audio_start(audio);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "bt_audio_start failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    /* 4) CallPhone：注册 reader + esp-sr 唤醒词检测 + HFP 上行 */
+    call_phone_cfg_t cp_cfg = {
+        .bus            = rx_bus,
+        .audio          = audio,
+        .sample_rate    = 44100,
+        .pcm_fifo_bytes = 0,   /* 0 = 默认 16KB */
+    };
+    call_phone_handle_t cp = call_phone_create(&cp_cfg);
+    if (cp == NULL)
+    {
+        ESP_LOGE(TAG, "call_phone_create failed");
+        return;
+    }
+
+    ret = call_phone_start_listening(cp);
+    ESP_LOGI(TAG, "CallPhone start listening: %s (唤醒词: 你好小智)",
+             esp_err_to_name(ret));
+    if (ret != ESP_OK)
+    {
+        return;
+    }
+
+    /* 5) 状态监视任务（状态迁移 / 自动挂断 / 内存监视） */
+    call_test_ctx_t *ctx = (call_test_ctx_t *)calloc(1, sizeof(*ctx));
+    if (ctx != NULL)
+    {
+        ctx->cp = cp;
+        ctx->audio = audio;
+        if (xTaskCreatePinnedToCore(CallPhone_Test_Monitor, "call_mon",
+                                    4096, ctx, 5, NULL, 1) != pdPASS)
+        {
+            ESP_LOGE(TAG, "call_phone monitor task create failed");
+            free(ctx);
+        }
+    }
+
+    ESP_LOGI(TAG, "CallPhone phase-4 test ready: 请连接手机并说 你好小智");
+    ESP_LOGI(TAG, "free heap after bt+callphone: internal=%lu B, psram=%lu B",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
 void app_main(void)
 {
 	SystemStart();
@@ -776,12 +960,15 @@ void app_main(void)
 	/* 麦克风录音 10s -> 功放回放测试（测试完请注释掉） */
 	// Mic_Record_Playback_Test();
 
-	/* 蓝牙 A2DP 测试（bt_audio 模块） */
-	BtA2dp_Test();
+    /* 蓝牙 A2DP 测试（bt_audio 模块） */
+    // BtA2dp_Test();
+
+    /* 第四阶段：CallPhone 接线测试（完成后请注释掉） */
+    CallPhone_Test();
 
 	/* SD 卡测试与 LCD 测试各自为任务：同一条 SPI2 总线，SD 测完再通知 LCD */
-	//xTaskCreatePinnedToCore(Sd_Card_Test_Task, "sd_test", 8192, NULL, 5, NULL, 0);
-	//xTaskCreatePinnedToCore(Lcd_Touch_Test_Task, "lcd_test", 8192, NULL, 4, &s_lcdTestTask, 0);
+	// xTaskCreatePinnedToCore(Sd_Card_Test_Task, "sd_test", 8192, NULL, 5, NULL, 0);
+	// xTaskCreatePinnedToCore(Lcd_Touch_Test_Task, "lcd_test", 8192, NULL, 4, &s_lcdTestTask, 0);
 
 	
 	while(1)

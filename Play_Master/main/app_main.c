@@ -7,6 +7,8 @@
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "esp_heap_caps.h"
+#include <sys/stat.h>
+#include <errno.h>
 #include "driver/gpio.h"
 #include "StartAndStop.h"
 #include "sd_card.h"
@@ -19,6 +21,9 @@
 #include <stdbool.h>
 #include "bt_audio.h"
 #include "call_phone.h"
+#include "audio_decoder.h"
+#include <ctype.h>
+#include <dirent.h>
 
 
 static const char *TAG = "AppMain";
@@ -946,6 +951,255 @@ static void CallPhone_Test(void)
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
+/* ======================== audio_decoder（SD 卡 MP3 播放）测试 ===================== */
+
+/** 测试音乐目录：SD 卡 FATFS 挂载点 /sdcard/music */
+#define AUDIO_DEC_TEST_DIR  SD_CARD_MOUNT_POINT "/music"
+
+/** 单声道→立体声扩展缓冲容量（minimp3 单帧上限 1152 采样/声道 × 2 声道 × 2 缓冲） */
+#define AUDIO_DEC_STEREO_BUF_SAMPLES  (1152 * 2 * 2)
+
+/** 测试超时基线：估不出时长时最多播放 60s */
+#define AUDIO_DEC_TEST_TIMEOUT_MS     60000
+
+/** 单声道→立体声扩展工作缓冲（测试回调使用） */
+static int16_t *s_audDecStereoBuf = NULL;
+
+/** 音频解码测试状态（事件回调写入，主测试循环轮询） */
+static volatile bool s_audDecTestEof = false;
+static volatile bool s_audDecTestErr = false;
+static volatile uint64_t s_audDecTestBytes = 0;  /* 统计：累计回调输出字节 */
+
+/** audio_decoder 事件回调：打印 READY，EOF/ERROR 记录到测试状态 */
+static void Audio_Dec_Test_Evt_Cb(audio_decoder_event_id_t event,
+                                  const audio_decoder_info_t *info,
+                                  void *user_ctx)
+{
+    (void)user_ctx;
+    if (event == AUDIO_DECODER_EVT_READY && info != NULL)
+    {
+        ESP_LOGI(TAG, "decoder READY: %luHz/%uch dur=%lums bitrate=%lubps",
+                 (unsigned long)info->sample_rate, info->channels,
+                 (unsigned long)info->duration_ms,
+                 (unsigned long)info->bitrate_bps);
+    }
+    else if (event == AUDIO_DECODER_EVT_EOF)
+    {
+        s_audDecTestEof = true;
+        ESP_LOGI(TAG, "decoder EOF");
+    }
+    else if (event == AUDIO_DECODER_EVT_ERROR)
+    {
+        s_audDecTestErr = true;
+        ESP_LOGE(TAG, "decoder ERROR");
+    }
+}
+
+/** audio_decoder PCM 回调：不经 sync_protocol，PCM 直接进功放播放 */
+static void Audio_Dec_Test_Pcm_Cb(const int16_t *pcm, size_t samples,
+                                  uint32_t sample_rate, uint8_t channels,
+                                  void *user_ctx)
+{
+    (void)user_ctx;
+
+    if (pcm == NULL || samples == 0)
+    {
+        return;
+    }
+    s_audDecTestBytes += samples * sizeof(int16_t);
+
+    /* 全链路固定 44.1kHz：非 44.1kHz 文件播放速率会偏移，仅提示一次 */
+    if (sample_rate != AMPLIFIER_SAMPLE_RATE)
+    {
+        static bool warned = false;
+        if (!warned)
+        {
+            warned = true;
+            ESP_LOGW(TAG, "mp3 sample_rate=%lu != %d，速率不准确（建议 44.1kHz）",
+                     (unsigned long)sample_rate, AMPLIFIER_SAMPLE_RATE);
+        }
+    }
+
+    /* 单声道 → 立体声（L/R 写同一份），保证全链路双声道语义 */
+    if (channels == 1 && s_audDecStereoBuf != NULL)
+    {
+        size_t frames = samples;   /* 单声道：1 采样 = 1 帧 */
+        if (frames > (AUDIO_DEC_STEREO_BUF_SAMPLES / 2))
+        {
+            frames = AUDIO_DEC_STEREO_BUF_SAMPLES / 2;
+        }
+        for (size_t i = 0; i < frames; i++)
+        {
+            s_audDecStereoBuf[i * 2 + 0] = pcm[i];
+            s_audDecStereoBuf[i * 2 + 1] = pcm[i];
+        }
+        Amplifier_Play_Buffer((const uint8_t *)s_audDecStereoBuf,
+                              frames * 4, NULL, 200);
+        return;
+    }
+
+    Amplifier_Play_Buffer((const uint8_t *)pcm, samples * sizeof(uint16_t),
+                          NULL, 200);
+}
+
+/** 在 /sdcard/music 下寻找第一个 .mp3 文件（大小写不敏感） */
+static bool Audio_Dec_Test_Find_Mp3(char *path, size_t pathSize)
+{
+    DIR *dir = opendir(AUDIO_DEC_TEST_DIR);
+    if (dir == NULL)
+    {
+        ESP_LOGE(TAG, "opendir failed: %s", AUDIO_DEC_TEST_DIR);
+        return false;
+    }
+
+    bool found = false;
+    struct dirent *ent = NULL;
+    while ((ent = readdir(dir)) != NULL)
+    {
+        const char *dot = NULL;
+        if (ent->d_name[0] == '.')
+        {
+            continue;
+        }
+        dot = strrchr(ent->d_name, '.');
+        if (dot != NULL && strlen(dot) == 4 &&
+            tolower((unsigned char)dot[1]) == 'm' &&
+            tolower((unsigned char)dot[2]) == 'p' &&
+            tolower((unsigned char)dot[3]) == '3')
+        {
+            /* 跳过目录项：FATFS 对“目录名伪装成 .mp3”也能打开成功，
+             * 但 fseek/fread 全部失败（即本次遇到的故障模式） */
+            if (ent->d_type == DT_DIR)
+            {
+                ESP_LOGW(TAG, "skip dir-like mp3 entry: %s", ent->d_name);
+                continue;
+            }
+            snprintf(path, pathSize, "%s/%s", AUDIO_DEC_TEST_DIR, ent->d_name);
+            found = true;
+            break;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+/**
+ * @brief 测试：SD 卡 /sdcard/music → audio_decoder 解码 → 功放播放（不经 sync_protocol）
+ */
+static void Audio_Decoder_Test(void)
+{
+    char path[256] = {0};
+    audio_decoder_handle_t dec = NULL;
+    audio_decoder_info_t info;
+    uint32_t pos_ms = 0;
+    uint32_t cap_ms = 0;
+    esp_err_t ret;
+
+    ESP_LOGI(TAG, "=== Audio Decoder Test Start ===");
+
+    ret = Amplifier_Init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Amplifier_Init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    Amplifier_Set_Volume(80);
+
+    ret = SD_Card_Init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "SD_Card_Init failed: %s", esp_err_to_name(ret));
+        Amplifier_Deinit();
+        return;
+    }
+    ESP_LOGI(TAG, "SD card mounted at %s", SD_Card_Get_Mount_Point());
+
+    ret = audio_decoder_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "audio_decoder_init failed: %s", esp_err_to_name(ret));
+        audio_decoder_deinit();
+        Amplifier_Deinit();
+        return;
+    }
+
+    /* 找一首测试曲目（music 文件夹下的第一个 .mp3） */
+    if (!Audio_Dec_Test_Find_Mp3(path, sizeof(path)))
+    {
+        ESP_LOGE(TAG, "no .mp3 file found under %s", AUDIO_DEC_TEST_DIR);
+        audio_decoder_deinit();
+        Amplifier_Deinit();
+        return;
+    }
+    ESP_LOGI(TAG, "test track: %s", path);
+
+    /* 单声道→立体声扩展缓冲 */
+    s_audDecStereoBuf = (int16_t *)malloc(AUDIO_DEC_STEREO_BUF_SAMPLES *
+                                          sizeof(int16_t));
+    if (s_audDecStereoBuf == NULL)
+    {
+        ESP_LOGE(TAG, "stereo buffer alloc failed");
+        audio_decoder_deinit();
+        Amplifier_Deinit();
+        return;
+    }
+
+    /* 打开：内部创建解码任务，文件头解析完成后回调 READY */
+    audio_decoder_cfg_t cfg = {
+        .on_pcm    = Audio_Dec_Test_Pcm_Cb,
+        .pcm_ctx   = NULL,
+        .on_event  = Audio_Dec_Test_Evt_Cb,
+        .event_ctx = NULL,
+    };
+    dec = audio_decoder_open(path, &cfg);
+    if (dec == NULL)
+    {
+        ESP_LOGE(TAG, "audio_decoder_open failed: %s", path);
+        goto test_exit;
+    }
+
+    memset(&info, 0, sizeof(info));
+    if (audio_decoder_get_info(dec, &info) == ESP_OK)
+    {
+        ESP_LOGI(TAG, "track info: %luHz/%uch  dur=%lu ms  bitrate=%lubps",
+                 (unsigned long)info.sample_rate, info.channels,
+                 (unsigned long)info.duration_ms,
+                 (unsigned long)info.bitrate_bps);
+    }
+
+    ret = audio_decoder_play(dec);
+    ESP_LOGI(TAG, "audio_decoder_play: %s", esp_err_to_name(ret));
+
+    /* 播放到 EOF（或兜底超时），每秒打印一次进度 */
+    cap_ms = (info.duration_ms > 0) ? (info.duration_ms + 3000)
+                                    : AUDIO_DEC_TEST_TIMEOUT_MS;
+    for (uint32_t elapsed = 0; elapsed < cap_ms &&
+                               !s_audDecTestEof && !s_audDecTestErr;
+         elapsed += 1000)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (audio_decoder_get_position_ms(dec, &pos_ms) == ESP_OK)
+        {
+            ESP_LOGI(TAG, "position %lu / %lu ms  heap=%u  pcm_bytes=%llu",
+                     (unsigned long)pos_ms, (unsigned long)info.duration_ms,
+                     (unsigned int)esp_get_free_heap_size(),
+                     (unsigned long long)s_audDecTestBytes);
+        }
+    }
+
+    ESP_LOGI(TAG, "=== Audio Decoder Test Finished (eof=%d err=%d) ===",
+             s_audDecTestEof, s_audDecTestErr);
+
+test_exit:
+    if (dec != NULL)
+    {
+        audio_decoder_close(dec);
+        dec = NULL;
+    }
+    free(s_audDecStereoBuf);
+    s_audDecStereoBuf = NULL;
+    /* 功放与 SD 卡保持挂起状态，便于后续其他顶层测试复用 */
+}
 void app_main(void)
 {
 	SystemStart();
@@ -964,12 +1218,14 @@ void app_main(void)
     // BtA2dp_Test();
 
     /* 第四阶段：CallPhone 接线测试（完成后请注释掉） */
-    CallPhone_Test();
+    // CallPhone_Test();   /* 与 MP3 解码测试共用功放，跑 audio_decoder 测试时临时屏蔽 */
 
 	/* SD 卡测试与 LCD 测试各自为任务：同一条 SPI2 总线，SD 测完再通知 LCD */
 	// xTaskCreatePinnedToCore(Sd_Card_Test_Task, "sd_test", 8192, NULL, 5, NULL, 0);
 	// xTaskCreatePinnedToCore(Lcd_Touch_Test_Task, "lcd_test", 8192, NULL, 4, &s_lcdTestTask, 0);
 
+	/* SD 卡 MP3 播放测试（audio_decoder 模块）：不经 sync_protocol，直接经功放播放 */
+    Audio_Decoder_Test();
 	
 	while(1)
 	{

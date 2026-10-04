@@ -11,11 +11,11 @@ endforeach()
     
 # 2. 搜集所有的 .c 文件
 file(GLOB_RECURSE SOURCES "*.c")
-
+ 
 # 3. 注册组件
 idf_component_register(
     SRCS ${SOURCES}
     INCLUDE_DIRS ${MID_INCLUDE_DIRS}
     # Middlewares 的传感器通常需要调用 BSP 层的底层通信逻辑
-    REQUIRES bsp app_update esp_https_ota esp_partition esp_http_client mbedtls nvs_flash
+    REQUIRES bsp app_update esp_https_ota esp_partition esp_http_client mbedtls nvs_flash esp_wifi esp_netif esp_event lwip esp_ringbuf esp_timer
 ) 

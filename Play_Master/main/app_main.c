@@ -24,6 +24,9 @@
 #include "audio_decoder.h"
 #include <ctype.h>
 #include <dirent.h>
+#include "nvs_flash.h"
+#include "wifi_manager.h"
+#include "node_role.h"
 
 
 static const char *TAG = "AppMain";
@@ -1200,10 +1203,193 @@ test_exit:
     s_audDecStereoBuf = NULL;
     /* 功放与 SD 卡保持挂起状态，便于后续其他顶层测试复用 */
 }
+
+/* ======================== WiFi / 组播测试 ======================== */
+
+/** 测试组播组与端口（与分层设计 3.4.2 的音频通道约定一致） */
+#define WIFI_TEST_MCAST_GROUP  "239.0.0.1"
+#define WIFI_TEST_MCAST_PORT   5678
+
+/** 测试发送次数 */
+#define WIFI_TEST_SEND_COUNT   10
+
+/** 测试用：wifi_manager 事件回调（仅打印状态变化，测试观察用） */
+static void Wifi_Test_Evt_Cb(const wifi_mgr_event_t *evt, void *ctx)
+{
+    (void)ctx;
+
+    switch (evt->id)
+    {
+    case WIFI_EVT_CONNECTED:
+        ESP_LOGI(TAG, "[wifi] CONNECTED ip=%s rssi=%d", evt->ip, evt->rssi);
+        break;
+    case WIFI_EVT_DISCONNECTED:
+        ESP_LOGI(TAG, "[wifi] DISCONNECTED");
+        break;
+    case WIFI_EVT_RECONNECTING:
+        ESP_LOGI(TAG, "[wifi] RECONNECTING");
+        break;
+    case WIFI_EVT_IP_CHANGED:
+        ESP_LOGI(TAG, "[wifi] IP_CHANGED ip=%s", evt->ip);
+        break;
+    default:
+        break;
+    }
+}
+
+/**
+ * @brief 测试：wifi_manager 连接热点，并沿组播通道发送/接收 UDP 数据
+ *
+ * 说明：
+ *   - 凭据：测试开头把整份运行参数（含 HW666）经 node_role_set 写入 NVS，
+ *     wifi_manager 启动时经 node_role_get() 直接从 NVS 读取连接热点；
+ *   - 自环：wifi_manager 已开 IP_MULTICAST_LOOP，本机发的包会经 lwIP 回环回本机，
+ *     单机即可验证"发->收"闭环（从/灯控未实现时用）；
+ *   - 串口按序打印 CONNECTED -> 每包 send 结果 -> recv 结果（应收到刚发的内容）。
+ */
+static void Wifi_Mcast_Test(void)
+{
+    wifi_manager_handle_t wifi = NULL;
+    wifi_mcast_handle_t   chan = NULL;
+    wifi_manager_cfg_t    cfg  = {0};
+    wifi_mcast_cfg_t      mc   = {0};
+    char txbuf[64];
+    char rxbuf[256];
+    size_t rx_len = 0;
+    node_role_cfg_t rcfg = {0};
+    esp_err_t err;
+
+    /* 1. 运行参数整体保存进 NVS（node_role 为唯一管理入口）：全部字段显式赋值
+     *    （默认值来自 node_role.h 公共宏，与《nvs存储.md》一致），node_role_set 整包写回；
+     *    wifi 连接凭据也在其中，wifi_manager 启动时经 node_role_get() 直接读取 */
+    err = node_role_init(NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "node_role_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    snprintf(rcfg.wifi_ssid,         sizeof(rcfg.wifi_ssid),         "%s", NODE_ROLE_DEFAULT_SSID);
+    snprintf(rcfg.wifi_password,     sizeof(rcfg.wifi_password),     "%s", NODE_ROLE_DEFAULT_PASSWORD);
+    snprintf(rcfg.ota_server_url,    sizeof(rcfg.ota_server_url),    "%s", NODE_ROLE_DEFAULT_OTA_URL);
+    snprintf(rcfg.multicast_group,   sizeof(rcfg.multicast_group),   "%s", NODE_ROLE_DEFAULT_GROUP);
+    rcfg.role              = NODE_ROLE_MASTER;
+    rcfg.volume            = NODE_ROLE_DEFAULT_VOLUME;
+    rcfg.play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
+    rcfg.sync_delay_ms     = NODE_ROLE_DEFAULT_SYNC_DELAY_MS;
+    rcfg.audio_sample_rate = NODE_ROLE_DEFAULT_SAMPLE_RATE;
+
+    err = node_role_set(&rcfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "node_role_set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    /* 读回并打印整份配置，确认 NVS 里保存的是完整参数（不只是 WiFi 两个字段） */
+    if (node_role_get(&rcfg) == ESP_OK)
+    {
+        ESP_LOGI(TAG, "node_role saved to NVS: role=%u ssid=\"%s\" vol=%u rate=%u delay=%u grp=\"%s\" ota=\"%s\"",
+                 (unsigned)rcfg.role, rcfg.wifi_ssid, (unsigned)rcfg.volume,
+                 (unsigned)rcfg.audio_sample_rate, (unsigned)rcfg.sync_delay_ms,
+                 rcfg.multicast_group, rcfg.ota_server_url);
+    }
+
+    ESP_LOGI(TAG, "=== Wifi Multicast Test Start (SSID=\"%s\") ===",
+             rcfg.wifi_ssid);
+
+    /* 默认配置：连接超时 10s、重连间隔 3s、max_retries=0 无限重连 */
+    wifi = wifi_manager_create(&cfg);
+    if (wifi == NULL)
+    {
+        ESP_LOGE(TAG, "wifi_manager_create failed");
+        goto test_exit;
+    }
+    wifi_manager_register_event_cb(wifi, Wifi_Test_Evt_Cb, NULL);
+
+    err = wifi_manager_start(wifi);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "wifi_manager_start failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+    ESP_LOGI(TAG, "connecting to AP, waiting for IP...");
+
+    /* 轮询等待拿到 IP（最多 15s，超时即退出测试） */
+    for (int i = 0; i < 150; i++)
+    {
+        if (wifi_manager_is_connected(wifi))
+        {
+            char ip[16] = {0};
+            size_t ip_len = sizeof(ip);
+            if (wifi_manager_get_ip(wifi, ip, &ip_len) == ESP_OK)
+            {
+                ESP_LOGI(TAG, "wifi connected, ip=%s rssi=%d",
+                         ip, wifi_manager_get_rssi(wifi));
+            }
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (i == 149)
+        {
+            ESP_LOGE(TAG, "wait ip timeout, please check SSID/PWD");
+            goto test_exit;
+        }
+    }
+
+    /* 打开音频组播通道：rx_enable=true，自环回包会进 RX FIFO */
+    mc.group          = WIFI_TEST_MCAST_GROUP;
+    mc.port           = WIFI_TEST_MCAST_PORT;
+    mc.rx_enable      = true;
+    mc.rx_fifo_bytes  = 4096;
+    err = wifi_manager_mcast_open(wifi, &mc, &chan);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "mcast_open %s:%u failed: %s",
+                 WIFI_TEST_MCAST_GROUP, WIFI_TEST_MCAST_PORT,
+                 esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    for (int seq = 0; seq < WIFI_TEST_SEND_COUNT; seq++)
+    {
+        int n = snprintf(txbuf, sizeof(txbuf),
+                         "WIFI_TEST seq=%d cnt=%d", seq, WIFI_TEST_SEND_COUNT);
+
+        err = wifi_manager_mcast_send(chan, txbuf, (size_t)n, 1000);
+        ESP_LOGI(TAG, "mcast send[%d/%d] %d bytes -> %s",
+                 seq + 1, WIFI_TEST_SEND_COUNT, n,
+                 (err == ESP_OK) ? "OK" : esp_err_to_name(err));
+
+        /* 接收本机刚发出去的包（lwIP 组播回环），200ms 超时 */
+        memset(rxbuf, 0, sizeof(rxbuf));
+        err = wifi_manager_mcast_recv(chan, rxbuf, sizeof(rxbuf) - 1,
+                                      &rx_len, 200);
+        if (err == ESP_OK)
+        {
+            rxbuf[rx_len] = '\0';
+            ESP_LOGI(TAG, "mcast recv %d bytes: \"%s\"", (int)rx_len, rxbuf);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    ESP_LOGI(TAG, "=== Wifi Multicast Test Finished ===");
+
+test_exit:
+    if (chan != NULL)
+    {
+        wifi_manager_mcast_close(chan);
+        chan = NULL;
+    }
+    wifi_manager_destroy(wifi);
+}
+
 void app_main(void)
 {
 	SystemStart();
 	StartAndStop_Init();
+
+	nvs_flash_init();
 
 	if (esp_psram_is_initialized()) {
         printf("PSRAM 初始化成功！可用大小: %d 字节\n", esp_psram_get_size());
@@ -1225,7 +1411,10 @@ void app_main(void)
 	// xTaskCreatePinnedToCore(Lcd_Touch_Test_Task, "lcd_test", 8192, NULL, 4, &s_lcdTestTask, 0);
 
 	/* SD 卡 MP3 播放测试（audio_decoder 模块）：不经 sync_protocol，直接经功放播放 */
-    Audio_Decoder_Test();
+    // Audio_Decoder_Test();
+
+	/* 第六阶段：wifi_manager 连接 + UDP 组播收发测试（SSID: HW666） */
+	Wifi_Mcast_Test();
 	
 	while(1)
 	{

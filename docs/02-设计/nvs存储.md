@@ -28,7 +28,7 @@
 | `role` | uint8_t（`node_role_t`） | `NODE_ROLE_MASTER`（0） | 节点角色：主 / 从 |
 | `wifi_ssid` | char[32] | 空 | WiFi 名称（触摸屏配网填写） |
 | `wifi_password` | char[64] | 空 | WiFi 密码（触摸屏配网填写） |
-| `ota_server_url` | char[256] | `http://192.168.4.16:5000/ota/check` | OTA 服务器地址，`ota_manager` 启动按 `cfg->check_url → NVS → 默认宏` 读取 |
+| `ota_server_url` | char[256] | `192.168.4.16:5000/ota/check` | OTA 服务器地址，`ota_manager` 启动按 `cfg->check_url → node_role 配置 → 默认宏` 读取；默认值不带协议头，使用时自行补 `http://` |
 | `volume` | uint8_t | 80 | 软件音量 0~100，掉电恢复 |
 | `play_mode` | uint8_t（`music_play_mode_t`） | 0（`MUSIC_PLAY_MODE_SEQUENTIAL`） | MusicPlay 播放模式：0 顺序播放、1 单曲循环，UI/PlayMode 修改时写入 |
 | `sync_delay_ms` | uint32_t | 200 | 组播同步延迟 D（ms），掉电恢复 |
@@ -37,11 +37,12 @@
 
 ### 1.3 说明
 
-- `play_mode`、`version` 字段当前未包含在主文档 §3.4.3 的 `node_role_cfg_t` 中，实现代码时同步补充；
+- `play_mode`、`version` 字段已并入主文档 §3.4.3 的 `node_role_cfg_t`（blob 结构带 `version` 头），字段顺序与本表一致；
 - 端口号（音频 5678/5679、灯控 8889）为代码常量，不入 NVS；
 - `device_name`（蓝牙广播名）不入 NVS，按 `PLAY_MASTER_BT` 自动生成；
+- 开发期默认 WiFi（`HW666` / `ADajLP691TY.`）由 `node_role` 内置默认宏（`NODE_ROLE_DEFAULT_SSID`/`NODE_ROLE_DEFAULT_PASSWORD`）提供并首次落盘，生产默认留空、由触摸屏配网填写；
 - SD 续播（`last_track_*`）本期不实现，预留后续版本扩展；播放源与播放状态属运行态，不持久化；
-- 此前主文档中「NVS 键 `ota_server_url`」的单键表述，统一为本设计的整体 blob 存储方式。
+- 配置统一为整体 blob 存储（命名空间 `node_role`、Key `cfg`），NVS 中不单独建键（含 `ota_server_url`）；各业务模块一律经 `node_role_get()` 读取，不直接操作 NVS。
 
 ------
 

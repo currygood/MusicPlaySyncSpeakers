@@ -1,4 +1,4 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -28,6 +28,7 @@
 #include "nvs_flash.h"
 #include "wifi_manager.h"
 #include "node_role.h"
+#include "ui.h"
 
 
 static const char *TAG = "AppMain";
@@ -1602,6 +1603,44 @@ test_exit:
     wifi_manager_destroy(wifi);
 }
 
+/* ======================== 第八阶段：UI 模块联调测试 ======================== */
+
+/**
+ * @brief 第八阶段测试：UI 模块（LVGL 9.6 自持 UI_Task）
+ *
+ * 说明：
+ *   - ui_init(NULL)：全占位模式（未接 LightControl/CallPhone/wifi_manager 句柄），
+ *     显示/触摸/切页为真实功能，业务按键按下仅打 [占位] 日志注明将来调用的接口；
+ *   - UI 内部自举顺序：SPIFFS storage 挂载（图片）→ I2C 总线 → LCD/触摸
+ *     → LVGL 9.6 移植 → 页面构建 → UI_Task（Core 1 / 优先级 12 / 栈 13312）；
+ *   - 观察点：①屏幕出现"状态栏 + 播放页 + Tab 栏"，封面/灯泡 PNG 正常显示
+ *     （需 menuconfig 开 CONFIG_LV_USE_LODEPNG）；②三个 Tab 切换、本地列表
+ *     进出；③按播放键/拨灯开关/点配网等，串口打印对应 [占位] 日志；
+ *   - 无 SD 卡也不影响本测试（图片已烧录 flash storage 分区，SD 仅音乐用）；
+ *   - 与 MP3 解码测试互斥：两者任务同在 Core 1 会互相抢占，分开验证。
+ */
+static void UI_Test(void)
+{
+    esp_err_t ret;
+
+    ESP_LOGI(TAG, "=== UI Test Start（第八阶段：界面联调） ===");
+    ESP_LOGI(TAG, "free heap before UI: internal=%lu B, psram=%lu B",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    ret = ui_init(NULL);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "ui_init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "free heap after UI: internal=%lu B, psram=%lu B",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    ESP_LOGI(TAG, "=== UI Test running: 触摸切 Tab / 按播放键 / 拨灯开关，观察 [占位] 日志 ===");
+}
+
 void app_main(void)
 {
 	SystemStart();
@@ -1629,13 +1668,16 @@ void app_main(void)
 	// xTaskCreatePinnedToCore(Lcd_Touch_Test_Task, "lcd_test", 8192, NULL, 4, &s_lcdTestTask, 0);
 
 	/* SD 卡 MP3 播放测试（audio_decoder 模块）：不经 sync_protocol，直接经功放播放 */
-    // Audio_Decoder_Test();
+    // Audio_Decoder_Test();   /* 测 UI 时临时屏蔽：解码与 UI_Task 同在 Core 1 会互相抢占 */
 
 	/* 第六阶段：wifi_manager 连接 + UDP 组播收发测试（SSID: HW666） */
 	// Wifi_Mcast_Test();
 
 	/* 第七阶段：LightControl 灯控模块回环测试 */
-	Light_Control_Test();
+	// Light_Control_Test();
+
+	/* 第八阶段：UI 模块联调测试（LVGL 9.6 自持 UI_Task，全占位模式） */
+	UI_Test();
 	
 	while(1)
 	{

@@ -18,5 +18,9 @@ idf_component_register(
     INCLUDE_DIRS ${MID_INCLUDE_DIRS}
     # Middlewares 的传感器通常需要调用 BSP 层的底层通信逻辑；esp-sr 供 CallPhone 唤醒词检测
     # App 层模块（LightControl）依赖 msystem（wifi_manager 组播通道）与 cjson（灯控 JSON 协议）
-    REQUIRES middlewares esp-sr msystem cjson
+    # App/UI 依赖：lvgl（LVGL 9 自持 UI_Task 方案，UI 代码 include "lvgl.h"）
+    #             + spiffs（UI 图片烧录 storage 分区，esp_vfs_spiffs_register 挂载）
+    # 注意：esp_lvgl_port 本工程未使用，其组件名是 esp_lvgl_port（不是 lvgl_port/esp_lvgl），
+    #       不要加进 REQUIRES，否则 CMake 解析报 unknown name
+    REQUIRES middlewares esp-sr msystem cjson spiffs lvgl
 )

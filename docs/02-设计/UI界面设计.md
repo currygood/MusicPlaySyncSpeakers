@@ -40,7 +40,7 @@
 │           内容区（高 176px，各页面复用）          │
 │                                                │
 ├────────────────────────────────────────────────┤
-│   ♫ 播放      │      💡 灯控      │   ⚙ 设置    │  ← Tab 栏（常驻，高 40px）
+│       ♪        │        💡        │      ⚙      │  ← Tab 栏（常驻，高 40px，纯图标）
 └────────────────────────────────────────────────┘
 ```
 
@@ -148,6 +148,7 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 | `LV_DEF_REFR_PERIOD` | 33 | ≈30fps |
 | `LV_INDEV_DEF_READ_PERIOD` | 30 | 对齐触摸轮询节奏 |
 | `LV_FONT_DEFAULT` | 内置兜底字体 | SD 缺席时的默认字体（见 3.2） |
+| `LV_FONT_MONTSERRAT_16 / _24` | 1 | 启用内置 symbol 字形（控件图标，字号档见 3.3） |
 
 ------
 
@@ -184,10 +185,32 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 - 生成命令示例（详见 8.2）。
 - 数字/时间统一用字体内置 ASCII 字形，不单独做数字字体。
 
-### 3.3 图标方案
+### 3.3 图标方案（全图标化，控件零文字）
 
-- **兜底图标**：LVGL 内置 symbol（`LV_SYMBOL_WIFI`、`LV_SYMBOL_PLAY`、`LV_SYMBOL_PAUSE` 等）+ 纯色色块自绘，随固件编译，不依赖 SD；
-- **增强图标**：SD 卡 `/sdcard/ui/icons/` 下 PNG（16×16 / 24×24 两档），存在则优先加载，缺失逐个回退 symbol；
+**原则**：所有功能控件一律用**图形图标**表达（播放/暂停/上下曲/设置/灯控等），不用文字按钮；仅"动作类按钮"（确定/取消/WiFi 配网等）和源 chip 保留文字。图标不依赖 SD 卡——SD 缺席时图标体系完整可用。
+
+**字形来源（两类，均随固件编译）**：
+
+| 来源 | 覆盖范围 | 说明 |
+| :--- | :--- | :--- |
+| LVGL 内置 symbol 字体（FontAwesome 子集） | 播放 ▶⏸、上下曲 ⏮⏭、循环 ↻、音量、WiFi、蓝牙、设置 ⚙、列表 ≡、刷新等 | lv_conf 启用 `LV_FONT_MONTSERRAT_16 / _24` 即含对应字号 symbol 字形；零额外文件 |
+| 自定义图标字体（Material Icons 子集，lv_font_conv 生成 C 数组） | 内置 symbol 缺失的 4 个字形：**灯泡 lightbulb**（Tab + 灯控页 Tab 位）、**麦克风 mic**（状态栏 + 设置页）、**单曲循环 repeat_one**（播放模式）、**同步 sync** | ≈10KB，与 symbol 同用法（label 渲染），同样单色可着色 |
+
+**图标 → 控件映射表**（实现对照）：
+
+| 位置 | 图标 | 字形来源 |
+| :--- | :--- | :--- |
+| 播放页 ⏮ / ▶⏸ / ⏭ | `LV_SYMBOL_PREV` / `PLAY` / `PAUSE` / `NEXT` | 内置 |
+| 播放模式（顺序 / 单曲循环） | `LV_SYMBOL_LOOP` / repeat_one | 内置 / 自定义 |
+| 播放页列表入口 | `LV_SYMBOL_LIST` | 内置 |
+| 音量 | `LV_SYMBOL_VOLUME_MAX / MID / MUTE` | 内置 |
+| Tab 栏（纯图标，选中主色/未选灰） | ♪=`AUDIO`、灯泡=lightbulb、⚙=`SETTINGS` | 内置 / 自定义 / 内置 |
+| 状态栏 WiFi / 蓝牙 | `LV_SYMBOL_WIFI` / `BLUETOOTH` | 内置 |
+| 状态栏同步 / 麦克风 | sync / mic | 自定义 |
+| 灯控页大图标 48px | bulb_on / bulb_off（彩色） | SD PNG（可选，缺省回退自定义灯泡字形） |
+
+**控件图标不建议用 PNG 的原因**：控件图标需要随状态变色（选中/未选、ON/OFF、pending 半透明、异常红色），PNG 颜色定死、每种状态都要出一张变体图；字体字形改一个 style 属性即可换色/变透明度。**PNG 只用于颜色固定的图**（封面、彩色灯泡大图标）。
+
 - 无电量显示——硬件无电量计，不虚构。
 
 ### 3.4 布局网格与控件规范
@@ -224,7 +247,7 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
                 ├──────────────────────────────────────┤
    Tab 切换 ──► │            内容区 320×176            │ ◄── 二级页覆盖层
                 ├──────────────────────────────────────┤
-                │   ♫ 播放    │    💡 灯控    │  ⚙ 设置 │
+                │      ♪       │       💡       │  ⚙   │   ← Tab 栏纯图标（3.3）
                 └──────────────────────────────────────┘
 
   播放页 ──[列表]──► 本地音乐列表 ──[←]──► 播放页
@@ -263,20 +286,18 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 
 ### 5.2 播放页（Tab 1，默认主页）
 
-内容区 176px 纵向分 5 行：
+内容区 176px 纵向分两段：顶区 128px（左封面 + 右信息列）+ 控制行 48px：
 
 ```reStructuredText
 ┌────────────────────────────────────────────────┐
-│ [●蓝牙]                              [≡ 列表]  │ ← 行A 32px：源chip(左) 列表入口(右)
-│ ┌────────────────────────────────────────────┐ │
-│ │ 歌曲标题歌曲标题……（20px 跑马灯）            │ │ ← 行B 40px 面板
-│ │ 歌手 · 专辑（12px 次色）                     │ │
-│ └────────────────────────────────────────────┘ │
-│ ───────────────────●──────────────             │ ← 行C 24px：进度条+时间(本地源)
-│ 01:23                          / 04:56         │
-│                                                │
-│  [单曲]     ⏮        ▶⏸        ⏭        🔊    │ ← 行D 48px：模式+三主控键
-│                                  ─────●──────  │ ← 行E 32px：音量 slider 0-100
+│ ┌──────────┐   [●蓝牙]               [≡ 列表]  │
+│ │          │   歌曲标题歌曲标题……（20px 跑马灯） │   顶区 128px：
+│ │ 专辑封面 │   歌手 · 专辑（12px 次色）          │   左：封面 128×128（占位图）
+│ │ 128×128  │   ──────────●────────────          │   右：信息列
+│ │          │   01:23            /  04:56        │
+│ │          │   🔊 ───●──────────                │
+│ └──────────┘                                    │
+│     [🔂]       ⏮        ▶⏸        ⏭           │ ← 控制行 48px：模式+三主控键
 └────────────────────────────────────────────────┘
 ```
 
@@ -284,12 +305,13 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 
 | 元素 | 数据来源（显示） | 动作（控制） |
 | :--- | :--- | :--- |
+| 封面 128×128 | `/sdcard/ui/img/cover_default.png`，**恒为占位图**（BT 源无封面接口、本地源不解析 ID3 内嵌图）；SD 缺失→内置色块占位 | 无 |
 | 源 chip | `view->source`；`PLAY_MODE_EVT_CHANGED` 刷新 | 点击 → `play_mode_set(另一源)`（见 6.3） |
 | 列表入口 | — | 点击 → 本地音乐列表；**BT 源时禁用置灰**（列表是本地源功能） |
 | 标题/副标题 | `view->track`：本地源=`display_name`+文件名；BT 源=歌名+`artist · album`（承载方式见 9.2 建议） | — |
-| 进度条+时间 | 500ms 轮询 `music_play_get_position_ms()`（9.2 建议）；时长 `view->track->duration_ms` | **只读，不支持拖动**（`audio_decoder` 不做 seek，接口不虚构）；**BT 源整行隐藏**（AVRCP 无 position 接口） |
+| 进度条+时间 | 500ms 轮询 `music_play_get_position_ms()`（9.2 建议）；时长 `view->track->duration_ms` | **只读，不支持拖动**（`audio_decoder` 不做 seek，接口不虚构）；**BT 源整段隐藏**（AVRCP 无 position 接口） |
 | ⏮ ▶⏸ ⏭ | `view->state` 决定 ▶/⏸ 图标 | `music_play_command(TOGGLE/NEXT/PREV)` |
-| 模式按钮 | `view->mode`：顺序 ↔ 单曲循环 | `music_play_set_mode()` |
+| 模式按钮 | `view->mode`：顺序=↻ / 单曲循环=🔂（图标切换，字形见 3.3） | `music_play_set_mode()` |
 | 音量 slider | `view->volume`（`MUSIC_EVT_VOLUME_CHANGED` 回流） | 拖动实时 `music_play_set_volume()`（UI 侧"拖动中"标志防回流抖动） |
 
 **"指令 = 期望"的 UI 呈现**：
@@ -329,7 +351,7 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 └────────────────────────────────────────────────┘
 ```
 
-- 两张卡片 ≈148×128：图标 48px + 名称 16px + 状态文字 12px + switch；灯名固定 `bedroom` / `livingroom`（灯控协议规范）。
+- 两张卡片 ≈148×128：图标 48px + 名称 16px + 状态文字 12px + switch；灯名固定 `bedroom` / `livingroom`（灯控协议规范）。大图标优先用 SD 卡彩色 PNG（`bulb_on/bulb_off`，点亮态可做琥珀色发光效果），缺省回退自定义灯泡字形（3.3）。
 - **三态显示**：UNKNOWN（灰"未知"）/ ON（琥珀"开"）/ OFF（面板色"关"）；初始与重连后用 `light_control_get_state()` 恢复。
 - **交互时序**：点击 switch → `light_control_send(cmd, name)` → 卡片进入等待态（switch 半透明 + 图标闪烁）→ `LIGHT_EVT_ACK` 按回执 `ok` 落定；`LIGHT_EVT_ERROR`（回执异常或 90s 上报超时）→ Toast"控制失败/状态超时"，状态回落 UNKNOWN。
 - `LIGHT_EVT_STATUS`（30s 周期上报）静默刷新图标，无动画。
@@ -590,10 +612,11 @@ UI/
     │   ├── ui_font_12.bin    常用汉字子集+ASCII，辅助字号
     │   ├── ui_font_16.bin    同上，正文字号
     │   └── ui_font_20.bin    同上，标题字号
-    ├── icons/                可选增强图标（16/24px PNG，命名见下）
-    │   ├── wifi_ok.png  wifi_err.png  bt_on.png  sync_ok.png …
+    ├── icons/                彩色静态图（仅此类用 PNG；状态/控件图标一律字体字形，见 3.3）
+    │   ├── bulb_on.png       灯控页大图标·点亮态（48×48，可选）
+    │   └── bulb_off.png      灯控页大图标·熄灭态（48×48，可选）
     └── img/
-        └── cover_default.png 专辑占位图（240×240 内）
+        └── cover_default.png 专辑占位图（128×128，全卡唯一必选图）
 ```
 
 ### 8.2 字体生成规范（lv_font_conv）
@@ -608,9 +631,16 @@ npx lv_font_conv --font NotoSansSC-Regular.ttf --size 16 --bpp 4 \
 npx lv_font_conv --font NotoSansSC-Regular.ttf --size 16 --bpp 4 \
   --range 0x20-0x7E --symbols "播放暂停上下曲音量灯控设置配网连接中已断开未启用挂载本地蓝牙同步未知开关注点击刷新返回确定取消失败成功扫描密码输入完成重启升级版本关于设备语音助手…" \
   --format lvgl -o ui_font_fallback_16.c
+
+# 自定义图标字体（补内置 symbol 缺失字形：灯泡/麦克风/单曲循环/同步；C 数组编进固件 ≈10KB）
+# 字形码位以所选图标库（Material Icons / FontAwesome）官方码位表为准
+npx lv_font_conv --font MaterialIcons-Regular.ttf --size 24 --bpp 4 \
+  --range <灯泡码位>,<麦克风码位>,<单曲循环码位>,<同步码位> \
+  --format lvgl -o ui_icons_24.c
 ```
 
 - 常用 1500 字覆盖全部界面文案；`--bpp 4`（抗锯齿）+ `--no-compress`（`LV_USE_FONT_COMPRESSED=0` 配套）。
+- 内置 symbol 字形随 Montserrat 字号启用（lv_conf 开 `LV_FONT_MONTSERRAT_16` / `LV_FONT_MONTSERRAT_24`），无需额外文件。
 
 ### 8.3 lv_fs 映射
 
@@ -622,9 +652,9 @@ npx lv_font_conv --font NotoSansSC-Regular.ttf --size 16 --bpp 4 \
 
 | 异常 | 字体 | 图标 | 播放页 | 列表页 | 配网/设置 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| SD 未挂载 | 内置兜底字体 | LVGL symbol | 正常（无本地播放） | 空态"SD 卡未挂载" | **完全可用**（不依赖 SD） |
+| SD 未挂载 | 内置兜底字体 | 字形图标全部内置不受影响；cover/bulb PNG 回退字形 | 正常（无本地播放） | 空态"SD 卡未挂载" | **完全可用**（不依赖 SD） |
 | fonts/*.bin 加载失败 | 同上回退 | 不受影响 | 正常 | 正常 | 正常 |
-| icons/*.png 缺失/损坏 | 不受影响 | 逐个回退 symbol | 正常 | 正常 | 正常 |
+| icons/*.png 缺失/损坏 | 不受影响 | 回退灯泡字形（字体） | 正常 | 正常 | 正常 |
 | cover 缺失 | 不受影响 | 内置色块占位 | 正常 | 正常 | 正常 |
 | SD 播放中拔卡 | 已加载资源继续用 | — | `MUSIC_EVT_ERROR` → Toast + 停止态 | 空态 | — |
 
@@ -676,7 +706,7 @@ esp_err_t music_play_get_position_ms(music_play_handle_t player, uint32_t *posit
 
 | 阶段 | 内容 | 准出条件 | 依赖 |
 | :--- | :--- | :--- | :--- |
-| **M1 显示/触摸底座** | 自持 UI_Task + flush/read 适配、主题与双轨字体、状态栏/Tab 栏骨架、三页静态布局（假数据）、页面切换 | 320×240 稳定刷屏 ≈30fps、触摸点击/滚动正常、SD 字体加载与降级切换生效；`LCD_TOUCH_SELF_TEST=0` | LCD_Touch（已实现）、sd_card（已实现）；MusicPlay 等可为 NULL |
+| **M1 显示/触摸底座** | 自持 UI_Task + flush/read 适配、主题与双轨字体、图标字形资产（symbol 字号启用 + 自定义 iconfont 生成，见 3.3）、状态栏/Tab 栏骨架、三页静态布局（假数据）、页面切换 | 320×240 稳定刷屏 ≈30fps、触摸点击/滚动正常、SD 字体加载与降级切换生效；`LCD_TOUCH_SELF_TEST=0` | LCD_Touch（已实现）、sd_card（已实现）；MusicPlay 等可为 NULL |
 | **M2 播放链路** | 播放页真实数据、本地列表、音量/模式、pending 态、跑马灯 | 本地源完整闭环（选曲/播放/暂停/切曲/进度/音量）；BT 源标题与控制可用（AVRCP 回流） | MusicPlay / PlayMode 实现（+9.2 建议落地） |
 | **M3 灯控 + 配网** | 灯控页三态与回执时序、扫描列表、密码键盘、配网两步流程 | 开灯→ack 落定 <50ms；断网重连图标正确；配网成功落盘 NVS | LightControl / wifi_manager 实现（+9.1 建议落地） |
 | **M4 系统状态收尾** | 设置页同步/语音/OTA 分区、容错矩阵全量验证、Toast 体系 | SD 拔卡降级、各句柄 NULL 降级逐项通过；OTA 进度展示正确 | sync_protocol / CallPhone / OTA |

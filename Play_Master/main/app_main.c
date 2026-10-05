@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include "bt_audio.h"
 #include "call_phone.h"
+#include "light_control.h"
 #include "audio_decoder.h"
 #include <ctype.h>
 #include <dirent.h>
@@ -1384,6 +1385,223 @@ test_exit:
     wifi_manager_destroy(wifi);
 }
 
+/* ======================== LightControl 灯控回环测试 ======================== */
+
+/** 灯控组播通道（分层设计 3.4.2：灯控 239.0.0.2:8889，代码常量不入 NVS） */
+#define LIGHT_TEST_MCAST_GROUP      "239.0.0.2"
+#define LIGHT_TEST_MCAST_PORT       8889
+
+/** 测试灯名（尚未实现的灯控端按此名开关） */
+#define LIGHT_TEST_LIGHT            "bathroom"
+
+/** 测试用状态上报超时（ms）：缩短至 3s，便于验证超时回落 UNKNOWN 路径 */
+#define LIGHT_TEST_STATE_TIMEOUT_MS 3000
+
+/** 每步等待模块收包/处理的时间（ms） */
+#define LIGHT_TEST_STEP_DELAY_MS    300
+
+/** 测试用：LightControl 事件回调（正式实现由 UI 刷灯图标，这里仅打印） */
+static void Light_Test_Evt_Cb(const light_event_t *evt, void *user_ctx)
+{
+    (void)user_ctx;
+    const char *id_str = (evt->id == LIGHT_EVT_ACK)    ? "ACK"    :
+                         (evt->id == LIGHT_EVT_STATUS) ? "STATUS" : "ERROR";
+    const char *st_str = (evt->data.state == LIGHT_STATE_ON)  ? "ON"     :
+                         (evt->data.state == LIGHT_STATE_OFF) ? "OFF"    : "UNKNOWN";
+
+    ESP_LOGI(TAG, "[light] EVENT %s light=\"%s\" ok=%d state=%s",
+             id_str, evt->data.light, evt->data.ok, st_str);
+}
+
+/** 测试模拟灯控端回包：直接向灯控组播通道发一帧 JSON（ack/status） */
+static void Light_Test_Simulate_Device(wifi_mcast_handle_t chan, const char *json)
+{
+    esp_err_t err = wifi_manager_mcast_send(chan, json, strlen(json), 1000);
+    ESP_LOGI(TAG, "[light] simulate device %d bytes: %s -> %s",
+             (int)strlen(json), json,
+             (err == ESP_OK) ? "OK" : esp_err_to_name(err));
+}
+
+/** 测试查询并打印某灯当前状态（模块内部缓存） */
+static void Light_Test_Show_State(light_control_handle_t lc, const char *label)
+{
+    light_state_t st = LIGHT_STATE_UNKNOWN;
+    const char *st_str;
+    esp_err_t err = light_control_get_state(lc, LIGHT_TEST_LIGHT, &st);
+
+    st_str = (st == LIGHT_STATE_ON)  ? "ON"  :
+             (st == LIGHT_STATE_OFF) ? "OFF" : "UNKNOWN";
+    ESP_LOGI(TAG, "[light] %s: get_state=%s (%s)", label, st_str,
+             (err == ESP_OK) ? "OK" : esp_err_to_name(err));
+}
+
+/**
+ * @brief 第七阶段测试：LightControl 灯控模块回环测试
+ *
+ * 说明：
+ *   - 灯控端尚未实现，测试采用"单机回环 + 模拟回包"：
+ *     1) light_control_send() 下发的 on/off 指令经组播回环，模块自己的
+ *        SmartHome_Task 应收到原始帧（日志 "recv ... {\"cmd\":\"on\"...}"）；
+ *     2) 由本测试代替灯控端回 ack/status 帧，验证解析与事件回调链路
+ *        （LIGHT_EVT_ACK / LIGHT_EVT_STATUS / 超时 LIGHT_EVT_ERROR）；
+ *     3) state_timeout_ms 临时缩短为 3s，验证超时后状态落回 UNKNOWN。
+ */
+static void Light_Control_Test(void)
+{
+    wifi_manager_handle_t  wifi  = NULL;
+    wifi_mcast_handle_t    chan  = NULL;
+    light_control_handle_t lc    = NULL;
+    wifi_manager_cfg_t     cfg   = {0};
+    wifi_mcast_cfg_t       mc    = {0};
+    light_control_cfg_t    lcfg  = {0};
+    node_role_cfg_t        rcfg  = {0};
+    esp_err_t              err;
+
+    /* 1. 运行参数写入 NVS（与 Wifi_Mcast_Test 一致，wifi_manager 启动时读凭据） */
+    err = node_role_init(NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "node_role_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    snprintf(rcfg.wifi_ssid,       sizeof(rcfg.wifi_ssid),       "%s", NODE_ROLE_DEFAULT_SSID);
+    snprintf(rcfg.wifi_password,   sizeof(rcfg.wifi_password),   "%s", NODE_ROLE_DEFAULT_PASSWORD);
+    snprintf(rcfg.ota_server_url,  sizeof(rcfg.ota_server_url),  "%s", NODE_ROLE_DEFAULT_OTA_URL);
+    snprintf(rcfg.multicast_group, sizeof(rcfg.multicast_group), "%s", NODE_ROLE_DEFAULT_GROUP);
+    rcfg.role              = NODE_ROLE_MASTER;
+    rcfg.volume            = NODE_ROLE_DEFAULT_VOLUME;
+    rcfg.play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
+    rcfg.sync_delay_ms     = NODE_ROLE_DEFAULT_SYNC_DELAY_MS;
+    rcfg.audio_sample_rate = NODE_ROLE_DEFAULT_SAMPLE_RATE;
+
+    err = node_role_set(&rcfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "node_role_set failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "=== Light Control Loopback Test Start (SSID=\"%s\") ===",
+             rcfg.wifi_ssid);
+
+    /* 2. WiFi 连接（与 mcast 测试一致，等待 IP） */
+    wifi = wifi_manager_create(&cfg);
+    if (wifi == NULL)
+    {
+        ESP_LOGE(TAG, "wifi_manager_create failed");
+        goto test_exit;
+    }
+    wifi_manager_register_event_cb(wifi, Wifi_Test_Evt_Cb, NULL);
+
+    err = wifi_manager_start(wifi);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "wifi_manager_start failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+    ESP_LOGI(TAG, "connecting to AP, waiting for IP...");
+
+    for (int i = 0; i < 150; i++)
+    {
+        if (wifi_manager_is_connected(wifi))
+        {
+            char ip[16] = {0};
+            size_t ip_len = sizeof(ip);
+            if (wifi_manager_get_ip(wifi, ip, &ip_len) == ESP_OK)
+            {
+                ESP_LOGI(TAG, "wifi connected, ip=%s rssi=%d",
+                         ip, wifi_manager_get_rssi(wifi));
+            }
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (i == 149)
+        {
+            ESP_LOGE(TAG, "wait ip timeout, please check SSID/PWD");
+            goto test_exit;
+        }
+    }
+
+    /* 3. 灯控组播通道：0x8889, rx_enable 打开（本机回环/模拟回包都进接收 FIFO） */
+    mc.group        = LIGHT_TEST_MCAST_GROUP;
+    mc.port         = LIGHT_TEST_MCAST_PORT;
+    mc.rx_enable    = true;
+    mc.rx_fifo_bytes = 4096;
+    err = wifi_manager_mcast_open(wifi, &mc, &chan);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "mcast_open %s:%u failed: %s",
+                 LIGHT_TEST_MCAST_GROUP, LIGHT_TEST_MCAST_PORT,
+                 esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    /* 4. 创建 LightControl（内部创建 SmartHome_Task，Core 0） */
+    lcfg.chan              = chan;
+    lcfg.tx_timeout_ms     = 100;       /* 与模块默认一致（100ms） */
+    lcfg.state_timeout_ms  = LIGHT_TEST_STATE_TIMEOUT_MS;   /* 3s（生产默认 90s） */
+    lcfg.on_event          = Light_Test_Evt_Cb;
+    lc = light_control_create(&lcfg);
+    if (lc == NULL)
+    {
+        ESP_LOGE(TAG, "light_control_create failed");
+        goto test_exit;
+    }
+
+    /* 5. 未收到任何上行：状态应为 UNKNOWN */
+    Light_Test_Show_State(lc, "before report");
+
+    /* 6. 发送开灯指令：包组播回环，模块收底打印 "recv ... {\"cmd\":\"on\"...}" */
+    err = light_control_send(lc, LIGHT_CMD_ON, LIGHT_TEST_LIGHT);
+    ESP_LOGI(TAG, "[light] light_control_send(ON) -> %s",
+             (err == ESP_OK) ? "OK" : esp_err_to_name(err));
+    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
+
+    /* 7. 模拟灯控端回 ack ok=true -> LIGHT_EVT_ACK，状态 ON */
+    Light_Test_Simulate_Device(chan,
+        "{\"cmd\":\"ack\",\"light\":\"bathroom\",\"ok\":true}");
+    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
+    Light_Test_Show_State(lc, "after ack ok=true");
+
+    /* 8. OFF 指令 + ack ok=false -> 状态 OFF */
+    err = light_control_send(lc, LIGHT_CMD_OFF, LIGHT_TEST_LIGHT);
+    ESP_LOGI(TAG, "[light] light_control_send(OFF) -> %s",
+             (err == ESP_OK) ? "OK" : esp_err_to_name(err));
+    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
+    Light_Test_Simulate_Device(chan,
+        "{\"cmd\":\"ack\",\"light\":\"bathroom\",\"ok\":false}");
+    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
+    Light_Test_Show_State(lc, "after ack ok=false");
+
+    /* 9. 模拟周期 status 上报 ok=true -> LIGHT_EVT_STATUS，状态 ON */
+    Light_Test_Simulate_Device(chan,
+        "{\"cmd\":\"status\",\"light\":\"bathroom\",\"ok\":true}");
+    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
+    Light_Test_Show_State(lc, "after status ok=true");
+
+    /* 10. 超时（3s 无上报）-> LIGHT_EVT_ERROR，状态 UNKNOWN */
+    ESP_LOGI(TAG, "[light] wait %d ms with no report, expect timeout -> UNKNOWN",
+             LIGHT_TEST_STATE_TIMEOUT_MS);
+    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STATE_TIMEOUT_MS + 1000));
+    Light_Test_Show_State(lc, "after timeout");
+
+    ESP_LOGI(TAG, "=== Light Control Loopback Test Finished ===");
+
+test_exit:
+    if (lc != NULL)
+    {
+        light_control_destroy(lc);
+        lc = NULL;
+    }
+    if (chan != NULL)
+    {
+        wifi_manager_mcast_close(chan);
+        chan = NULL;
+    }
+    wifi_manager_destroy(wifi);
+}
+
 void app_main(void)
 {
 	SystemStart();
@@ -1414,7 +1632,10 @@ void app_main(void)
     // Audio_Decoder_Test();
 
 	/* 第六阶段：wifi_manager 连接 + UDP 组播收发测试（SSID: HW666） */
-	Wifi_Mcast_Test();
+	// Wifi_Mcast_Test();
+
+	/* 第七阶段：LightControl 灯控模块回环测试 */
+	Light_Control_Test();
 	
 	while(1)
 	{

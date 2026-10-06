@@ -1017,8 +1017,10 @@ esp_err_t wifi_manager_mcast_open(wifi_manager_handle_t h,
 
     if (cfg->rx_enable)
     {
+        /* NOSPLIT：一个 UDP 包整体入环，跨环回绕时不会被拆成两半，
+         * 保证 mcast_recv 每次拿到的都是一整包（第九阶段自环测试需要） */
         ch->rx_fifo = xRingbufferCreate(ch->rx_fifo_bytes,
-                                        RINGBUF_TYPE_BYTEBUF);
+                                        RINGBUF_TYPE_NOSPLIT);
         if (ch->rx_fifo == NULL)
         {
             ESP_LOGE(TAG, "rx fifo create failed (%u bytes)",

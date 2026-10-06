@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include <sys/stat.h>
 #include <errno.h>
 #include "driver/gpio.h"
@@ -28,6 +29,7 @@
 #include "nvs_flash.h"
 #include "wifi_manager.h"
 #include "node_role.h"
+#include "sync_protocol.h"
 #include "ui.h"
 
 
@@ -1641,6 +1643,535 @@ static void UI_Test(void)
     ESP_LOGI(TAG, "=== UI Test running: 触摸切 Tab / 按播放键 / 拨灯开关，观察 [占位] 日志 ===");
 }
 
+/* ======================== 第九阶段：sync_protocol 同步播放模块测试 ======================== */
+
+/** 测试用正弦波参数：1kHz / 幅度 8000（约 49% 满幅，便于听感对比） */
+#define SYNC_TEST_SINE_HZ      (1000)
+#define SYNC_TEST_SINE_AMP     (8000)
+#define SYNC_TEST_2PI          (6.2831853f)
+
+/** 测试采样率：与全链路一致（AMPLIFIER_SAMPLE_RATE = 44.1kHz） */
+#define SYNC_TEST_SAMPLE_RATE  (44100)
+
+/** 每 10ms 推 441 个 mono 采样 = 44.1kHz（与模块消费速率相等，不欠载） */
+#define SYNC_TEST_PUSH_SAMPLES (441)
+
+/** 音频回环校验包数（每帧 15ms，20 包约 300ms） */
+#define SYNC_TEST_AUDIO_PKTS   (20)
+
+/** 回环接收超时（ms） */
+#define SYNC_TEST_RECV_TMO_MS  (500)
+
+/** 测试喂音任务停止标志（测试主流程退出时置位） */
+static volatile bool s_sync_test_stop = false;
+
+/** 正弦相位游标（喂音任务独占写入） */
+static uint32_t s_sync_test_phase = 0;
+
+/** 测试用：sync_protocol 事件回调（仅打印状态变化，观察状态机用） */
+static void Sync_Test_Evt_Cb(const sync_protocol_event_t *evt, void *ctx)
+{
+    (void)ctx;
+    const char *id_str = (evt->id == SYNC_EVT_STATE_CHANGED)   ? "STATE_CHANGED" :
+                         (evt->id == SYNC_EVT_STREAM_CHANGED)  ? "STREAM_CHANGED" :
+                         (evt->id == SYNC_EVT_SLAVE_SYNCED)    ? "SLAVE_SYNCED" :
+                         (evt->id == SYNC_EVT_SLAVE_LOST)      ? "SLAVE_LOST" :
+                         (evt->id == SYNC_EVT_ERROR)           ? "ERROR" : "UNKNOWN";
+    ESP_LOGI(TAG, "[sync] EVT %s state=%d stream=%u", id_str,
+             (int)evt->status.state, evt->status.stream_id);
+}
+
+/** 测试：持续把 1kHz 正弦 PCM 推进 sync_protocol。
+ * 按"距上一拍经过的实时间"补推采样（欠长采样数累积）,长期平均速率严格
+ * 等于 44.1kHz——不再用"固定 10ms + 现算 441 点"（那样实际喂入 < 消费，
+ * 本地 D 缓冲永远灌不满）。 */
+static void Sync_Test_Feed_Task(void *arg)
+{
+    int16_t chunk[SYNC_TEST_PUSH_SAMPLES];
+    (void)arg;
+    int64_t last_us = esp_timer_get_time();
+    int64_t owed    = 0;   /* 与 44.1kHz 对齐的累计欠账采样数 */
+
+    while (!s_sync_test_stop)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        int64_t now_us = esp_timer_get_time();
+        owed += ((now_us - last_us) * SYNC_TEST_SAMPLE_RATE + 500000) / 1000000;
+        last_us = now_us;
+
+        while (owed >= (int64_t)SYNC_TEST_PUSH_SAMPLES)
+        {
+            for (size_t i = 0; i < SYNC_TEST_PUSH_SAMPLES; i++)
+            {
+                chunk[i] = (int16_t)(SYNC_TEST_SINE_AMP *
+                            sinf(SYNC_TEST_2PI * SYNC_TEST_SINE_HZ *
+                                 (float)s_sync_test_phase / SYNC_TEST_SAMPLE_RATE));
+                s_sync_test_phase++;
+            }
+            sync_protocol_master_push_pcm(chunk, SYNC_TEST_PUSH_SAMPLES);
+            owed -= (int64_t)SYNC_TEST_PUSH_SAMPLES;
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief 第九阶段测试：sync_protocol 同步播放模块（单机自环）
+ *
+ * 说明：
+ *   - 测试以独立任务运行（app_main 主任务栈仅 3584B，本测试函数的
+ *     pkt[2048] 等栈占用 + 深日志调用会发生栈溢出，故按现有惯例
+ *     xTaskCreatePinnedToCore 单独起任务，栈给 16KB）；
+ *   - 单机即可验证“发→收”闭环：wifi_manager 已开 IP_MULTICAST_LOOP，且
+ *     SO_REUSEADDR 允许同一组播端口绑定多个 socket，每个组播包会向该端口
+ *     每个成员拷一份——因此模块 TX 用的发送 socket（只发）与测试自用的
+ *     嗅探 socket（只收）可并行存在；
+ *   - 控制通道必须开 rx：sync_protocol 主节点侧要收从节点的 PING 并回 PONG；
+ *   - 覆盖点（从节点未实现，先验证主节点协议行为）：
+ *     ① 音频帧自环：magic/stream_id/seq 连续/帧长 1322|1324/时间戳间隔≈15ms/载荷非 0；
+ *     ② 控制命令自环：broadcast PLAY/PAUSE/NEXT/VOLUME 的 4 字节基础帧到 5679；
+ *     ③ PING→PONG 应答：构造 t1=now 的 PING 发到控制通道，模块自动回 PONG（t1<t2<=t3）；
+ *     ④ pause/resume 状态机：暂停期间不再发包，恢复后 D 缓冲重灌回到 PLAYING；
+ *   - 本地最终出声：直接走 amplifier（Amplifier_Play_Buffer），应能听到 1kHz
+ *     正弦——为后续主从同拍播放做前置验证。
+ */
+static void Sync_Protocol_Test(void *arg)
+{
+    (void)arg;
+    wifi_manager_handle_t wifi = NULL;
+    wifi_mcast_handle_t   audio_tx = NULL;   /* 传给 sync_protocol：音频只发 */
+    wifi_mcast_handle_t   ctrl_tx  = NULL;   /* 传给 sync_protocol：控制收发 */
+    wifi_mcast_handle_t   audio_rx = NULL;   /* 测试自环：嗅探音频帧 */
+    wifi_mcast_handle_t   ctrl_rx  = NULL;   /* 测试自环：嗅探控制帧 */
+    wifi_manager_cfg_t    cfg  = {0};
+    wifi_mcast_cfg_t      mc   = {0};
+    node_role_cfg_t       rcfg = {0};
+    sync_protocol_master_cfg_t scfg = {0};
+    sync_protocol_master_status_t st;
+    uint8_t pkt[2048];
+    size_t  len = 0;
+    uint16_t stream_id = 0;
+    uint16_t prev_seq  = 0;
+    uint64_t prev_ts   = 0;
+    bool got_prev = false;
+    int  fail  = 0;
+    esp_err_t err;
+
+    ESP_LOGI(TAG, "=== Sync Protocol Test Start（第九阶段：同步播放自环） ===");
+
+    /* 0. 功放初始化：sync_protocol 本地播放最终经 amplifier 写 I2S */
+    if (Amplifier_Init() != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Amplifier_Init failed");
+        goto test_exit;
+    }
+    Amplifier_Set_Volume(80);
+
+    /* 1. 运行参数写入 NVS + 连接热点（与 Wifi_Mcast_Test 一致） */
+    err = node_role_init(NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "node_role_init failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    snprintf(rcfg.wifi_ssid,         sizeof(rcfg.wifi_ssid),         "%s", NODE_ROLE_DEFAULT_SSID);
+    snprintf(rcfg.wifi_password,     sizeof(rcfg.wifi_password),     "%s", NODE_ROLE_DEFAULT_PASSWORD);
+    snprintf(rcfg.ota_server_url,    sizeof(rcfg.ota_server_url),    "%s", NODE_ROLE_DEFAULT_OTA_URL);
+    snprintf(rcfg.multicast_group,   sizeof(rcfg.multicast_group),   "%s", NODE_ROLE_DEFAULT_GROUP);
+    rcfg.role              = NODE_ROLE_MASTER;
+    rcfg.volume            = NODE_ROLE_DEFAULT_VOLUME;
+    rcfg.play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
+    rcfg.sync_delay_ms     = NODE_ROLE_DEFAULT_SYNC_DELAY_MS;
+    rcfg.audio_sample_rate = NODE_ROLE_DEFAULT_SAMPLE_RATE;
+    err = node_role_set(&rcfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "node_role_set failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    wifi = wifi_manager_create(&cfg);
+    if (wifi == NULL)
+    {
+        ESP_LOGE(TAG, "wifi_manager_create failed");
+        goto test_exit;
+    }
+    wifi_manager_register_event_cb(wifi, Wifi_Test_Evt_Cb, NULL);
+    err = wifi_manager_start(wifi);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "wifi_manager_start failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+    ESP_LOGI(TAG, "connecting to AP, waiting for IP...");
+    for (int i = 0; i < 150; i++)
+    {
+        if (wifi_manager_is_connected(wifi))
+        {
+            char ip[16] = {0};
+            size_t ip_len = sizeof(ip);
+            if (wifi_manager_get_ip(wifi, ip, &ip_len) == ESP_OK)
+            {
+                ESP_LOGI(TAG, "wifi connected, ip=%s rssi=%d",
+                         ip, wifi_manager_get_rssi(wifi));
+            }
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (i == 149)
+        {
+            ESP_LOGE(TAG, "wait ip timeout, check SSID/PWD");
+            goto test_exit;
+        }
+    }
+
+    /* 2. 打开组播通道（同端口允许多个 socket：每个组播包各收一份拷贝） */
+    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
+    mc.port  = SYNC_PROTOCOL_MCAST_PORT_AUDIO;
+    mc.rx_enable = false;                  /* 模块音频通道只发 */
+    err = wifi_manager_mcast_open(wifi, &mc, &audio_tx);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "mcast_open audio_tx failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
+    mc.port  = SYNC_PROTOCOL_MCAST_PORT_CTRL;
+    mc.rx_enable     = true;               /* 模块控制通道要收 PING→回 PONG */
+    mc.rx_fifo_bytes = 4096;
+    err = wifi_manager_mcast_open(wifi, &mc, &ctrl_tx);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "mcast_open ctrl_tx failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
+    mc.port  = SYNC_PROTOCOL_MCAST_PORT_AUDIO;
+    mc.rx_enable = true;                   /* 测试自环：嗅探音频帧 */
+    mc.rx_fifo_bytes = 8192;
+    err = wifi_manager_mcast_open(wifi, &mc, &audio_rx);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "mcast_open audio_rx failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
+    mc.port  = SYNC_PROTOCOL_MCAST_PORT_CTRL;
+    mc.rx_enable = true;   /* 测试自环：嗅探控制帧 */
+    mc.rx_fifo_bytes = 4096;
+    err = wifi_manager_mcast_open(wifi, &mc, &ctrl_rx);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "mcast_open ctrl_rx failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    /* 3. sync_protocol 初始化 + 启动流（44.1kHz mono）*/
+    scfg.sync_delay_ms    = rcfg.sync_delay_ms;   /* 200ms（NVS 参数） */
+    scfg.frame_duration_ms = 15;
+    scfg.delay_queue_pkts  = 0;                   /* 默认 16 */
+    scfg.ingress_bytes     = 0;                   /* 默认 24KB */
+    scfg.audio_chan        = audio_tx;
+    scfg.control_chan      = ctrl_tx;
+    err = sync_protocol_master_init(&scfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "sync_protocol_master_init failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+    sync_protocol_master_register_event_cb(Sync_Test_Evt_Cb, NULL);
+
+    err = sync_protocol_master_start(0, SYNC_TEST_SAMPLE_RATE, 1);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "sync_protocol_master_start failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+    sync_protocol_master_get_status(&st);
+    stream_id = st.stream_id;
+    ESP_LOGI(TAG, "stream started: id=%u state=%d(0=PREPARING)", stream_id, (int)st.state);
+
+    /* 4. 启动正弦喂入任务（独立任务，不阻塞本测试的阻塞接收） */
+    s_sync_test_stop  = false;
+    s_sync_test_phase = 0;
+    if (xTaskCreatePinnedToCore(Sync_Test_Feed_Task, "sync_feed", 4096,
+                                NULL, 5, NULL, 0) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Sync_Test_Feed_Task create failed");
+        fail++;
+    }
+
+    /* 5. 阶段 A：音频帧自环逐包校验 */
+    ESP_LOGI(TAG, "[A] audio frame loopback: %d pkts", SYNC_TEST_AUDIO_PKTS);
+    for (int i = 0; i < SYNC_TEST_AUDIO_PKTS; i++)
+    {
+        sync_audio_pkt_hdr_t *h = (sync_audio_pkt_hdr_t *)pkt;
+        const int16_t *pcm;
+        int64_t delta_us = 0;
+
+        len = 0;
+        err = wifi_manager_mcast_recv(audio_rx, pkt, sizeof(pkt), &len,
+                                      SYNC_TEST_RECV_TMO_MS * 4);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "[A][%d] recv failed: %s", i, esp_err_to_name(err));
+            fail++;
+            continue;
+        }
+        if (len < SYNC_AUDIO_HDR_SIZE || h->magic != SYNC_MAGIC)
+        {
+            ESP_LOGE(TAG, "[A][%d] bad magic/len=%u", i, (unsigned)len);
+            fail++;
+            continue;
+        }
+        if (h->stream_id != stream_id)
+        {
+            ESP_LOGE(TAG, "[A][%d] stream=%u expect=%u", i, h->stream_id, stream_id);
+            fail++;
+        }
+        if (len != SYNC_AUDIO_HDR_SIZE + h->data_len ||
+            (h->data_len != 1322 && h->data_len != 1324))
+        {
+            ESP_LOGE(TAG, "[A][%d] data_len=%u len=%u", i, h->data_len, (unsigned)len);
+            fail++;
+        }
+        if (got_prev && (uint16_t)(h->seq - prev_seq) != 1)
+        {
+            ESP_LOGE(TAG, "[A][%d] seq jump %u->%u", i, prev_seq, h->seq);
+            fail++;
+        }
+        if (got_prev)
+        {
+            delta_us = (int64_t)h->timestamp_us - (int64_t)prev_ts;
+            if (delta_us < 3000 || delta_us > 40000)
+            {
+                ESP_LOGE(TAG, "[A][%d] frame interval %lldus", i, (long long)delta_us);
+                fail++;
+            }
+        }
+        pcm = (const int16_t *)(pkt + SYNC_AUDIO_HDR_SIZE);
+        if (pcm[0] == 0 && pcm[1] == 0 && pcm[2] == 0 && pcm[3] == 0)
+        {
+            ESP_LOGE(TAG, "[A][%d] payload all zero", i);
+            fail++;
+        }
+        got_prev = true;
+        prev_seq = h->seq;
+        prev_ts  = h->timestamp_us;
+        if (i % 5 == 0)
+        {
+            ESP_LOGI(TAG, "[A][%d] seq=%u len=%u ts=%llu delta=%lldus",
+                     i, h->seq, h->data_len, (unsigned long long)h->timestamp_us,
+                     (long long)delta_us);
+        }
+    }
+
+    /* 6. 阶段 B：控制命令帧自环（PLAY/PAUSE/NEXT/VOLUME） */
+    ESP_LOGI(TAG, "[B] control cmd loopback");
+    {
+        static const sync_protocol_cmd_t cmds[] = {
+            SYNC_CMD_PLAY, SYNC_CMD_PAUSE, SYNC_CMD_NEXT, SYNC_CMD_VOLUME,
+        };
+        for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++)
+        {
+            uint8_t param = (cmds[i] == SYNC_CMD_VOLUME) ? 0x3C : 0;
+            bool got = false;
+
+            err = sync_protocol_master_broadcast_cmd(cmds[i], param);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "[B] send cmd 0x%02X failed: %s",
+                         cmds[i], esp_err_to_name(err));
+                fail++;
+                continue;
+            }
+            for (int tries = 0; tries < 20 && !got; tries++)
+            {
+                len = 0;
+                err = wifi_manager_mcast_recv(ctrl_rx, pkt, sizeof(pkt), &len, 200);
+                if (err != ESP_OK)
+                {
+                    break;
+                }
+                if (len != sizeof(sync_ctrl_basic_t))
+                {
+                    continue;   /* 扩展帧（START/HEARTBEAT/PING/PONG）跳过 */
+                }
+                sync_ctrl_basic_t *b = (sync_ctrl_basic_t *)pkt;
+                if (b->magic != SYNC_MAGIC || b->cmd != (uint8_t)cmds[i] ||
+                    b->param != param)
+                {
+                    ESP_LOGW(TAG, "[B] unexpected basic frame magic=%04X cmd=%02X param=%u",
+                             b->magic, b->cmd, b->param);
+                    continue;
+                }
+                ESP_LOGI(TAG, "[B] cmd=0x%02X param=%u loopback OK", b->cmd, b->param);
+                got = true;
+            }
+            if (!got)
+            {
+                ESP_LOGE(TAG, "[B] cmd 0x%02X not seen on loopback", cmds[i]);
+                fail++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    /* 7. 阶段 C：PING→PONG 自环（模块应收 PING 并自动回 PONG） */
+    ESP_LOGI(TAG, "[C] PING/PONG roundtrip");
+    {
+        sync_ctrl_ext_t     *ext = (sync_ctrl_ext_t *)pkt;
+        sync_ping_payload_t  ping_payload;
+        uint64_t t1 = (uint64_t)esp_timer_get_time();
+        bool got_pong = false;
+
+        ping_payload.t1_us = t1;
+        memset(pkt, 0, sizeof(pkt));
+        ext->magic = SYNC_MAGIC;
+        ext->type  = SYNC_MSG_PING;
+        ext->len   = sizeof(ping_payload);
+        memcpy(ext->data, &ping_payload, sizeof(ping_payload));
+        err = wifi_manager_mcast_send(ctrl_tx, pkt,
+                                      sizeof(sync_ctrl_ext_t) + sizeof(ping_payload), 100);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "[C] PING send failed: %s", esp_err_to_name(err));
+            fail++;
+        }
+        else
+        {
+            for (int tries = 0; tries < 40 && !got_pong; tries++)
+            {
+                len = 0;
+                err = wifi_manager_mcast_recv(ctrl_rx, pkt, sizeof(pkt), &len, 200);
+                if (err != ESP_OK)
+                {
+                    break;
+                }
+                if (len < sizeof(sync_ctrl_ext_t) ||
+                    ((sync_ctrl_ext_t *)pkt)->magic != SYNC_MAGIC)
+                {
+                    continue;
+                }
+                ext = (sync_ctrl_ext_t *)pkt;
+                if (ext->type != SYNC_MSG_PONG ||
+                    ext->len != sizeof(sync_pong_payload_t))
+                {
+                    continue;
+                }
+                sync_pong_payload_t *pong = (sync_pong_payload_t *)ext->data;
+                if (pong->t1_us != t1)
+                {
+                    continue;
+                }
+                if (pong->t1_us <= pong->t2_us && pong->t2_us <= pong->t3_us &&
+                    (pong->t2_us - t1) < 5000000u &&
+                    (pong->t3_us - pong->t2_us) < 1000000u)
+                {
+                    ESP_LOGI(TAG, "[C] PONG OK: t1=%llu t2=%llu t3=%llu",
+                             (unsigned long long)pong->t1_us,
+                             (unsigned long long)pong->t2_us,
+                             (unsigned long long)pong->t3_us);
+                    got_pong = true;
+                }
+                else
+                {
+                    ESP_LOGE(TAG, "[C] PONG timing bad: t1=%llu t2=%llu t3=%llu",
+                             (unsigned long long)pong->t1_us,
+                             (unsigned long long)pong->t2_us,
+                             (unsigned long long)pong->t3_us);
+                    fail++;
+                }
+            }
+            if (!got_pong)
+            {
+                ESP_LOGE(TAG, "[C] no PONG on loopback");
+                fail++;
+            }
+        }
+    }
+
+    /* 8. 阶段 D：pause/resume 状态机 */
+    ESP_LOGI(TAG, "[D] pause/resume state machine");
+    err = sync_protocol_master_pause();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "[D] pause failed: %s", esp_err_to_name(err));
+        fail++;
+    }
+    sync_protocol_master_get_status(&st);
+    if (st.state != SYNC_STATE_PAUSED)
+    {
+        ESP_LOGE(TAG, "[D] pause -> state=%d", (int)st.state);
+        fail++;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "[D] paused OK");
+    }
+    /* 暂停期间 TX 应停止发包：取两个时刻对比 */
+    vTaskDelay(pdMS_TO_TICKS(300));
+    sync_protocol_master_get_status(&st);
+    uint32_t paused_tx = st.tx_pkts;
+    vTaskDelay(pdMS_TO_TICKS(400));
+    sync_protocol_master_get_status(&st);
+    if (st.tx_pkts != paused_tx)
+    {
+        ESP_LOGE(TAG, "[D] tx advanced while paused: %u -> %u", paused_tx, st.tx_pkts);
+        fail++;
+    }
+
+    err = sync_protocol_master_resume();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "[D] resume failed: %s", esp_err_to_name(err));
+        fail++;
+    }
+    vTaskDelay(pdMS_TO_TICKS(700));   /* 等待 D 缓冲重新灌满 */
+    sync_protocol_master_get_status(&st);
+    if (st.state != SYNC_STATE_PLAYING || st.tx_pkts == 0 || st.dropped_pkts != 0)
+    {
+        ESP_LOGE(TAG, "[D] resume misbehave: state=%d tx=%u dropped=%u",
+                 (int)st.state, st.tx_pkts, st.dropped_pkts);
+        fail++;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "[D] resumed OK: state=%d tx=%u dropped=%u",
+                 (int)st.state, st.tx_pkts, st.dropped_pkts);
+    }
+
+    /* 9. 阶段 E：本地出声观察 + 收尾状态快照 */
+    ESP_LOGI(TAG, "[E] keep playing 2s（应能听到 1kHz 正弦，主节点本地功放出声）");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    sync_protocol_master_get_status(&st);
+    ESP_LOGI(TAG, "final status: state=%d stream=%u tx=%u dropped=%u "
+             "ingress=%uB dq_used=%u delta_us=%lld slave_online=%d",
+             (int)st.state, st.stream_id, st.tx_pkts, st.dropped_pkts,
+             (unsigned)st.ingress_used, (unsigned)st.delay_queue_used,
+             (long long)st.play_delta_us, st.slave_online ? 1 : 0);
+
+    /* 收尾：停喂入 → 停流 → 反初始化 */
+    s_sync_test_stop = true;
+    vTaskDelay(pdMS_TO_TICKS(30));
+    sync_protocol_master_stop();
+    sync_protocol_master_deinit();
+    ESP_LOGI(TAG, "=== Sync Protocol Test Finished (fail=%d) ===", fail);
+
+test_exit:
+    if (audio_rx != NULL) wifi_manager_mcast_close(audio_rx);
+    if (ctrl_rx  != NULL) wifi_manager_mcast_close(ctrl_rx);
+    if (audio_tx != NULL) wifi_manager_mcast_close(audio_tx);
+    if (ctrl_tx  != NULL) wifi_manager_mcast_close(ctrl_tx);
+    wifi_manager_destroy(wifi);
+    vTaskDelete(NULL);
+}
+
 void app_main(void)
 {
 	SystemStart();
@@ -1677,7 +2208,11 @@ void app_main(void)
 	// Light_Control_Test();
 
 	/* 第八阶段：UI 模块联调测试（LVGL 9.6 自持 UI_Task，全占位模式） */
-	UI_Test();
+	// UI_Test();
+
+	/* 第九阶段：sync_protocol 同步播放模块自环测试（音频/控制组播自环 + 本地功放）。
+	 * 测试函数自带大栈缓冲，按惯例单独起任务（16KB 栈，避开 main_task 3.5KB 限制） */
+	xTaskCreatePinnedToCore(Sync_Protocol_Test, "sync_test", 16384, NULL, 5, NULL, 0);
 	
 	while(1)
 	{

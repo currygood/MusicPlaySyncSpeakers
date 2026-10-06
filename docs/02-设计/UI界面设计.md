@@ -2,8 +2,8 @@
 
 > **屏幕**：2.8 寸 IPS（ILI9341，SPI）320×240 横屏 + 电容触摸（FT6336G，I²C 轮询）
 > **文档范围**：仅描述**主音频节点**的 LVGL 界面；从节点无屏幕，灯控节点无屏幕。
-> **核心原则**：UI 是控制指令的"期望发起者"，不是状态的主人——所有状态显示以各模块事件回流与查询接口为准；UI 不直接调用 `bt_audio` / ESP-IDF API；图片/字体资源从 SD 卡（`/sdcard/ui/`）加载，SD 缺席时降级可用。
-> **实现状态**：UI 模块尚未实现（`components/App/UI/` 为空目录）；本文档为定稿设计，接口可直接照此编码。
+> **核心原则**：UI 是控制指令的"期望发起者"，不是状态的主人——所有状态显示以各模块事件回流与查询接口为准；UI 不直接调用 `bt_audio` / ESP-IDF API；图片/字体资源随固件提供（3 张 PNG 在 Flash `storage` 分区、字体编译进固件）。
+> **实现状态**：UI 模块已实现（`components/App/UI/`）；本文档为设计定稿，接口与资源策略以文档为准。
 
 ------
 
@@ -14,7 +14,7 @@
 1. **分层边界不破例**：UI 属于 App 层，只调用 App 层模块（MusicPlay / PlayMode / LightControl）的定稿接口与系统服务查询接口（wifi_manager / node_role / OTA / CallPhone / sync_protocol）；**绝不**直接调用 `bt_audio`、`audio_decoder` 等"被上层模块持有的"中间件句柄，更不碰 ESP-IDF API。
 2. **指令是期望，状态靠回流**：UI 按键后不自行翻转状态显示（只给按压动效），最终状态以 `music_event_t` / `light_event_t` 等事件携带的快照落定；事件未回流前控件呈"等待"半透明态。
 3. **单订阅者接线**：UI 是 MusicPlay / PlayMode / LightControl / OTA 事件的唯一订阅者，由 `app_main` 在创建各模块时把 `on_event` 接线到 UI 提供的转发函数；事件回调上下文**只入队**，不碰 LVGL。
-4. **资源在 SD、固件有兜底**：全量中文字体与图标放 SD 卡；固件内置 ASCII + 核心汉字兜底字体与 LVGL symbol 图标，SD 未挂载时界面照常可用（功能降级、不白屏）。
+4. **资源随包、固件自带**：全量中文字体与图标（lv_font_conv 生成的 C 数组）编译进固件，3 张 PNG 图片经 `spiffs_create_partition_image` 烧录进 Flash `storage` 分区，SD 卡不参与 UI 资源，界面不依赖任何外置存储。
 5. **小屏优先级**：320×240 空间有限，一屏只做一件事；次级功能收进二级页；状态全局常驻（状态栏 + Tab 栏），操作路径最多两跳。
 
 ### 1.2 屏幕与触摸参数
@@ -73,7 +73,7 @@ UI_Task（Core 1，优先级 12，栈 13312 —— 对齐架构文档任务表�
   ├─ lv_init()
   ├─ lv_display_create(320, 240) + flush_cb → LCD_Set_Window/LCD_Write_PixelData
   ├─ lv_indev_create() + read_cb → LCD_TOUCH_FT6336G_Get_Touch_Points()
-  ├─ lv_binfont_create("S:/ui/fonts/…")   （SD 就绪时；失败回退内置字体）
+  ├─ 挂载 Flash storage 分区（SPIFFS）＋注册 lv_fs 盘符 'F'（读 ui_img/*.png；字体已编译进固件）
   ├─ 页面构建（ui_screens_create）
   └─ 循环：事件队列出队 → lv_timer_handler() → vTaskDelay(10ms)
 ```
@@ -124,7 +124,7 @@ static void ui_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 | 刷新模式 | `LV_DISPLAY_RENDER_MODE_PARTIAL` | 脏区渲染，静止画面零刷屏流量 |
 | 刷新周期 | `LV_DEF_REFR_PERIOD = 33ms`（≈30fps） | 限帧，降低 SPI 占空比 |
 | LVGL 堆 | `LV_USE_STDLIB_MALLOC = 1`（走 ESP-IDF malloc，配合 SPIRAM_USE_MALLOC 落 PSRAM） | 内部 RAM 紧张（BT + WiFi + 音频 FIFO），对象/字体大块放 PSRAM |
-| 字体缓存 | binfont 位图驻留在 LVGL 堆（PSRAM） | 字体文件本身留在 SD，不整卡缓存 |
+| 字体缓存 | 字形位图驻留在 LVGL 堆（PSRAM） | 字体 C 数组已编译进固件，无需外部字体文件 |
 
 ### 2.5 SPI2 总线共存策略（LCD 刷屏 vs SD 读写）
 
@@ -132,7 +132,7 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 
 1. **部分刷新**：UI 大多数帧只刷脏区（进度条、时间、状态图标），全屏重绘仅发生在切页瞬间；
 2. **限帧 30fps** + 40 行分块传输，把单次 SPI 占用切成 ≤5ms 的碎片；
-3. **大图一次加载**：专辑封面等 PNG 在进入播放页时一次性解码并缓存，播放过程中不反复读卡；
+3. **大图一次加载**：封面等 PNG 在进入播放页时一次性解码并缓存，播放过程中不反复读 Flash `storage` 分区；
 4. **对音频的影响评估**：音频链路本身不走 SPI（I2S 独立），SPI 争用最坏情况是解码任务读卡变慢 → PCM 产出抖动，由 `sync_protocol` ingress 环形缓冲（16~32KB ≈ 0.2~0.4s @44.1kHz/16bit/单声道）吸收，不致爆音。
 
 ### 2.6 lv_conf 关键配置清单
@@ -140,14 +140,14 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 | 配置项 | 值 | 说明 |
 | :--- | :--- | :--- |
 | `LV_COLOR_DEPTH` | 16 | RGB565 |
-| `LV_USE_FS_POSIX` | 1，盘符 `'S'`，前缀 `"/sdcard"` | `"S:/ui/…"` → `/sdcard/ui/…`（见 8.3） |
-| `LV_USE_LODEPNG` | 1 | SD 卡 PNG（封面/图标）解码 |
-| `LV_USE_FREETYPE` | 0 | 不启用运行时 TTF 渲染，用预转换 binfont（省 CPU/内存） |
+| 自定义 lv_fs 盘符（代码 `ui_disp.c` 注册） | 盘符 `'F'` + VFS 前缀 `/storage` | `F:/ui_img/…` → `/storage/ui_img/…`（见 8.3） |
+| `LV_USE_LODEPNG` | 1 | Flash `storage` 分区 PNG（封面/图标）解码 |
+| `LV_USE_FREETYPE` | 0 | 不启用运行时 TTF 渲染，字体一律为 lv_font_conv 生成的 C 数组并编译进固件 |
 | `LV_USE_FONT_COMPRESSED` | 0 | 字体生成时 `--no-compress` 配套 |
 | `LV_USE_STDLIB_MALLOC` | 1 | LVGL 堆走系统 malloc（配合 PSRAM） |
 | `LV_DEF_REFR_PERIOD` | 33 | ≈30fps |
 | `LV_INDEV_DEF_READ_PERIOD` | 30 | 对齐触摸轮询节奏 |
-| `LV_FONT_DEFAULT` | 内置兜底字体 | SD 缺席时的默认字体（见 3.2） |
+| `LV_FONT_DEFAULT` | `ui_font_cn_16` | 界面默认中文字体（编译进固件，见 3.2） |
 | `LV_FONT_MONTSERRAT_16 / _24` | 1 | 启用内置 symbol 字形（控件图标，字号档见 3.3） |
 
 ------
@@ -171,23 +171,21 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 | 错误色 | `#FF5C5C` | 断开、失败 toast |
 | 未知态 | `#6B7280` | 灯 UNKNOWN、图标灰显 |
 
-### 3.2 字体方案与字号规范
+### 3.2 字体方案与字号规范（C 数组编译进固件）
 
-双轨字体：**SD 全量字体（体验）+ 固件内置兜底字体（可用性）**，LVGL 双字体实例切换（见 8.4 容错矩阵）。
+中文字体与图标字体**不入 SD 卡**：由 `lv_font_conv` 生成 C 数组（`ui_font_cn_16.c` / `ui_icons_16.c` / `ui_icons_24.c`）**编译进固件**，UI 通过 `const lv_font_t`（`ui_priv.h` `extern` 声明）直接引用，无 binfont/TTF 运行时文件。
 
-| 字号 | 用途 | SD 字体（binfont） | 内置兜底（C 数组编译进固件） |
-| :--- | :--- | :--- | :--- |
-| 20px | 歌曲标题、页面标题 | 常用汉字子集 ≈1500 字 + ASCII | —（标题回退 16px 兜底） |
-| 16px | 正文、按钮、列表项、时间 | 同上 | ASCII + **核心 200 汉字**（状态词："播放 灯控 设置 配网 连接 已断开 未启用 未挂载 …"） |
-| 12px | 副标题、状态栏文字、说明 | 同上 | ASCII + 核心汉字复用 16px |
+| 字号 | 用途 | 字体资产（C 数组编译进固件） |
+| :--- | :--- | :--- |
+| 20px | 歌曲标题、页面标题 | 未单独生成时回退放大 16px |
+| 16px | 正文、按钮、列表项、时间 | `ui_font_cn_16`：Noto Sans SC 子集 521 字 + ASCII（`--bpp 4` 抗锯齿） |
+| 12px | 副标题、状态栏文字、说明 | 复用 16px 字形缩放 |
+| 16/24px | 状态栏 / Tab 栏图标 | `ui_icons_16` / `ui_icons_24`（Material Symbols 字形） |
 
-- 生成方式：`lv_font_conv` 转 `.bin`，随卡发放；内置兜底字生成 C 文件编译进固件（≈15~25KB）。
-- 生成命令示例（详见 8.2）。
-- 数字/时间统一用字体内置 ASCII 字形，不单独做数字字体。
+- 生成命令示例见 8.2（lv_font_conv，`--format lvgl` 输出 C 数组）。
+- 数字/时间统一用 ASCII 字形，不单独做数字字体。
 
-### 3.3 图标方案（全图标化，控件零文字）
-
-**原则**：所有功能控件一律用**图形图标**表达（播放/暂停/上下曲/设置/灯控等），不用文字按钮；仅"动作类按钮"（确定/取消/WiFi 配网等）和源 chip 保留文字。图标不依赖 SD 卡——SD 缺席时图标体系完整可用。
+**原则**：所有功能控件一律用**图形图标**表达（播放/暂停/上下曲/设置/灯控等），不用文字按钮；仅"动作类按钮"（确定/取消/WiFi 配网等）和源 chip 保留文字。图标全部为字形（内置 symbol ＋ 自定义 iconfont），不依赖任何存储介质。
 
 **字形来源（两类，均随固件编译）**：
 
@@ -207,7 +205,7 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 | Tab 栏（纯图标，选中主色/未选灰） | ♪=`AUDIO`、灯泡=lightbulb、⚙=`SETTINGS` | 内置 / 自定义 / 内置 |
 | 状态栏 WiFi / 蓝牙 | `LV_SYMBOL_WIFI` / `BLUETOOTH` | 内置 |
 | 状态栏同步 / 麦克风 | sync / mic | 自定义 |
-| 灯控页大图标 48px | bulb_on / bulb_off（彩色） | SD PNG（可选，缺省回退自定义灯泡字形） |
+| 灯控页大图标 48px | bulb_on / bulb_off（彩色） | Flash `storage` 分区 PNG（`F:/ui_img/Light_On.png` / `Light_Off.png`；缺失回退自定义灯泡字形） |
 
 **控件图标不建议用 PNG 的原因**：控件图标需要随状态变色（选中/未选、ON/OFF、pending 半透明、异常红色），PNG 颜色定死、每种状态都要出一张变体图；字体字形改一个 style 属性即可换色/变透明度。**PNG 只用于颜色固定的图**（封面、彩色灯泡大图标）。
 
@@ -305,7 +303,7 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 
 | 元素 | 数据来源（显示） | 动作（控制） |
 | :--- | :--- | :--- |
-| 封面 128×128 | `/sdcard/ui/img/cover_default.png`，**恒为占位图**（BT 源无封面接口、本地源不解析 ID3 内嵌图）；SD 缺失→内置色块占位 | 无 |
+| 封面 128×128 | `F:/ui_img/Music_Album.png`（Flash `storage` 分区），**恒为占位图**（BT 源无封面接口、本地源不解析 ID3 内嵌图）；分区缺失→内置色块占位 | 无 |
 | 源 chip | `view->source`；`PLAY_MODE_EVT_CHANGED` 刷新 | 点击 → `play_mode_set(另一源)`（见 6.3） |
 | 列表入口 | — | 点击 → 本地音乐列表；**BT 源时禁用置灰**（列表是本地源功能） |
 | 标题/副标题 | `view->track`：本地源=`display_name`+文件名；BT 源=歌名+`artist · album`（承载方式见 9.2 建议） | — |
@@ -351,7 +349,7 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 └────────────────────────────────────────────────┘
 ```
 
-- 两张卡片 ≈148×128：图标 48px + 名称 16px + 状态文字 12px + switch；灯名固定 `bedroom` / `livingroom`（灯控协议规范）。大图标优先用 SD 卡彩色 PNG（`bulb_on/bulb_off`，点亮态可做琥珀色发光效果），缺省回退自定义灯泡字形（3.3）。
+- 两张卡片 ≈148×128：图标 48px + 名称 16px + 状态文字 12px + switch；灯名固定 `bedroom` / `livingroom`（灯控协议规范）。大图标优先用 Flash `storage` 分区彩色 PNG（`F:/ui_img/Light_On.png` / `F:/ui_img/Light_Off.png`，点亮态可做琥珀色发光效果），缺失时回退自定义灯泡字形（3.3）。
 - **三态显示**：UNKNOWN（灰"未知"）/ ON（琥珀"开"）/ OFF（面板色"关"）；初始与重连后用 `light_control_get_state()` 恢复。
 - **交互时序**：点击 switch → `light_control_send(cmd, name)` → 卡片进入等待态（switch 半透明 + 图标闪烁）→ `LIGHT_EVT_ACK` 按回执 `ok` 落定；`LIGHT_EVT_ERROR`（回执异常或 90s 上报超时）→ Toast"控制失败/状态超时"，状态回落 UNKNOWN。
 - `LIGHT_EVT_STATUS`（30s 周期上报）静默刷新图标，无动画。
@@ -541,7 +539,7 @@ UI [确定] → node_role_get()          （读缓存副本）
 
 ```c
 /* ===== UI 模块对外接口（定稿） =====
- * 装配约束：ui_init() 在各 App 模块创建之后、SD 挂载检查之后调用；
+ * 装配约束：ui_init() 在各 App 模块创建之后、storage 分区挂载检查之后调用；
  *           各 on_event 接线（6.1）发生在各模块 create 之前。
  * 降级约定：ui_cfg_t 中任何句柄为 NULL 时 UI 照常运行，对应功能显示"未就绪"。
  */
@@ -557,7 +555,7 @@ typedef struct {
 } ui_cfg_t;
 
 /* 生命周期 */
-esp_err_t ui_init(const ui_cfg_t *cfg);   /* 内含 LVGL 初始化、SD 资源加载（可失败降级）、页面构建、UI_Task 创建 */
+esp_err_t ui_init(const ui_cfg_t *cfg);   /* 内含 LVGL 初始化、storage 分区图片加载（可失败降级）、页面构建、UI_Task 创建 */
 void      ui_deinit(void);                /* 删除 UI_Task、释放 LVGL（整机下电路径才使用） */
 
 /* ===== 事件接线入口（app_main 将各模块 on_event 指向以下函数） =====
@@ -575,8 +573,8 @@ void ui_on_ota_event(const ota_update_event_info_t *info, void *user_ctx);
 ```reStructuredText
 UI/
 ├── ui.h / ui.c            对外接口 + 生命周期 + 事件队列
-├── ui_disp.c              flush_cb / 触摸 read_cb / 渲染缓冲 / 字体加载
-├── ui_theme.c             配色常量 / 样式 / 字体实例切换（SD / 兜底）
+├── ui_disp.c              flush_cb / 触摸 read_cb / 渲染缓冲 / 资源加载（挂载 storage, lv_fs 'F'）
+├── ui_theme.c             配色常量 / 样式 / 字体引用（字体已编译进固件）
 ├── ui_statusbar.c         状态栏（轮询 lv_timer）
 ├── ui_tabbar.c            Tab 栏与页面切换
 ├── scr_player.c           播放页（含 pending 态逻辑）
@@ -595,71 +593,63 @@ UI/
 | `light == NULL` | — | "灯控未启用" | — | — |
 | `wifi == NULL` | — | — | 配网入口禁用 | WiFi 灰显 |
 | `call_phone == NULL` | — | — | 语音分区"未启用" | 麦克风灰显 |
+| storage 未挂载（分区镜像缺失/未烧录） | 字体/图标不受影响；图片回退字形/色块 | 灯图标回退字形 | storage 图片用占位 | 状态栏图标均内置 |
 | sync_protocol 未 init | — | — | "未启用" | 同步图标灰显 |
-| SD 未挂载 | 全局切内置字体/图标；列表页空态"SD 卡未挂载"；主题资源用占位（见 8.4） | | | |
+| SD 未挂载（仅音乐） | UI 资源（字体/图片）不受影响 | 不受影响 | 不受影响 | 不受影响 |
 
 ------
 
-## 8. SD 卡资源规范与容错
+## 8. UI 资源规范与容错（Flash storage 分区 + 固件编译字体）
 
-### 8.1 资源目录树
+> **资源策略**：UI 图片（3 张）随固件烧录进 Flash `storage` 分区（SPIFFS），中文字体/图标全部由 `lv_font_conv` 生成 C 数组**编译进固件**，SD 卡不参与 UI 资源。
+
+### 8.1 资源目录（storage 分区，随固件烧录）
 
 ```reStructuredText
-/sdcard/
-├── music/                    音乐文件（MusicPlay 管理，非 UI 资源）
-└── ui/                       UI 资源根目录（sd_card 模块已自动创建）
-    ├── fonts/
-    │   ├── ui_font_12.bin    常用汉字子集+ASCII，辅助字号
-    │   ├── ui_font_16.bin    同上，正文字号
-    │   └── ui_font_20.bin    同上，标题字号
-    ├── icons/                彩色静态图（仅此类用 PNG；状态/控件图标一律字体字形，见 3.3）
-    │   ├── bulb_on.png       灯控页大图标·点亮态（48×48，可选）
-    │   └── bulb_off.png      灯控页大图标·熄灭态（48×48，可选）
-    └── img/
-        └── cover_default.png 专辑占位图（128×128，全卡唯一必选图）
+/storage/                         # SPIFFS 分区（挂载点 /storage，LVGL 盘符 'F'）
+└── ui_img/                       # UI 图片（spiffs_create_partition_image 烧录）
+    ├── Music_Album.png           专辑占位图（128×128，必需）
+    ├── Light_On.png              灯控页大图标·点亮态（彩色）
+    └── Light_Off.png             灯控页大图标·熄灭态（彩色）
+
+字体不在文件系统：ui_font_cn_16（中文 16px，编译进固件）
+图标字体：ui_icons_16 / ui_icons_24 + LVGL symbol（全部编译进固件/自带）
 ```
 
-### 8.2 字体生成规范（lv_font_conv）
+### 8.2 字体生成规范（lv_font_conv，C 数组编译进固件）
 
 ```bash
-# SD 全量字体（binfont，运行时 lv_binfont_create 加载）
+# 中文 16px：覆盖界面全部文案 + ASCII（--format lvgl，输出 C 数组）
 npx lv_font_conv --font NotoSansSC-Regular.ttf --size 16 --bpp 4 \
-  --range 0x20-0x7E --symbols "《常用1500汉字表》" \
-  --format bin --no-compress -o ui_font_16.bin
+  --range 0x20-0x7E --symbols "《界面全部文案汉字集》" \
+  --format lvgl --no-compress -o ui_font_cn_16.c
 
-# 固件内置兜底字体（C 数组，编译进固件，仅 ASCII+核心200汉字）
-npx lv_font_conv --font NotoSansSC-Regular.ttf --size 16 --bpp 4 \
-  --range 0x20-0x7E --symbols "播放暂停上下曲音量灯控设置配网连接中已断开未启用挂载本地蓝牙同步未知开关注点击刷新返回确定取消失败成功扫描密码输入完成重启升级版本关于设备语音助手…" \
-  --format lvgl -o ui_font_fallback_16.c
-
-# 自定义图标字体（补内置 symbol 缺失字形：灯泡/麦克风/单曲循环/同步；C 数组编进固件 ≈10KB）
-# 字形码位以所选图标库（Material Icons / FontAwesome）官方码位表为准
+# 自定义图标字体（灯泡/麦克风/单曲循环/同步；C 数组编译进固件）
 npx lv_font_conv --font MaterialIcons-Regular.ttf --size 24 --bpp 4 \
-  --range <灯泡码位>,<麦克风码位>,<单曲循环码位>,<同步码位> \
+  --range <灯泡码字>,<麦克风码字>,<单曲循环码字>,<同步码字> \
   --format lvgl -o ui_icons_24.c
 ```
 
-- 常用 1500 字覆盖全部界面文案；`--bpp 4`（抗锯齿）+ `--no-compress`（`LV_USE_FONT_COMPRESSED=0` 配套）。
-- 内置 symbol 字形随 Montserrat 字号启用（lv_conf 开 `LV_FONT_MONTSERRAT_16` / `LV_FONT_MONTSERRAT_24`），无需额外文件。
+- `--bpp 4`（抗锯齿）+ `--no-compress`（`LV_USE_FONT_COMPRESSED=0` 配套），生成 `const lv_font_t` 数组。
+- 内置 symbol 字形随 Montserrat 字号启用（lv_conf 开 `LV_FONT_MONTSERRAT_16 / _24`），无需额外文件。
+- 运行时零字体文件 IO（无 .bin、无 binfont、无 TTF）。
 
-### 8.3 lv_fs 映射
+### 8.3 lv_fs 映射（只读 storage 分区图片）
 
-- `LV_USE_FS_POSIX=1`，盘符 `'S'`，根路径 `"/sdcard"`；
-- 代码中一律写 `"S:/ui/fonts/ui_font_16.bin"` → `fopen("/sdcard/ui/fonts/ui_font_16.bin")`；
-- 前置条件：`SD_Card_Init()` 挂载成功后才允许加载 SD 资源（架构文档数据流五的初始化顺序约定）。
+- 自定义 LVGL 文件系统盘符 `'F'`（`ui_disp.c` 注册，VFS `stdio` 后端，根 `/storage`）；
+- 代码中一律写 `"F:/ui_img/xxx.png"` → `/storage/ui_img/xxx.png`；
+- 前置条件：`ui_hw_bringup()` 内 `esp_vfs_spiffs_register()` 挂载 `/storage` 成功后才允许加载图片（失败按 8.4 降级）。
 
-### 8.4 SD 缺席/异常容错矩阵
+### 8.4 资源缺失/异常容错矩阵
 
 | 异常 | 字体 | 图标 | 播放页 | 列表页 | 配网/设置 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| SD 未挂载 | 内置兜底字体 | 字形图标全部内置不受影响；cover/bulb PNG 回退字形 | 正常（无本地播放） | 空态"SD 卡未挂载" | **完全可用**（不依赖 SD） |
-| fonts/*.bin 加载失败 | 同上回退 | 不受影响 | 正常 | 正常 | 正常 |
-| icons/*.png 缺失/损坏 | 不受影响 | 回退灯泡字形（字体） | 正常 | 正常 | 正常 |
-| cover 缺失 | 不受影响 | 内置色块占位 | 正常 | 正常 | 正常 |
-| SD 播放中拔卡 | 已加载资源继续用 | — | `MUSIC_EVT_ERROR` → Toast + 停止态 | 空态 | — |
+| storage 未挂载（分区镜缺失/未烧录） | 不受影响（编译进固件） | 字形图标全部内置不受影响；PNG 回退字形 | 正常（封面占位色块） | 正常 | 正常 |
+| ui_img/*.png 缺失/损坏 | 不受影响 | 字形图标回退 | 封面内置色块占位 | 正常 | 正常 |
+| SD 未挂载（仅音乐） | 不受影响 | 不受影响 | 正常（无本地播放） | 空态"SD 卡未挂载" | 正常 |
+| SD 播放中拔卡 | 不受影响 | 不受影响 | `MUSIC_EVT_ERROR` → Toast + 停止态 | 空态 | 正常 |
 
-- 资源加载在 `ui_init()` 内一次性完成（失败逐项降级，不阻塞启动）；SD 恢复（重新上电插卡）后经重启自然恢复，本期不做运行时热加载。
-
+- 图片在 `ui_init()` 内按需加载（失败逐项降级，不阻塞启动）；字体全程无文件 IO，SD 只负责音乐文件。
 ------
 
 ## 9. 上游接口补充建议（仅记录，未回写架构文档）
@@ -706,7 +696,7 @@ esp_err_t music_play_get_position_ms(music_play_handle_t player, uint32_t *posit
 
 | 阶段 | 内容 | 准出条件 | 依赖 |
 | :--- | :--- | :--- | :--- |
-| **M1 显示/触摸底座** | 自持 UI_Task + flush/read 适配、主题与双轨字体、图标字形资产（symbol 字号启用 + 自定义 iconfont 生成，见 3.3）、状态栏/Tab 栏骨架、三页静态布局（假数据）、页面切换 | 320×240 稳定刷屏 ≈30fps、触摸点击/滚动正常、SD 字体加载与降级切换生效；`LCD_TOUCH_SELF_TEST=0` | LCD_Touch（已实现）、sd_card（已实现）；MusicPlay 等可为 NULL |
+| **M1 显示/触摸底座** | 自持 UI_Task + flush/read 适配、主题与内置字体（C 编译进固件）、图标字形资产（symbol 字号启用 + 自定义 iconfont 生成，见 3.3）、状态栏/Tab 栏骨架、三页静态布局（假数据）、页面切换 | 320×240 稳定刷屏 ≈30fps、触摸点击/滚动正常、storage 分区 PNG 加载与占位回退生效；`LCD_TOUCH_SELF_TEST=0` | LCD_Touch（已实现）、storage 分区（已实现，随固件烧录）；MusicPlay 等可为 NULL |
 | **M2 播放链路** | 播放页真实数据、本地列表、音量/模式、pending 态、跑马灯 | 本地源完整闭环（选曲/播放/暂停/切曲/进度/音量）；BT 源标题与控制可用（AVRCP 回流） | MusicPlay / PlayMode 实现（+9.2 建议落地） |
 | **M3 灯控 + 配网** | 灯控页三态与回执时序、扫描列表、密码键盘、配网两步流程 | 开灯→ack 落定 <50ms；断网重连图标正确；配网成功落盘 NVS | LightControl / wifi_manager 实现（+9.1 建议落地） |
 | **M4 系统状态收尾** | 设置页同步/语音/OTA 分区、容错矩阵全量验证、Toast 体系 | SD 拔卡降级、各句柄 NULL 降级逐项通过；OTA 进度展示正确 | sync_protocol / CallPhone / OTA |
@@ -724,4 +714,4 @@ esp_err_t music_play_get_position_ms(music_play_handle_t player, uint32_t *posit
 | 触摸为 20ms 轮询快照（无中断） | 快速滑动跟手性一般 | 本期不做滑动手势；列表滚动用 LVGL 内建滚动实测调优 |
 | esp-sr 许可证不确定（CallPhone 可能换唤醒方案） | 语音状态来源变化 | UI 只依赖 `call_phone_get_state()`，底层替换不影响 UI |
 | AVRCP 回流慢（部分手机 >500ms） | 播放键等待态偏长 | pending 态 500ms 阈值 + `view->pending_cmd` 双信号；不做乐观提交 |
-| binfont 字符集遗漏 | 个别字显示为方块 | 文案表与字符集统一维护；兜底方案为内置字体覆盖状态词 |
+| 编译字体字符集遗漏 | 个别字显示为方块 | 文案表与字符集统一维护；新增文字需重新生成 C 数组并更新固件 |

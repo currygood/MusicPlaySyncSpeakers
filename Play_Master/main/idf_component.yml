@@ -8,6 +8,5 @@
 # ============================================================
 dependencies:
   lvgl/lvgl: "^9"
-  espressif/esp_lvgl_port: "^2"
   espressif/cjson: "^1.7.19"
   espressif/esp-sr: "^2.0.0"

@@ -4,7 +4,7 @@
  *
  * 实现要点：
  *   1. create()：从 "model" 分区加载唤醒词模型（wn9s_nihaoxiaozhi，"你好小智"），
- *      创建 esp-sr AFE 实例；注册 audio_bus RX 读者 "call_phone_mic"；
+ *      读取 microphone 模块 FIFO；
  *      创建 CallPhone_Task（优先级 8，栈 8192，Core 1，见架构设计 6 任务表）。
  *   2. start_listening() 后任务循环：读麦克风 PCM（I2S 每 44.1kHz 帧 L/R 双槽位，
  *      先提取一路为 44.1kHz 单声道 16bit）→ 16.16 定点线性插值重采样到
@@ -14,10 +14,10 @@
  *      （44.1k 输入，bt_audio 内部降采样到 SCO 速率）；
  *   4. SCO 被关闭 / call_phone_hangup() / 超时后回到 LISTENING 继续监听。
  *
- * 数据流：麦克风 → audio_bus(RX) → call_phone_mic reader → esp-sr 唤醒检测
+ * 数据流：麦克风 → microphone(FIFO) → call_phone → esp-sr 唤醒检测
  *          → 命中 → HFP SCO 建立 → 麦克风上行 → 手机语音助手。
  *
- * 依赖：audio_bus（RX 多读者）、bt_audio（HFP 能力）、esp-sr（乐鑫组件 v2.5.3）。
+ * 依赖：microphone（麦克风 FIFO）、bt_audio（HFP 能力）、esp-sr（乐鑫组件 v2.5.3）。
  * 注意：本模块不处理 HFP 下行（手机应答放音由 bt_audio.on_pcm(HFP_DOWNLINK)
  *       输出并接至 sync_protocol，见主音频节点软件架构分层设计 3.3.2）。
  *
@@ -50,14 +50,11 @@
 
 #define TAG "CallPhone"
 
-/** 麦克风固定采样率（与 audio_bus 全链路一致：AUDIO_BUS_SAMPLE_RATE） */
+/** 麦克风固定采样率（Hz）：44.1kHz，全链路统一 */
 #define CP_MIC_SAMPLE_RATE        44100
 
 /** esp-sr AFE 期望采样率：16kHz（见 esp_afe_sr_iface.h feed 注释 "16-bit @ 16 KHZ"） */
 #define CP_AFE_RATE               16000
-
-/** 上行 FIFO 默认字节数：16384 ≈ 186ms@44.1k 单声道 */
-#define CP_PCM_FIFO_DEFAULT       16384
 
 /** 唤醒命中后等待 SCO 打开的超时（ms） */
 #define CP_SCO_TIMEOUT_MS         5000
@@ -112,9 +109,7 @@ typedef struct {
 /* ======================== 模块私有结构 ================================================== */
 
 struct call_phone_s {
-    audio_bus_handle_t bus;            /* 调用方传入的 audio_bus（本模块只注册/注销 reader） */
     bt_audio_handle_t  audio;          /* 复用 bt_audio 的 HFP 能力 */
-    uint32_t           pcm_fifo_bytes; /* 麦克风 reader FIFO 大小 */
 
     /* esp-sr 唤醒检测 */
     srmodel_list_t           *models;       /* 模型列表（来自 model 分区） */
@@ -124,9 +119,6 @@ struct call_phone_s {
     int                       feed_chunk;   /* feed() 每次需要的样本数 */
     uint64_t                  rs_step;      /* 44.1k→16k 16.16 定点重采样步长 */
     uint64_t                  rs_pos;       /* 重采样位置（跨帧连续） */
-
-    /* 麦克风 reader */
-    audio_reader_handle_t reader;
 
     /* 缓冲（PSRAM 优先） */
     int16_t *rs_in;      /* 44.1k 输入缓冲（I2S L/R 槽位对，容量 rs_in_cap） */
@@ -221,7 +213,7 @@ static uint32_t CallPhone_Resample_16_16(const int16_t *in, uint32_t in_n,
 /**
  * @brief 从 I2S 双槽位交错流中提取单声道（就地覆盖）
  *
- * audio_bus RX 每 44.1kHz 帧输出 L/R 两个 32-bit 槽位样本（I2S_SLOT_MODE_STEREO，
+ * microphone FIFO 每 44.1kHz 帧输出 L/R 两个 32-bit 槽位样本（I2S_SLOT_MODE_STEREO，
  * 每帧先左槽后右槽）。INMP441 只驱动物理左槽（L/R=GND → 左声道，见
  * docs/02-设计/引脚分配表.md），另一槽浮空：GPIO34 输入专用脚无内部下拉
  * （与 gpio_pulldown_en 报错同因），浮空槽会拾取串扰噪声。
@@ -297,8 +289,9 @@ static void CallPhone_Listening(call_phone_handle_t cp)
     while (got < pair_need)
     {
         size_t  now = 0;
-        ret = audio_reader_read_pcm16(cp->reader, cp->rs_in + got,
-                                      pair_need - got, &now, CP_READ_TIMEOUT_MS);
+        ret = Microphone_Read_Pcm16(cp->rs_in + got,
+                                      pair_need - got, &now,
+                                      pdMS_TO_TICKS(CP_READ_TIMEOUT_MS));
         if (ret != ESP_OK || now == 0)
         {
             break;
@@ -386,7 +379,7 @@ static void CallPhone_Connecting(call_phone_handle_t cp)
     if (bt_audio_hfp_is_audio_open(cp->audio))
     {
         /* SCO 已打开：丢弃唤醒期间积压的旧麦克风数据，重采样状态复位后开始上行 */
-        audio_reader_flush(cp->reader);
+        Microphone_Flush();
         cp->rs_pos = 0;
         CallPhone_State_Set(cp, CALL_PHONE_STATE_STREAMING);
         ESP_LOGI(TAG, "HFP SCO open, mic uplink started");
@@ -410,8 +403,9 @@ static void CallPhone_Streaming(call_phone_handle_t cp)
     size_t    got = 0;
     esp_err_t ret;
 
-    ret = audio_reader_read_pcm16(cp->reader, cp->up_buf,
-                                  CP_UP_PAIR_SAMPLES, &got, CP_STREAM_TIMEOUT_MS);
+    ret = Microphone_Read_Pcm16(cp->up_buf,
+                                  CP_UP_PAIR_SAMPLES, &got,
+                                  pdMS_TO_TICKS(CP_STREAM_TIMEOUT_MS));
     if (ret == ESP_OK && got >= 2)
     {
         size_t frames = CallPhone_ExtractMono(cp->up_buf, got, &cp->lane, NULL, NULL);
@@ -437,16 +431,11 @@ static void CallPhone_Streaming(call_phone_handle_t cp)
 /**
  * @brief 统一释放资源（create 失败回滚与 DESTROY 共用）
  *
- * 逆序：注销 reader → 销毁 AFE 实例 → 释放模型 → 释放缓冲。
+ * 逆序：销毁 AFE 实例 → 释放模型 → 释放缓冲（麦克风 FIFO 由 microphone 模块统一管理）。
  * 仅任务线程（且模块已停）调用。
  */
 static void CallPhone_Deinit(call_phone_handle_t cp)
 {
-    if (cp->reader != NULL)
-    {
-        audio_reader_unregister(cp->reader);
-        cp->reader = NULL;
-    }
     if (cp->afe_data != NULL && cp->afe_if != NULL)
     {
         cp->afe_if->destroy(cp->afe_data);
@@ -519,7 +508,7 @@ static bool CallPhone_HandleCmd(call_phone_handle_t cp,
         if (CallPhone_State_Get(cp) == CALL_PHONE_STATE_CONNECTING ||
             CallPhone_State_Get(cp) == CALL_PHONE_STATE_STREAMING)
         {
-            bt_audio_hfp_stop_voice(cp->audio);  /* 先停 HFP 语音，再注销 reader/FIFO */
+    /* 先停 HFP 语音，再释放调用模块资源 */
         }
         CallPhone_Deinit(cp);
         xSemaphoreGive(cp->destroy_done);
@@ -583,12 +572,11 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     call_phone_cmd_msg_t msg;
     afe_config_t        *afe_cfg = NULL;
     char                *model_name;
-    esp_err_t            ret;
 
-    /* ---- 参数检查：采样率固定 44.1k；bus/audio 句柄必须有效 ---- */
-    if (cfg == NULL || cfg->bus == NULL || cfg->audio == NULL)
+    /* 参数检查：采样率固定 44.1k；audio 句柄必须有效 */
+    if (cfg == NULL || cfg->audio == NULL)
     {
-        ESP_LOGE(TAG, "create: invalid cfg (bus/audio required)");
+        ESP_LOGE(TAG, "create: invalid cfg (audio required)");
         return NULL;
     }
     if (cfg->sample_rate != 0 && cfg->sample_rate != CP_MIC_SAMPLE_RATE)
@@ -603,10 +591,7 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
         ESP_LOGE(TAG, "create: calloc failed");
         return NULL;
     }
-    cp->bus = cfg->bus;
     cp->audio = cfg->audio;
-    cp->pcm_fifo_bytes = (cfg->pcm_fifo_bytes == 0)
-                         ? CP_PCM_FIFO_DEFAULT : cfg->pcm_fifo_bytes;
     cp->state = CALL_PHONE_STATE_IDLE;
     cp->lane = -1;   /* 首次读取时按能量自动选择 I2S 槽位 */
 
@@ -699,16 +684,7 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
         goto fail;
     }
 
-    /* ---- 步骤 7：注册麦克风 reader（name "call_phone_mic"，FIFO 满丢旧数据） ---- */
-    ret = audio_reader_register(cfg->bus, "call_phone_mic", cp->pcm_fifo_bytes,
-                                AUDIO_FIFO_DROP_OLDEST, &cp->reader);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "audio_reader_register: %s", esp_err_to_name(ret));
-        goto fail;
-    }
-
-    /* ---- 步骤 8：创建任务（CallPhone_Task） ---- */
+    /* ---- 步骤 7：创建任务（CallPhone_Task） ---- */
     if (xTaskCreatePinnedToCore(CallPhone_Task, CP_TASK_NAME, CP_TASK_STACK, cp,
                                 CP_TASK_PRIO, &cp->task, CP_TASK_CORE) != pdPASS)
     {
@@ -716,8 +692,8 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
         goto fail;
     }
 
-    ESP_LOGI(TAG, "created: fifo=%u bytes, feed=%d samples@%d Hz",
-             (unsigned)cp->pcm_fifo_bytes, cp->feed_chunk, cp->afe_rate);
+    ESP_LOGI(TAG, "created: feed=%d samples@%d Hz",
+             cp->feed_chunk, cp->afe_rate);
     return cp;
 
 fail:

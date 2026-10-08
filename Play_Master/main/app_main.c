@@ -18,7 +18,6 @@
 #include "microphone.h"
 #include "LCD_Touch.h"
 #include "i2c_driver.h"
-#include "audio_bus.h"
 #include <stdbool.h>
 #include "bt_audio.h"
 #include "call_phone.h"
@@ -171,7 +170,7 @@ static void Sd_Card_Test(void)
  *
  * 生成 800Hz 方波 PCM（16-bit/44.1kHz/双声道），按 0.25s 响、0.25s 停
  * 的节奏通过功放播放，共 5 秒。用作总线化改造后的硬件验证：能听到
- * 有节奏的“嘟嘟”声即说明 audio_bus + 物理 I2S + 功放链路正常。
+ * 有节奏的“嘟嘟”声即说明 microphone + 物理 I2S + 功放链路正常。
  */
 static void play_beep_test(void)
 {
@@ -465,11 +464,12 @@ static void Mic_Record_Playback_Test(void)
 static bool s_btA2dpConnected = false;
 static TaskHandle_t s_btHfpTestTask = NULL;   /* HFP 语音测试任务句柄 */
 
+static int16_t s_hfpDnStereoBuf[2048];
+
 /** bt_audio PCM 回调（bt_audio 任务上下文）：直喂功放验证音频链路 */
 static void App_Bt_Pcm_Cb(bt_audio_pcm_source_t source, const int16_t *pcm,
                           size_t samples, uint32_t sample_rate, void *user_ctx)
 {
-    (void)source;
     (void)sample_rate;
     (void)user_ctx;
 
@@ -482,6 +482,27 @@ static void App_Bt_Pcm_Cb(bt_audio_pcm_source_t source, const int16_t *pcm,
     {
         return;
     }
+
+    /* HFP 下行是 44.1kHz 单声道，而功放总线为双声道（L/R 写同一份）：
+     * 单声道原样写入会被当作双声道帧解析（且字节数常非 4 的倍数，
+     * i2s_channel_write 会拒绝），必须先扩为立体声再交给功放。 */
+    if (source == BT_AUDIO_PCM_SOURCE_HFP_DOWNLINK)
+    {
+        if (samples > (sizeof(s_hfpDnStereoBuf) / (2 * sizeof(int16_t))))
+        {
+            ESP_LOGW(TAG, "HFP mono chunk too large: %u", (unsigned)samples);
+            return;
+        }
+        int16_t *out = s_hfpDnStereoBuf;
+        for (size_t i = 0; i < samples; i++)
+        {
+            out[i * 2]     = pcm[i];
+            out[i * 2 + 1] = pcm[i];
+        }
+        Amplifier_Play_Buffer((const uint8_t *)out, samples * 4, NULL, 200);
+        return;
+    }
+
     Amplifier_Play_Buffer((const uint8_t *)pcm, samples * sizeof(int16_t), NULL, 200);
 }
 
@@ -543,10 +564,13 @@ static void App_Bt_Evt_Cb(const bt_audio_event_t *evt, void *user_ctx)
                  (unsigned long)evt->data.track_info.duration_ms);
         break;
     case BT_AUDIO_EVT_VOLUME_CHANGED:
-        ESP_LOGI(TAG, "AVRCP volume: %u", evt->data.volume);
-        /* 手机侧调音量（绝对音量命令/通知）→ 同步本机功放 */
+    {
+        /* 手机侧调音量（HFP +VGS / AVRCP 绝对音量，bt_audio 已统一为 0~100）
+         * → 同步本机功放（0% 即静音，属正常用户设置，不做下限处理）。 */
+        ESP_LOGI(TAG, "volume change: phone=%u%%", evt->data.volume);
         Amplifier_Set_Volume(evt->data.volume);
         break;
+    }
     default:
         break;
     }
@@ -779,11 +803,11 @@ static void BtA2dp_Test(void)
 
 /*
  * 接线顺序（见《主音频节点开发过程》第四阶段）：
- *   Microphone_Init()（自建 RX 总线 + INMP441 使能）→ bt_audio_create
+ *   Microphone_Init()（INMP441 + 麦克风 FIFO）→ bt_audio_create
  *   → call_phone_create
  *
- * 说明：RX 总线句柄由 microphone 模块导出（Microphone_GetBus()），
- * 测试不再自建总线、不重复 INMP441 使能步骤。
+ * 说明：麦克风 FIFO 由 microphone 模块统一管理，call_phone 直接
+ * 通过 Microphone_Read_* 读取，无需再暴露总线句柄。
  */
 
 /* 监视任务上下文 */
@@ -876,13 +900,6 @@ static void CallPhone_Test(void)
         ESP_LOGE(TAG, "Microphone_Init failed: %s", esp_err_to_name(ret));
         return;
     }
-    audio_bus_handle_t rx_bus = Microphone_GetBus();
-    if (rx_bus == NULL)
-    {
-        ESP_LOGE(TAG, "Microphone_GetBus failed");
-        Microphone_Deinit();
-        return;
-    }
 
     /* 2) 功放（TX）——HFP 下行经 on_pcm 播放 */
     ret = Amplifier_Init();
@@ -916,12 +933,10 @@ static void CallPhone_Test(void)
         return;
     }
 
-    /* 4) CallPhone：注册 reader + esp-sr 唤醒词检测 + HFP 上行 */
+    /* 4) CallPhone：esp-sr 唤醒词检测 + HFP 上行（读 microphone FIFO） */
     call_phone_cfg_t cp_cfg = {
-        .bus            = rx_bus,
         .audio          = audio,
         .sample_rate    = 44100,
-        .pcm_fifo_bytes = 0,   /* 0 = 默认 16KB */
     };
     call_phone_handle_t cp = call_phone_create(&cp_cfg);
     if (cp == NULL)
@@ -2212,7 +2227,7 @@ void app_main(void)
 
 	/* 第九阶段：sync_protocol 同步播放模块自环测试（音频/控制组播自环 + 本地功放）。
 	 * 测试函数自带大栈缓冲，按惯例单独起任务（16KB 栈，避开 main_task 3.5KB 限制） */
-	xTaskCreatePinnedToCore(Sync_Protocol_Test, "sync_test", 16384, NULL, 5, NULL, 0);
+	// xTaskCreatePinnedToCore(Sync_Protocol_Test, "sync_test", 16384, NULL, 5, NULL, 0);
 	
 	while(1)
 	{

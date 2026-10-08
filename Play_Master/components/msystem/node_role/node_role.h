@@ -61,8 +61,8 @@ typedef struct {
 /* ======================== 默认参数（内置默认，配网 UI 接入前） =========== */
 
 /** 默认 WiFi SSID/密码（开发期测试凭据，配网后由 node_role_set 覆盖） */
-#define NODE_ROLE_DEFAULT_SSID          "HW666"
-#define NODE_ROLE_DEFAULT_PASSWORD      "ADajLP691TY."
+#define NODE_ROLE_DEFAULT_SSID          "败家之眼"
+#define NODE_ROLE_DEFAULT_PASSWORD      "Tgs200410"
 
 /** 默认 OTA 服务器地址（不带协议头，ota_manager 使用前自行补全） */
 #define NODE_ROLE_DEFAULT_OTA_URL       "192.168.4.16:5000/ota/check"

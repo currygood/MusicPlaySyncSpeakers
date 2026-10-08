@@ -3,7 +3,7 @@
  * @brief 语音通话模块（唤醒词检测 + HFP 语音上行桥接，App 层）
  *
  * 模块职责（对应《主音频节点软件架构分层设计》3.3.2）：
- *   - 本地唤醒词检测：从 audio_bus RX 注册麦克风 reader（名称 "call_phone_mic"），
+ *   - 本地唤醒词检测：从 microphone 模块读取麦克风 FIFO（Microphone_Read_Pcm16），
  *     把 PCM 喂给乐鑫 esp-sr 做唤醒词检测（唤醒词：你好小智，wn9s_nihaoxiaozhi）；
  *   - 唤醒命中后自动调用 bt_audio_hfp_start_voice() 建立 HFP 语音链路，
  *     SCO 打开后把麦克风 PCM 经 bt_audio_hfp_send_pcm() 持续上行到手机；
@@ -12,17 +12,17 @@
  *   - 不对外发事件：UI / 灯控 / MusicPlay 均不订阅；需要状态时通过
  *     call_phone_get_state() 查询。
  *
- * 数据流：麦克风 → audio_bus(RX) → call_phone_mic reader → esp-sr 唤醒检测
+ * 数据流：麦克风 → microphone(FIFO) → call_phone → esp-sr 唤醒检测
  *          → 命中 → HFP SCO 建立 → 麦克风上行 → 手机语音助手。
  *
- * 依赖：audio_bus（RX 多读者）、bt_audio（HFP 能力）、esp-sr（乐鑫组件，仅主节点引入）。
+ * 依赖：microphone（麦克风 FIFO）、bt_audio（HFP 能力）、esp-sr（乐鑫组件，仅主节点引入）。
  */
 
 #ifndef __CALL_PHONE_H__
 #define __CALL_PHONE_H__
 
 #include "esp_err.h"
-#include "audio_bus.h"
+#include "microphone.h"
 #include "bt_audio.h"
 #include <stdint.h>
 
@@ -45,10 +45,8 @@ typedef enum {
 
 /* 创建参数 */
 typedef struct {
-    audio_bus_handle_t bus;        /* audio_bus（本模块内部注册 RX reader "call_phone_mic"） */
-    bt_audio_handle_t  audio;      /* 复用 bt_audio 的 HFP 能力 */
-    uint32_t sample_rate;          /* 麦克风采样率：固定 44100（esp-sr 内部需 16k，本模块内重采样） */
-    uint32_t pcm_fifo_bytes;       /* 上行 FIFO 字节数，0 = 默认 16384 */
+    bt_audio_handle_t  audio;         /* 复用 bt_audio 的 HFP 能力 */
+    uint32_t sample_rate;             /* 麦克风采样率：固定 44100（esp-sr 内部需 16k，本模块内重采样） */
 } call_phone_cfg_t;
 
 /* ======================== API ============================================================ */

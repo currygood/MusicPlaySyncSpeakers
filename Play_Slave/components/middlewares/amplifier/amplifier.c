@@ -1,36 +1,37 @@
 /**
  * @file amplifier.c
- * @brief 功放模块实现（基于 NS4168 D 类功放芯片 + audio_bus 总线）
+ * @brief 功放模块实现（NS4168 D 类功放，直接驱动 I2S TX）
  *
  * 本模块封装 NS4168 功放芯片的音频输出功能。NS4168 是 5W 单声道
  * D 类功放，通过 I2S 标准协议接收 PCM 音频数据驱动扬声器。
  *
- * 架构变化（总线化改造）：
- *   - 不再直接调用 i2s_driver 的旧 API，而是通过 middlewares/audio_bus
- *     注册为一个"写者"（生产者）；
- *   - 功放是一条 TX 总线，未来组播同步、测试音等上层 App 都可以注册
- *     写者，由 audio_bus 仲裁，保证同一时刻只有一路数据在播放；
- *   - 本模块只负责"发声"，不关心总线上其他写者的存在。
+ * 架构说明（原 audio_bus 瘦身后）：
+ *   - 本模块直接持有 i2s_driver 的物理 TX 句柄（I2S_NUM_1）；
+ *   - 模块内部维护写锁，每块 Amplifier_Play_Buffer() 为一次原子写，
+ *     多任务音源（组播同步播放、自检音等）经此入口串行化；
+ *   - 从节点只有功放一个音频输出端，无麦克风/蓝牙/本地解码。
  *
  * 硬件连接（I2S TX）：BCLK=GPIO8、LRCK=GPIO9、DIN=GPIO10
  */
 
 #include "amplifier.h"
-#include "audio_bus.h"
+#include "i2s_driver.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
-/* ======================== 模块静态变量 =========================================== */
+/* ======================== 模块静态变量 ============================================= */
 
 static const char *TAG = "AMPLIFIER";  /* 日志标签 */
 
-/* 功放所属音频总线与写者句柄 */
-static audio_bus_handle_t Amp_Bus = NULL;
-static audio_writer_handle_t Amp_Writer = NULL;
+/* I2S 物理 TX 句柄与写锁 */
+static i2s_bus_handle_t  Amp_Phy        = NULL;
+static SemaphoreHandle_t Amp_WriteMutex = NULL;
 
-/* 当前软件音量（0~100），默认 80% */
+/* 当前软件音量（0~100），默认 80 */
 static uint8_t Amplifier_Volume = 80;
 
-/* ======================== 硬编码引脚与格式配置 ==================================== */
+/* ======================== 硬编码引脚与格式配置 ===================================== */
 
 /** I2S TX 位时钟 GPIO（BCLK 接 NS4168 BCLK） */
 #define AMP_BCLK_GPIO  8
@@ -65,54 +66,50 @@ static const i2s_bus_cfg_t Amp_BusCfg = {
     .tx_auto_clear  = true,
 };
 
-/* ======================== 功放公共 API =========================================== */
+/* ======================== 功放公共 API ========================================== */
 
 esp_err_t Amplifier_Init(void)
 {
     /* 重复初始化保护 */
-    if (Amp_Bus != NULL)
+    if (Amp_Phy != NULL)
     {
         ESP_LOGW(TAG, "already initialized");
         return ESP_OK;
     }
 
-    /*
-     * 创建 TX 音频总线（I2S_NUM_1，功放）。
-     * 从节点总线固定为 TX（仅功放），其他模块后续可以在同一条
-     * 总线上注册写者。
-     */
-    Amp_Bus = audio_bus_create(I2S_NUM_1, &Amp_PinCfg, &Amp_BusCfg);
-    if (Amp_Bus == NULL)
+    /* 创建 I2S TX 物理通道（I2S_NUM_1，功放） */
+    esp_err_t ret = i2s_bus_phy_create(I2S_NUM_1, true, &Amp_PinCfg, &Amp_BusCfg, &Amp_Phy);
+    if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "audio bus create failed");
+        ESP_LOGE(TAG, "i2s phy create failed: %s", esp_err_to_name(ret));
+        Amp_Phy = NULL;
         return ESP_FAIL;
     }
 
-    /* 以"amplifier"之名注册为写者 */
-    esp_err_t ret = audio_writer_register(Amp_Bus, "amplifier", &Amp_Writer);
-    if (ret != ESP_OK)
+    Amp_WriteMutex = xSemaphoreCreateMutex();
+    if (Amp_WriteMutex == NULL)
     {
-        ESP_LOGE(TAG, "writer register failed: %s", esp_err_to_name(ret));
-        audio_bus_destroy(Amp_Bus);
-        Amp_Bus = NULL;
-        return ret;
+        ESP_LOGE(TAG, "write mutex create failed");
+        i2s_bus_phy_destroy(Amp_Phy);
+        Amp_Phy = NULL;
+        return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "NS4168 amplifier initialized");
+    ESP_LOGI(TAG, "NS4168 amplifier initialized, volume=%d%%", Amplifier_Volume);
     return ESP_OK;
 }
 
 esp_err_t Amplifier_Deinit(void)
 {
-    if (Amp_Writer != NULL)
+    if (Amp_WriteMutex != NULL)
     {
-        audio_writer_unregister(Amp_Writer);
-        Amp_Writer = NULL;
+        vSemaphoreDelete(Amp_WriteMutex);
+        Amp_WriteMutex = NULL;
     }
-    if (Amp_Bus != NULL)
+    if (Amp_Phy != NULL)
     {
-        audio_bus_destroy(Amp_Bus);
-        Amp_Bus = NULL;
+        i2s_bus_phy_destroy(Amp_Phy);
+        Amp_Phy = NULL;
     }
     ESP_LOGI(TAG, "NS4168 amplifier deinitialized");
     return ESP_OK;
@@ -126,19 +123,23 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
         ESP_LOGE(TAG, "Invalid buffer parameters");
         return ESP_ERR_INVALID_ARG;
     }
-    if (Amp_Writer == NULL)
+    if (Amp_Phy == NULL || Amp_WriteMutex == NULL)
     {
         ESP_LOGE(TAG, "amplifier not initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
-    /*
-     * 通过音频总线写入（原子块，默认 BLOCK 策略）：
-     *  PCM 为 16-bit 单声道，采样数 = 字节数 / 2
-     */
-    size_t samples = size / sizeof(int16_t);
-    esp_err_t ret = audio_writer_write(Amp_Writer, (const int16_t *)buffer,
-                                       samples, timeout, AUDIO_WRITE_BLOCK);
+    /* 写锁 + 物理写入：PCM 16-bit 单声道，size 直接为字节数 */
+    TickType_t wait_ticks = (timeout == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(timeout);
+    if (xSemaphoreTake(Amp_WriteMutex, wait_ticks) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "write lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+    size_t written = 0;
+    esp_err_t ret = i2s_bus_phy_write(Amp_Phy, buffer, size, &written, timeout);
+    xSemaphoreGive(Amp_WriteMutex);
+
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Play buffer failed: %s", esp_err_to_name(ret));
@@ -146,7 +147,7 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
     }
     if (bytes_written != NULL)
     {
-        *bytes_written = samples * sizeof(int16_t);
+        *bytes_written = size;
     }
     return ESP_OK;
 }

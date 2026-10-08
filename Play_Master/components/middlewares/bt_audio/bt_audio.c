@@ -595,11 +595,17 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
         /* AG 通过 +VGM/+VGS 调整本机音量（HF 侧） */
         if (param->volume_control.type == ESP_HF_VOLUME_CONTROL_TARGET_SPK)
         {
+            /* 归一化：HFP +VGS 音量刻度为 0~15，而 AVRCP 绝对音量为 0~100，
+             * 统一转成 0~100 再下发，避免把（如 1/15）直接当 1% 用。 */
+            uint32_t v015 = (uint32_t)param->volume_control.volume;
+            if (v015 > 15) { v015 = 15; }
+            uint8_t v100 = (uint8_t)((v015 * 100) / 15);
+
             memset(&evt, 0, sizeof(evt));
             evt.id = BT_AUDIO_EVT_VOLUME_CHANGED;
-            evt.data.volume = (uint8_t)param->volume_control.volume;
+            evt.data.volume = v100;
             bt_audio_post_event(&evt);
-            ESP_LOGI(TAG, "HFP volume set to %d", param->volume_control.volume);
+            ESP_LOGI(TAG, "HFP volume set to %u (VGS 0~15 -> 0~100)", v100);
         }
         break;
     }

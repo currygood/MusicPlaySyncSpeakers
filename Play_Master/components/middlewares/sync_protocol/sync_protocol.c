@@ -15,7 +15,7 @@
  *   - 独立于音源：push_pcm 线程安全非阻塞入环；暂停/停止时环满丢弃。
  *
  * 本地最终出声使用 Amplifier_Play_Buffer()（第九阶段讨论决定），因此
- * 本模块不注册 audio_bus writer，也不需要 audio_bus 句柄。
+ * 本模块不注册任何写者：经 Amplifier_Play_Buffer() 直接写 I2S。
  */
 
 #include "sync_protocol.h"

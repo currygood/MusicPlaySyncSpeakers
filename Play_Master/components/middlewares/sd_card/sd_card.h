@@ -18,7 +18,7 @@
  * 风格说明（句柄式）：
  *   - 文件以句柄（sd_card_file_handle_t）访问，句柄不透明；
  *   - Open/Read/Write/Seek/Tell/Close 一组 API，风格与 i2s_driver /
- *     audio_bus 的总线句柄保持一致，底层为 FATFS/VFS（线程安全）；
+ *     上层模块的句柄风格保持一致，底层为 FATFS/VFS（线程安全）；
  *   - 句柄内部校验：非法句柄 / 未挂载时返回 ESP_ERR_INVALID_STATE 或
  *     ESP_ERR_INVALID_ARG，不会写坏内存。
  *

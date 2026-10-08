@@ -30,9 +30,9 @@
 
 /* ======================== 开发期兜底凭据 ======================== */
 /** 兜底 SSID：node_role NVS 未配网（ssid 为空）时使用，与 node_role 内置默认一致 */
-#define WIFI_MANAGER_DEFAULT_SSID        "HW666"
+#define WIFI_MANAGER_DEFAULT_SSID        "败家之眼"
 /** 兜底密码：同上 */
-#define WIFI_MANAGER_DEFAULT_PASSWORD    "ADajLP691TY."
+#define WIFI_MANAGER_DEFAULT_PASSWORD    "Tgs200410"
 
 /* ======================== 句柄与状态 ======================== */
 

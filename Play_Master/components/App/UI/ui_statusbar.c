@@ -8,7 +8,7 @@
  * 数据源约定：
  *   - WiFi：轮询 wifi_manager_get_state()（句柄经 ui_cfg 注入后生效，
  *     不注册 wifi_manager 事件——架构文档 3.4.2 约定 UI 走查询）；
- *   - 蓝牙：由播放源推断——MusicPlay/PlayMode 未实现（第九~十一阶段），先占位灰显；
+ *   - 蓝牙：由播放源推断——music_play_get_source()==MUSIC_SOURCE_BT 点亮，未注入句柄时灰显；
  *   - 同步：sync_protocol_master_get_status()（第九阶段实现），先占位灰显；
  *   - 麦克风：轮询 call_phone_get_state()（CallPhone 不发事件，只能查询）。
  */
@@ -75,7 +75,15 @@ static void statusbar_timer_cb(lv_timer_t *timer)
             }
         }
 
-        /* 蓝牙/同步：占位灰显（第九~十一阶段接入 MusicPlay/sync_protocol 后点亮） */
+        /* 蓝牙：MusicPlay 当前源为 BT（A2DP 已连接）时点亮 */
+        if (cfg->music != NULL)
+        {
+            lv_color_t color = (music_play_get_source(cfg->music) == MUSIC_SOURCE_BT)
+                                   ? UI_COLOR_OK : UI_COLOR_DISABLED;
+            lv_obj_set_style_text_color(s_insts[i].lblBt, color, 0);
+        }
+
+        /* 同步：占位灰显（sync_protocol 状态查询接口落地后点亮） */
     }
 }
 

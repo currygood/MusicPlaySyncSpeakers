@@ -142,6 +142,7 @@ bool      bt_audio_hfp_is_audio_open(bt_audio_handle_t audio); /* 查询 SCO 是
 /* AVRCP：UI 控制 */
 esp_err_t bt_audio_send_ctrl_cmd(bt_audio_handle_t audio, bt_audio_cmd_t cmd);
 esp_err_t bt_audio_get_play_state(bt_audio_handle_t audio, bt_audio_play_state_t *state);
+esp_err_t bt_audio_get_position_ms(bt_audio_handle_t audio, uint32_t *position_ms);
 esp_err_t bt_audio_get_track_info(bt_audio_handle_t audio,
                                   const bt_audio_track_info_t **info);
 

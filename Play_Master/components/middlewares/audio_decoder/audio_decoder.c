@@ -5,19 +5,19 @@
  * 设计依据（《主音频节点软件架构分层设计.md》3.2.3 / 任务表）：
  *   - 只做两件事：① MP3 流式解码；② 通过 on_pcm 回调把 PCM 丢出去；
  *     没有 play/pause 决策权，不提供 seek()，音量归 amplifier/上层；
- *   - 解码任务在模块内部创建：Core 1 / 优先级 10 / 栈 32768（minimp3 每帧
- *     解码内部 scratch 约 15KB + PCM 缓冲 4.6KB，栈太小会栈溢出）；
+ *   - 解码任务在模块内部创建：Core 1 / 优先级 10 / 栈 8192（minimp3 帧解码
+ *     scratch 约 15.5KB 已由 open() 预分配至堆（PSRAM 优先），不再占任务栈，
+ *     栈上只剩单帧 PCM 缓冲 4.6KB 与调用深度，故可用 8KB 栈）；
  *   - 文件读取走 middlewares/sd_card 的句柄式 API（FATFS/VFS）；
  *   - 解码库使用 third_party/minimp3（CC0-1.0）的基础帧解码接口
  *     （mp3dec_t + mp3dec_decode_frame），由本模块自建 8KB 输入缓冲并以
  *     memmove 滑动窗口续读。不使用 mp3dec_ex 流式接口——其内部 128KB
  *     IO 缓冲经 malloc 超阈值会落入 PSRAM，实测在本板（ESP32-WROVER-E +
  *     PSRAM）解码期间触发 cache-livelock 类 TG1WDT 复位（见排查记录）；
- *   - open 时由解码任务在自身 32KB 栈内探测首帧（不做整文件扫描），
+ *   - open 时由解码任务在自身 8KB 栈内探测首帧（不做整文件扫描），
  *     时长按"文件大小 × 8 / 码率"估算，避免大文件打开卡顿；
- *     首帧探测不在 open() 调用者的任务栈执行（主任务栈仅 3584B，而
- *     mp3dec_decode_frame 内部 scratch 约 15.5KB，栈内直接调用会
- *     Double Exception 复位，已实测），改为解码任务探测后经信号量通知 open。
+ *     首帧探测不在 open() 调用者的任务栈执行（主任务栈仅 3584B，栈内
+ *     直接解码会溢出，已实测），改为解码任务探测后经信号量通知 open。
  *
  * minimp3 用法：在单一编译单元（本文件）定义 MINIMP3_IMPLEMENTATION 后
  * 引入 minimp3.h，全工程只在本处实例化解码器实现。
@@ -29,6 +29,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,8 +54,10 @@ static const char *TAG = "AUDIO_DECODER";
 /** 解码任务优先级（设计任务表：10） */
 #define AUDIO_DECODER_TASK_PRIO     10
 
-/** 解码任务栈大小（mp3dec_decode_frame 内部 scratch 约 15KB + PCM 缓冲 4.6KB） */
-#define AUDIO_DECODER_TASK_STACK    32768
+/** 解码任务栈大小（帧解码 scratch —— mp3dec_scratch_t 约 15.5KB —— 已由
+ * open() 预分配至堆并 PSRAM 优先，不在任务栈上；栈上只剩单帧 PCM 4.6KB
+ * 与调用深度，8KB 足够。原 32KB 是 scratch 落栈时的取值） */
+#define AUDIO_DECODER_TASK_STACK    8192
 
 /** 命令队列深度：同一时刻实际只有 1 条有效命令，留余量便于组合 */
 #define AUDIO_DECODER_CMD_QUEUE_LEN 4
@@ -62,14 +65,14 @@ static const char *TAG = "AUDIO_DECODER";
 /** close() 等待解码任务退出上限（防止任务卡死时永久阻塞） */
 #define AUDIO_DECODER_CLOSE_WAIT_MS 1000
 
-/** MP3 输入缓冲（8KB，可容纳约 6 帧 320kbps/44.1kHz；单次 malloc 远小于
- *  PSRAM 回落阈值，保证落在内部 DRAM） */
+/** MP3 输入缓冲（8KB，可容纳约 6 帧 320kbps/44.1kHz）；
+ *  优先取 PSRAM（省内部 DRAM），分配失败自动回退内部 DRAM */
 #define AUDIO_DECODER_IN_BUF_SIZE   8192
 
 /** 缓冲内剩余字节低于该值时从 SD 续读（避免每帧都发起读卡） */
 #define AUDIO_DECODER_IN_REFILL_MIN 512
 
-/** open() 等待首帧探测完成的上限（探测在解码任务 32KB 栈内执行，
+/** open() 等待首帧探测完成的上限（探测在解码任务 8KB 栈内执行，
  *  正常情况 <1s 即可解出首帧；超时按非 MP3 文件处理） */
 #define AUDIO_DECODER_PROBE_TIMEOUT_MS 5000
 
@@ -93,7 +96,8 @@ struct audio_decoder_s
 
     /* ---- 流式解码状态（minimp3 基础 API + 自建滑动窗口） ---- */
     mp3dec_t              mp3;          /* 解码器核心状态（约 7KB，随结构体在内部 DRAM） */
-    uint8_t              *in_buf;       /* 输入缓冲（malloc 8KB，内部 DRAM） */
+    mp3dec_scratch_t     *scratch;      /* 帧解码 scratch（约 15.5KB，PSRAM 优先，不占任务栈） */
+    uint8_t              *in_buf;       /* 输入缓冲（8KB，PSRAM 优先，失败回退内部） */
     size_t                in_fill;      /* 缓冲内有效字节数 */
     size_t                in_consumed;  /* 已消费偏移（滑动窗口起点） */
     bool                  in_eof;       /* 已读到文件尾（fread 返回 0） */
@@ -198,11 +202,11 @@ static void Audio_Decoder_Rewind(struct audio_decoder_s *dec)
 }
 
 /**
- * @brief open() 阶段探测首帧（必须在解码任务 32KB 栈内调用）
+ * @brief open() 阶段探测首帧（必须在解码任务 8KB 栈内调用）
  *
- * mp3dec_decode_frame 内部有约 19KB 的栈 scratch（mp3dec_scratch_t），
+ * 帧解码 scratch 已由 open() 预分配至堆，但栈上仍需单帧 PCM 4.6KB，
  * 而 audio_decoder_open() 是在 app_main 主任务栈（默认 3584B）里被调用，
- * 直接在 open 里探测会栈溢出复位。因此探测放到解码任务中执行：
+ * 直接在 open 里探测仍会栈溢出复位。因此探测放到解码任务中执行：
  * 逐块读入，minimp3 自动跳过 ID3v2 标签，找到并真实解码完整首个音频帧
  * 即成功；该帧 PCM 丢弃（约 26ms 音频），in_consumed 推进到下一帧，
  * 探测结果（probe_ok / probe_fi）通过信号量通知 open()。
@@ -227,9 +231,10 @@ static void Audio_Decoder_Probe_In_Task(struct audio_decoder_s *dec,
         }
 
         memset(&fi, 0, sizeof(fi));
-        int samples = mp3dec_decode_frame(&dec->mp3,
-                                          dec->in_buf + dec->in_consumed,
-                                          (int)avail, pcm, &fi);
+        int samples = mp3dec_decode_frame_scratch(&dec->mp3,
+                                                  dec->in_buf + dec->in_consumed,
+                                                  (int)avail, pcm, &fi,
+                                                  dec->scratch);
         if (fi.frame_bytes > 0)
         {
             dec->in_consumed += (size_t)fi.frame_bytes;   /* 消费该块（含垃圾/首帧） */
@@ -307,6 +312,10 @@ static void Audio_Decoder_Discard(struct audio_decoder_s *dec)
     {
         free(dec->in_buf);
     }
+    if (dec->scratch != NULL)
+    {
+        free(dec->scratch);
+    }
     if (dec->path != NULL)
     {
         free(dec->path);
@@ -325,9 +334,10 @@ static void Audio_Decoder_Task(void *arg)
     /* 单帧 PCM 缓冲：minimp3 单帧最多 1152 采样/声道 × 2 声道（46 字节×2304） */
     mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
 
-    /* open() 期间的首帧探测：mp3dec_decode_frame 内部有约 19KB 栈 scratch，
-     * 必须在解码任务（32KB 栈）上执行；app_main 主栈（默认 3584B）放不下，
-     * 直接在 open() 里调用会栈溢出导致 Double Exception 复位（已实测） */
+    /* open() 期间的首帧探测：帧解码 scratch（约 15.5KB）已在堆（PSRAM 优先），
+     * 但解码任务栈上仍有单帧 PCM 4.6KB，主栈（默认 3584B）放不下，
+     * 故仍在解码任务（8KB 栈）里执行、结果经信号量通知 open()
+     * （open() 主栈直接探测已实测会栈溢出） */
     Audio_Decoder_Probe_In_Task(dec, pcm);
 
     for (;;)
@@ -396,9 +406,10 @@ static void Audio_Decoder_Task(void *arg)
             int64_t t0 = esp_timer_get_time();
             mp3dec_frame_info_t fi;
             memset(&fi, 0, sizeof(fi));
-            int samples = mp3dec_decode_frame(&dec->mp3,
-                                              dec->in_buf + dec->in_consumed,
-                                              (int)avail, pcm, &fi);
+            int samples = mp3dec_decode_frame_scratch(&dec->mp3,
+                                                      dec->in_buf + dec->in_consumed,
+                                                      (int)avail, pcm, &fi,
+                                                      dec->scratch);
             if (fi.frame_bytes > 0)
             {
                 dec->in_consumed += (size_t)fi.frame_bytes;
@@ -588,20 +599,45 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
         return NULL;
     }
 
-    /* 输入缓冲：8KB 单次 malloc，内部 DRAM（远小于 PSRAM 回落阈值） */
-    dec->in_buf = (uint8_t *)malloc(AUDIO_DECODER_IN_BUF_SIZE);
+    /* 输入缓冲：8KB，PSRAM 优先省内部 RAM；分配失败自动回退内部。
+     * 注：文件头记录的 cache-livelock 踩坑属 mp3dec_ex 的 128KB IO 缓冲，
+     * 本模块用 minimp3 基础 API（8KB 缓冲）无此风险。 */
+    dec->in_buf = (uint8_t *)heap_caps_malloc(AUDIO_DECODER_IN_BUF_SIZE,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (dec->in_buf == NULL)
+    {
+        dec->in_buf = (uint8_t *)heap_caps_malloc(AUDIO_DECODER_IN_BUF_SIZE,
+                                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     if (dec->in_buf == NULL)
     {
         ESP_LOGE(TAG, "open: input buffer alloc failed");
         Audio_Decoder_Discard(dec);
         return NULL;
     }
+    /* 帧解码 scratch（mp3dec_scratch_t，约 15.5KB）：不占任务栈，
+     * open() 预分配、close() 释放；PSRAM 优先省内部 RAM，失败回退内部。
+     * 注：cache-livelock 踩坑属 mp3dec_ex 的 128KB IO 缓冲，本模块用
+     * minimp3 基础 API（16KB 级 scratch）无此风险。 */
+    dec->scratch = (mp3dec_scratch_t *)heap_caps_malloc(sizeof(*dec->scratch),
+                                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (dec->scratch == NULL)
+    {
+        dec->scratch = (mp3dec_scratch_t *)heap_caps_malloc(sizeof(*dec->scratch),
+                                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (dec->scratch == NULL)
+    {
+        ESP_LOGE(TAG, "open: scratch alloc failed");
+        Audio_Decoder_Discard(dec);
+        return NULL;
+    }
     mp3dec_init(&dec->mp3);
 
-    /* 首帧探测完成信号量：探测在解码任务 32KB 栈上执行（mp3dec_decode_frame
-     * 内部 scratch 约 15.5KB + PCM 4.6KB，主任务 3584B 栈放不下会
-     * Double Exception 复位，已实测）。open() 创建任务后经该信号量等待结果，
-     * 再用 probe_fi 组装文件参数。 */
+    /* 首帧探测完成信号量：探测在解码任务 8KB 栈上执行（帧 scratch 已在堆，
+     * 栈上只剩单帧 PCM 4.6KB；主任务 3584B 栈放不下会 Double Exception
+     * 复位，已实测）。open() 创建任务后经该信号量等待结果，再用 probe_fi
+     * 组装文件参数。 */
     dec->probe_done = xSemaphoreCreateBinary();
     if (dec->probe_done == NULL)
     {
@@ -727,6 +763,10 @@ esp_err_t audio_decoder_close(audio_decoder_handle_t dec)
     if (d->in_buf != NULL)
     {
         free(d->in_buf);
+    }
+    if (d->scratch != NULL)
+    {
+        free(d->scratch);
     }
     free(d->path);
     free(d);

@@ -22,6 +22,7 @@ static ui_cfg_t     s_cfg;              /* ui_init 保存的句柄配置（可�
 static bool         s_inited = false;
 static TaskHandle_t s_taskHandle = NULL;
 static QueueHandle_t s_lightEvtQueue = NULL;   /* 灯控事件队列（深度 8） */
+static QueueHandle_t s_musicEvtQueue = NULL;   /* 播放事件队列（深度 8） */
 
 /** 每个页面对应一个独立 screen（切页 = lv_screen_load 整屏重绘，无残影） */
 static lv_obj_t *s_pages[UI_PAGE_COUNT] = {0};
@@ -102,6 +103,7 @@ void ui_nav_goto(ui_page_t page)
 static void ui_task(void *arg)
 {
     light_event_t evt;
+    music_event_t mevt;
     (void)arg;
 
     ESP_LOGI(TAG, "UI_Task started (core=%d, prio=%d)",
@@ -114,6 +116,13 @@ static void ui_task(void *arg)
                xQueueReceive(s_lightEvtQueue, &evt, 0) == pdTRUE)
         {
             scr_light_apply_event(&evt);
+        }
+
+        /* 再排空播放事件队列（MusicPlay_Task 上下文入队），刷新播放页源 chip 等 */
+        while (s_musicEvtQueue != NULL &&
+               xQueueReceive(s_musicEvtQueue, &mevt, 0) == pdTRUE)
+        {
+            scr_player_apply_event(&mevt);
         }
 
         lv_timer_handler();
@@ -130,6 +139,17 @@ void ui_on_light_event(const light_event_t *evt, void *user_ctx)
     }
     /* SmartHome_Task 上下文：只入队，lv_* 留给 UI_Task（设计文档 6.8 约束） */
     (void)xQueueSend(s_lightEvtQueue, evt, 0);
+}
+
+void ui_on_music_event(const music_event_t *evt, void *user_ctx)
+{
+    (void)user_ctx;
+    if (evt == NULL || s_musicEvtQueue == NULL)
+    {
+        return;
+    }
+    /* MusicPlay_Task 上下文：只入队，lv_* 留给 UI_Task（设计文档 6.8 约束） */
+    (void)xQueueSend(s_musicEvtQueue, evt, 0);
 }
 
 /* ======================== 开机显示自检（诊断残影用，定位后置 0 关闭） ======================== */
@@ -224,9 +244,10 @@ esp_err_t ui_init(const ui_cfg_t *cfg)
 
     /* 4) 灯控事件队列 + UI_Task（Core 1 / 12 / 13312） */
     s_lightEvtQueue = xQueueCreate(8, sizeof(light_event_t));
-    if (s_lightEvtQueue == NULL)
+    s_musicEvtQueue = xQueueCreate(8, sizeof(music_event_t));
+    if (s_lightEvtQueue == NULL || s_musicEvtQueue == NULL)
     {
-        ESP_LOGE(TAG, "light event queue create failed");
+        ESP_LOGE(TAG, "event queue create failed");
         return ESP_ERR_NO_MEM;
     }
 
@@ -239,10 +260,11 @@ esp_err_t ui_init(const ui_cfg_t *cfg)
 
     s_inited = true;
     /* 固件版本标记：串口出现 multi-screen 才说明跑的是多 screen 新固件 */
-    ESP_LOGI(TAG, "ui init ok (multi-screen v2): wifi=%s, light=%s, call_phone=%s",
+    ESP_LOGI(TAG, "ui init ok (multi-screen v2): wifi=%s, light=%s, call_phone=%s, music=%s",
              (s_cfg.wifi       != NULL) ? "wired" : "placeholder",
              (s_cfg.light      != NULL) ? "wired" : "placeholder",
-             (s_cfg.call_phone != NULL) ? "wired" : "placeholder");
+             (s_cfg.call_phone != NULL) ? "wired" : "placeholder",
+             (s_cfg.music      != NULL) ? "wired" : "placeholder");
     ESP_LOGI(TAG, "free heap: internal=%lu B, psram=%lu B",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -264,6 +286,11 @@ void ui_deinit(void)
     {
         vQueueDelete(s_lightEvtQueue);
         s_lightEvtQueue = NULL;
+    }
+    if (s_musicEvtQueue != NULL)
+    {
+        vQueueDelete(s_musicEvtQueue);
+        s_musicEvtQueue = NULL;
     }
     s_inited = false;
     ESP_LOGI(TAG, "ui deinit");

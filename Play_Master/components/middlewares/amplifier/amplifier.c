@@ -70,8 +70,13 @@ static const i2s_bus_cfg_t Amp_BusCfg = {
     .slot_mask      = I2S_STD_SLOT_LEFT | I2S_STD_SLOT_RIGHT,
     .slot_ws_pol    = false,
     .slot_bit_shift = true,    /* Philips 标准默认行为（保持与原驱动一致） */
-    .dma_desc_num   = 16,      /* 增大 DMA 描述符数量 */
-    .dma_frame_num  = 512,     /* 增大每帧采样数 */
+    /* DMA 缓冲总字节 = dma_desc_num × dma_frame_num × 4B（2 slot × 16bit）。
+     * ESP-IDF i2s_common.c 里 i2s_dma_calloc(bufsize = dma_frame_num × bytes_per_frame)
+     * 按描述符逐个分配，caps = MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA，即内部 RAM：
+     * 原 16×512×4 = 32KB 内部 RAM → 改 6×512×4 = 12KB，省 20KB；
+     * 缓冲深度 6×512 帧 ≈ 70ms @44.1kHz，远大于 sync 15ms 送帧周期 */
+    .dma_desc_num   = 6,
+    .dma_frame_num  = 512,
     .tx_auto_clear  = true,
 };
 

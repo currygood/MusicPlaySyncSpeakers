@@ -17,7 +17,7 @@
 | 结构 | `node_role_cfg_t` + `version` 头 |
 | 管理模块 | `node_role`：`node_role_init(defaults)` 首次写入、`node_role_get()/set()` 整体式读写（原子提交） |
 
-- `wifi_manager`、`ota_manager`、`MusicPlay`、`PlayMode` 等模块一律通过 `node_role_get()` 读取，不直接操作 NVS；
+- `wifi_manager`、`ota_manager`、`MusicPlay` 等模块一律通过 `node_role_get()` 读取，不直接操作 NVS；
 - 写入时机：首次启动（defaults）、触摸屏配网、UI 修改音量/播放模式、OTA 服务器地址配置时。
 
 ### 1.2 字段表
@@ -30,7 +30,7 @@
 | `wifi_password` | char[64] | 空 | WiFi 密码（触摸屏配网填写） |
 | `ota_server_url` | char[256] | `192.168.4.16:5000/ota/check` | OTA 服务器地址，`ota_manager` 启动按 `cfg->check_url → node_role 配置 → 默认宏` 读取；默认值不带协议头，使用时自行补 `http://` |
 | `volume` | uint8_t | 80 | 软件音量 0~100，掉电恢复 |
-| `play_mode` | uint8_t（`music_play_mode_t`） | 0（`MUSIC_PLAY_MODE_SEQUENTIAL`） | MusicPlay 播放模式：0 顺序播放、1 单曲循环，UI/PlayMode 修改时写入 |
+| `play_mode` | uint8_t（`music_play_mode_t`） | 0（`MUSIC_PLAY_MODE_SEQUENTIAL`） | MusicPlay 播放模式：0 顺序播放、1 单曲循环，UI 修改时写入 |
 | `sync_delay_ms` | uint32_t | 200 | 组播同步延迟 D（ms），掉电恢复 |
 | `audio_sample_rate` | uint32_t | 44100 | 音频采样率，全链路固定 44.1kHz，保留字段 |
 | `multicast_group` | char[16] | `239.0.0.1` | 音频组播地址；固定默认，不提供 UI 修改入口 |

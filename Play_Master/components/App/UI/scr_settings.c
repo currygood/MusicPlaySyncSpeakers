@@ -7,8 +7,9 @@
  *   - 真实：SD 卡状态（SD_Card_Is_Mounted()）；
  *   - 句柄注入后真实：WiFi 状态/IP（wifi_manager 查询，1s 轮询）、
  *     语音状态（call_phone_get_state()，1s 轮询）；
- *   - 占位日志：源切换（play_mode_set，十一阶段）、配网（需扫描接口，
- *     设计文档 9.1）、同步（sync_protocol，九阶段）、OTA（十二阶段）。
+ *   - 源切换：music_play_set_source()（句柄注入后真实，NULL 时占位日志）；
+ *   - 占位日志：配网（需扫描接口，设计文档 9.1）、同步（sync_protocol，
+ *     九阶段）、OTA（十二阶段）。
  */
 
 #include "ui_priv.h"
@@ -53,14 +54,30 @@ static const char *call_state_name(call_phone_state_t st)
 
 static void src_bt_click_cb(lv_event_t *e)
 {
+    const ui_cfg_t *cfg = ui_cfg();
     (void)e;
-    ESP_LOGI(TAG, "[占位] 切蓝牙源 -> TODO: play_mode_set(MUSIC_SOURCE_BT)（第十一阶段接入）");
+
+    if (cfg->music != NULL)
+    {
+        esp_err_t ret = music_play_set_source(cfg->music, MUSIC_SOURCE_BT);
+        ESP_LOGI(TAG, "设置页 切蓝牙源 -> music_play_set_source(BT): %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "[占位] 切蓝牙源 -> TODO: music_play_set_source(MUSIC_SOURCE_BT)（未注入句柄）");
 }
 
 static void src_local_click_cb(lv_event_t *e)
 {
+    const ui_cfg_t *cfg = ui_cfg();
     (void)e;
-    ESP_LOGI(TAG, "[占位] 切本地源 -> TODO: play_mode_set(MUSIC_SOURCE_LOCAL)（第十一阶段接入）");
+
+    if (cfg->music != NULL)
+    {
+        esp_err_t ret = music_play_set_source(cfg->music, MUSIC_SOURCE_LOCAL);
+        ESP_LOGI(TAG, "设置页 切本地源 -> music_play_set_source(LOCAL): %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "[占位] 切本地源 -> TODO: music_play_set_source(MUSIC_SOURCE_LOCAL)（未注入句柄）");
 }
 
 static void wifi_cfg_click_cb(lv_event_t *e)

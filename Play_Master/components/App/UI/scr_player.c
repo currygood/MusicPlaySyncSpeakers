@@ -3,8 +3,9 @@
  * @brief 播放页（Tab 1，默认主页；UI 界面设计 5.2）
  *
  * 第八阶段布局：顶区 128px（左封面 128×128 + 右信息列）+ 控制行 48px。
- * 所有控制按键为占位：按下后本地图标反馈 + ESP_LOGI 注明将来调用的真实
- * 接口（music_play_* / play_mode_* 于第十/十一阶段接入）。
+ * 播放控制按键仍为占位：按下后本地图标反馈 + ESP_LOGI 注明将来调用的真实
+ * 接口（music_play_command / set_mode / set_volume，第十阶段接入）；
+ * 源切换已接真实接口（music_play_set_source / get_source，事件回流刷新）。
  * 真实数据接入点（已留好）：
  *   - 标题/副标题 ← music_play_get_view()->track（9.2 建议落地后 BT 源同源）
  *   - 进度       ← 500ms 轮询 music_play_get_position_ms()（本地源；BT 源隐藏）
@@ -28,7 +29,7 @@ static lv_obj_t *s_barProgress;   /* 进度条（0~1000，接入后 500ms 轮询
 static lv_obj_t *s_lblTime;       /* "00:00 / 00:00" */
 static bool      s_playing = false;
 static bool      s_singleLoop = false;
-static bool      s_srcBt = true;  /* 演示源状态：true=蓝牙 */
+static bool      s_srcBt = true;  /* 当前源：true=蓝牙（有句柄时以事件/查询为准） */
 
 /* ======================== 通用控制键（面板底 + 按压高亮 + 24px 图标） ======================== */
 static lv_obj_t *ctrl_btn(lv_obj_t *parent, int x, int y, int w, int h,
@@ -95,15 +96,28 @@ static void mode_click_cb(lv_event_t *e)
 
 static void chip_click_cb(lv_event_t *e)
 {
+    const ui_cfg_t *cfg = ui_cfg();
+    music_source_t want;
+    esp_err_t ret;
     (void)e;
-    /* 第八阶段占位演示：本地切换文字；真实接入（第十一阶段）后改为
-     * play_mode_set() + PLAY_MODE_EVT_CHANGED 回流刷新，不本地提交 */
-    s_srcBt = !s_srcBt;
-    lv_label_set_text(s_lblSrcChip, s_srcBt ? "蓝牙" : "本地");
-    ESP_LOGI(TAG, "[占位] 切换播放源为%s -> TODO: play_mode_set(MUSIC_SOURCE_%s)"
-                  "（第十一阶段接入；蓝牙优先规则仍生效）",
-             s_srcBt ? "蓝牙" : "本地",
-             s_srcBt ? "BT" : "LOCAL");
+
+    if (cfg->music == NULL)
+    {
+        /* 未注入 MusicPlay 句柄：本地演示切换（占位） */
+        s_srcBt = !s_srcBt;
+        lv_label_set_text(s_lblSrcChip, s_srcBt ? "蓝牙" : "本地");
+        ESP_LOGI(TAG, "[占位] 切换播放源为%s -> TODO: music_play_set_source(MUSIC_SOURCE_%s)",
+                 s_srcBt ? "蓝牙" : "本地", s_srcBt ? "BT" : "LOCAL");
+        return;
+    }
+
+    /* 真实接入：只下发"期望源"，界面等 MUSIC_EVT_SOURCE_CHANGED 回流刷新，不本地翻转
+     * （蓝牙已连接时会被自动轮询规则拉回，见 UI 界面设计 6.3） */
+    want = (music_play_get_source(cfg->music) == MUSIC_SOURCE_BT)
+               ? MUSIC_SOURCE_LOCAL : MUSIC_SOURCE_BT;
+    ret  = music_play_set_source(cfg->music, want);
+    ESP_LOGI(TAG, "chip -> music_play_set_source(%s): %s",
+             (want == MUSIC_SOURCE_BT) ? "BT" : "LOCAL", esp_err_to_name(ret));
 }
 
 static void list_click_cb(lv_event_t *e)
@@ -122,6 +136,38 @@ static void volume_cb(lv_event_t *e)
     if ((++logCnt % 10) == 1)
     {
         ESP_LOGI(TAG, "[占位] 音量 %d -> TODO: music_play_set_volume(%d)（第十阶段接入）", val, val);
+    }
+}
+
+/* ======================== 事件回流（UI_Task 上下文消费） ======================== */
+
+/** 处理 MusicPlay 事件：源变化刷新源 chip；其余事件在 UI 接线阶段补齐 */
+void scr_player_apply_event(const music_event_t *evt)
+{
+    if (evt == NULL)
+    {
+        return;
+    }
+
+    switch (evt->id)
+    {
+    case MUSIC_EVT_SOURCE_CHANGED:
+        s_srcBt = (evt->view.source == MUSIC_SOURCE_BT);
+        if (s_lblSrcChip != NULL)
+        {
+            lv_label_set_text(s_lblSrcChip, s_srcBt ? "蓝牙" : "本地");
+        }
+        ESP_LOGI(TAG, "music evt: source -> %s", s_srcBt ? "BT" : "LOCAL");
+        break;
+
+    case MUSIC_EVT_ERROR:
+        ESP_LOGW(TAG, "music evt: ERROR (src=%d state=%d)",
+                 (int)evt->view.source, (int)evt->view.state);
+        break;
+
+    default:
+        /* 播放状态/曲目/音量/模式等事件在 UI 接线阶段补齐 */
+        break;
     }
 }
 
@@ -159,6 +205,7 @@ static void cover_build(lv_obj_t *page)
 
 void scr_player_build(lv_obj_t *page)
 {
+    const ui_cfg_t *cfg = ui_cfg();
     const int colX = UI_COVER_SIZE + 4;         /* 右信息列起点 x=132 */
     const int colW = LCD_WIDTH - colX - 4;      /* 184 */
     lv_obj_t *chip;
@@ -184,6 +231,12 @@ void scr_player_build(lv_obj_t *page)
     lv_obj_add_event_cb(chip, chip_click_cb, LV_EVENT_CLICKED, NULL);
     s_lblSrcChip = ui_label_create(chip, "蓝牙", &ui_font_cn_16, UI_COLOR_PRIMARY);
     lv_obj_center(s_lblSrcChip);
+    /* 初始源：MusicPlay 已先行创建，读一次缓存源（内部加锁，UI_Task 启动前安全） */
+    if (cfg->music != NULL)
+    {
+        s_srcBt = (music_play_get_source(cfg->music) == MUSIC_SOURCE_BT);
+        lv_label_set_text(s_lblSrcChip, s_srcBt ? "蓝牙" : "本地");
+    }
 
     listBtn = lv_button_create(page);
     lv_obj_remove_style_all(listBtn);

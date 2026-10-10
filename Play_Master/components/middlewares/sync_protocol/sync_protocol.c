@@ -4,12 +4,17 @@
  *        本地延迟（D）播放 + 控制/时间同步通道处理
  *
  * 实现要点（对应《主音频节点软件架构分层设计.md》3.2.8 / 第 6 节任务表）：
- *   - SyncTx_Task：优先级 11 / 栈 8192 / Core 0。轮询入口环攒够一帧（约 15ms），
+ *   - SyncTx_Task：优先级 11 / 栈 4096 / Core 0。轮询入口环攒够一帧（约 15ms），
  *     打 esp_timer 时间戳 → 组播发送 → 推入本地延迟队列；同时处理控制通道
  *     （PING → PONG 应答、SYNC_START 一次下发、SYNC_HEARTBEAT 每秒下发、
  *      从节点在线超时检测）；本模块不持有 UDP socket（wifi_manager 通道句柄传入）。
- *   - SyncLocalPlay_Task：优先级 10 / 栈 10240 / Core 1。按 t_play = t_tx + D
+ *     栈内最大局部为延迟队列入队快照 sync_delay_entry_t（含 pcm[700] ≈ 1.4KB），
+ *     组包缓冲已移到模块 PSRAM（tx_pkt），故 4KB 足够（第十一阶段内部 DRAM
+ *     紧张，由 8KB 降下；帧/组包缓冲均在 PSRAM）。
+ *   - SyncLocalPlay_Task：优先级 10 / 栈 6144 / Core 1。按 t_play = t_tx + D
  *     出队，单声道 → 立体声（L/R 写入同一份）后经 amplifier 写 I2S。
+ *     栈内最大局部为出队快照 sync_delay_entry_t（含 pcm[700] ≈ 1.4KB），
+ *     6144 足够（第十一阶段由 10240 降栈省内部 DRAM）。
  *   - 帧节奏：每帧 15ms，帧大小在 661/662 采样之间交替，保证平均 44.1kHz
  *     （44.1k×0.015=661.5 非整数）；
  *   - 独立于音源：push_pcm 线程安全非阻塞入环；暂停/停止时环满丢弃。
@@ -46,12 +51,12 @@
 
 /** SyncTx_Task：优先级/栈/核（任务表） */
 #define SYNC_TX_TASK_PRIO   (11)
-#define SYNC_TX_TASK_STACK  (8192)
+#define SYNC_TX_TASK_STACK  (4096)
 #define SYNC_TX_TASK_CORE   (0)
 
 /** SyncLocalPlay_Task：优先级/栈/核（任务表） */
 #define SYNC_PLAY_TASK_PRIO  (10)
-#define SYNC_PLAY_TASK_STACK (10240)
+#define SYNC_PLAY_TASK_STACK (6144)
 #define SYNC_PLAY_TASK_CORE  (1)
 
 /** 每帧最大采样数（44.1k×15ms=661.5，取 700 余量；帧长在 661/662 交替） */
@@ -103,6 +108,8 @@ typedef struct {
     uint32_t sample_rate;
     uint8_t  channels;
     uint32_t auto_stream_seq;      /* stream_id=0 自动生成用 */
+    uint32_t stream_gen;           /* 流代号：sync_reset_stream 自增（stop/start/
+                                    * resume 复位本流），SyncTx_Task 提交校验用 */
 
     uint32_t cfg_delay_ms;
     uint32_t cfg_frame_ms;
@@ -122,6 +129,7 @@ typedef struct {
     uint32_t frame_target;         /* 本帧目标 mono 采样数（661/662 交替） */
     int16_t *frame_buf;           /* 攒帧缓冲（PSRAM） */
     int16_t *play_buf;            /* 单声道→立体声拓展缓冲（PSRAM） */
+    uint8_t *tx_pkt;              /* 组播组包缓冲（PSRAM，避免压 sync_tx_task 栈） */
 
     /* 本地延迟队列（SPSC，TX推 / Play拉） */
     sync_delay_entry_t *delay_q;
@@ -225,6 +233,15 @@ static void sync_delay_clear(void)
 {
     s_master.delay_head  = 0;
     s_master.delay_count = 0;
+}
+
+/** 提交校验（须持 s_lock 调用）：本帧所属流未被复位，且仍在放音态 */
+static bool sync_stream_valid_locked(uint32_t gen)
+{
+    return (s_master.started &&
+            (s_master.state == SYNC_STATE_PLAYING ||
+             s_master.state == SYNC_STATE_PREPARING) &&
+            s_master.stream_gen == gen);
 }
 
 /* ---------------- 组播发送 ---------------- */
@@ -420,6 +437,7 @@ static void sync_tx_task(void *arg)
                       (s_master.state == SYNC_STATE_PLAYING ||
                        s_master.state == SYNC_STATE_PREPARING);
         uint32_t nxt_frame = s_master.frame_target; /* 本帧目标采样数 */
+        uint32_t stream_gen = s_master.stream_gen;  /* 本帧所属流代号（提交校验用） */
         xSemaphoreGive(s_lock);
 
         if (!active)
@@ -473,6 +491,19 @@ static void sync_tx_task(void *arg)
                 sync_delay_entry_t ent;
                 int64_t t_tx = esp_timer_get_time();
 
+                /* 发送前校验：stop/start/resume 会 sync_reset_stream（流代号自增），
+                 * 若本帧所属的流已被复位则直接丢弃。否则会把上一路流的帧补发到
+                 * 组播，并在 start_sent 已被清零时补发一条 t0 属于旧流的
+                 * SYNC_START（第十一阶段实测：stop 之后仍补发一帧 + SYNC_START） */
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                bool stream_ok = sync_stream_valid_locked(stream_gen);
+                xSemaphoreGive(s_lock);
+                if (stream_ok == false)
+                {
+                    s_master.frame_filled = 0;
+                    continue;
+                }
+
                 memset(&ent, 0, sizeof(ent));
                 ent.stream_id    = s_master.stream_id;
                 ent.seq          = s_master.tx_seq;
@@ -481,11 +512,12 @@ static void sync_tx_task(void *arg)
                 memcpy(ent.pcm, s_master.frame_buf,
                        nxt_frame * sizeof(int16_t));
 
-                /* 组播发送（音频通道） */
-                uint8_t pkt[SYNC_PKT_BUF_BYTES];
+                /* 组播发送（音频通道）：组包缓冲在模块 PSRAM（tx_pkt），
+                 * 不占 sync_tx_task 栈（第十一阶段栈由 8KB 降到 4KB） */
+                uint8_t *pkt = s_master.tx_pkt;
                 sync_audio_pkt_hdr_t *hdr = (sync_audio_pkt_hdr_t *)pkt;
                 size_t pkt_len;
-                if (sizeof(pkt) < SYNC_AUDIO_HDR_SIZE +
+                if (SYNC_PKT_BUF_BYTES < SYNC_AUDIO_HDR_SIZE +
                     nxt_frame * sizeof(int16_t))
                 {
                     ESP_LOGE(TAG, "packet too large, drop");
@@ -493,7 +525,7 @@ static void sync_tx_task(void *arg)
                     s_master.frame_filled = 0;
                     continue;   /* 不应发生 */
                 }
-                memset(pkt, 0, sizeof(pkt));
+                memset(pkt, 0, SYNC_PKT_BUF_BYTES);
                 hdr->magic        = SYNC_MAGIC;
                 hdr->stream_id    = s_master.stream_id;
                 hdr->seq          = s_master.tx_seq;
@@ -507,6 +539,16 @@ static void sync_tx_task(void *arg)
                     s_master.dropped_pkts++;
                 }
 
+                /* 组播发送可能阻塞（最长 20ms），期间 stop/start/resume 仍可能复位
+                 * 本流：入延迟队列 + 起始帧判定必须在锁内再校验一次；SYNC_START
+                 * 也在锁内发出，保证与 stop 串行（stop 之后不再补发 SYNC_START） */
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                if (sync_stream_valid_locked(stream_gen) == false)
+                {
+                    xSemaphoreGive(s_lock);
+                    s_master.frame_filled = 0;
+                    continue;
+                }
                 /* 入本地延迟队列 */
                 if (sync_delay_push(&ent) == false)
                 {
@@ -518,12 +560,13 @@ static void sync_tx_task(void *arg)
                 {
                     s_master.start_sent = true;
                     s_master.first_tx_us = (uint64_t)t_tx;
-                    sync_send_start();
+                    sync_send_start();   /* 锁内发送：与 stop 串行，避免补发 */
                 }
                 s_master.frame_filled = 0;
                 s_master.tx_seq++;
                 s_master.frame_target = (s_master.tx_seq & 1u) ? 662u : 661u;
                 s_master.next_slot_us += (uint64_t)(s_master.cfg_frame_ms * 1000u);
+                xSemaphoreGive(s_lock);
             }
             else
             {
@@ -703,12 +746,18 @@ static void sync_free_all_buffers(void)
         heap_caps_free(s_master.play_buf);
         s_master.play_buf = NULL;
     }
+    if (s_master.tx_pkt != NULL)
+    {
+        heap_caps_free(s_master.tx_pkt);
+        s_master.tx_pkt = NULL;
+    }
     s_master.delay_cap = 0;
 }
 
 /** 复位单路流的所有运行态（start/stop/pause/resume 换源时调用） */
 static void sync_reset_stream(void)
 {
+    s_master.stream_gen++;         /* 流代号自增：SyncTx_Task 据此丢弃上一路流的帧 */
     s_master.frame_filled    = 0;
     s_master.frame_target    = 661;   /* 首帧 661 采样，之后 661/662 交替 */
     s_master.next_slot_us    = 0;
@@ -779,8 +828,10 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
                                             sizeof(sync_delay_entry_t));
     s_master.frame_buf   = sync_alloc_psram(SYNC_FRAME_MAX_SAMPLES * sizeof(int16_t));
     s_master.play_buf    = sync_alloc_psram(SYNC_FRAME_MAX_SAMPLES * 2 * sizeof(int16_t));
+    s_master.tx_pkt      = sync_alloc_psram(SYNC_PKT_BUF_BYTES);
     if (s_master.ingress_buf == NULL || s_master.delay_q == NULL ||
-        s_master.frame_buf == NULL || s_master.play_buf == NULL)
+        s_master.frame_buf == NULL || s_master.play_buf == NULL ||
+        s_master.tx_pkt == NULL)
     {
         ESP_LOGE(TAG, "buffer alloc failed");
         sync_free_all_buffers();
@@ -802,19 +853,24 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
     s_master.inited  = true;
     s_master.started = false;
 
-    if (xTaskCreatePinnedToCore(sync_tx_task, "SyncTx_Task",
-                                SYNC_TX_TASK_STACK, NULL, SYNC_TX_TASK_PRIO,
-                                &s_master.tx_task, SYNC_TX_TASK_CORE) != pdPASS)
-    {
-        ESP_LOGE(TAG, "SyncTx_Task create failed");
-    }
-    if (xTaskCreatePinnedToCore(sync_play_task, "SyncLocalPlay_Task",
-                                SYNC_PLAY_TASK_STACK, NULL, SYNC_PLAY_TASK_PRIO,
-                                &s_master.play_task, SYNC_PLAY_TASK_CORE) != pdPASS)
-    {
-        ESP_LOGE(TAG, "SyncLocalPlay_Task create failed");
-    }
+    BaseType_t tx_ok = xTaskCreatePinnedToCore(sync_tx_task, "SyncTx_Task",
+                                               SYNC_TX_TASK_STACK, NULL, SYNC_TX_TASK_PRIO,
+                                               &s_master.tx_task, SYNC_TX_TASK_CORE);
+    BaseType_t play_ok = xTaskCreatePinnedToCore(sync_play_task, "SyncLocalPlay_Task",
+                                                 SYNC_PLAY_TASK_STACK, NULL, SYNC_PLAY_TASK_PRIO,
+                                                 &s_master.play_task, SYNC_PLAY_TASK_CORE);
     xSemaphoreGive(s_lock);
+
+    /* 任一内部任务建不出来 = 同步播放不可用，必须回滚并上报失败，
+     * 否则上层（MusicPlay）会误判 sync 可用。
+     * s_lock 是普通互斥量（非递归），故先放锁再复用 deinit 收尾 */
+    if (tx_ok != pdPASS || play_ok != pdPASS)
+    {
+        ESP_LOGE(TAG, "task create failed (tx=%d play=%d), rollback init",
+                 (int)tx_ok, (int)play_ok);
+        (void)sync_protocol_master_deinit();
+        return ESP_ERR_NO_MEM;
+    }
 
     ESP_LOGI(TAG, "init ok: D=%u ms frame=%u ms dq_pkts=%u ingress=%u B",
              s_master.cfg_delay_ms, s_master.cfg_frame_ms,

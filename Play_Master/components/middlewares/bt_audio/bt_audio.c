@@ -62,11 +62,14 @@
 #define BT_HFP_RS_IN_MAX_SAMPLES      (1536)
 
 
-/** 事件队列深度 */
-#define BT_EVENT_QUEUE_LEN          8
+/** 事件队列深度（队列元素 bt_audio_event_t 约 536B，8 条 ≈4.3KB 内部 RAM，
+ *  wifi+BT 同时开启时易分配失败，故取 4，与 MusicPlay 命令队列一致） */
+#define BT_EVENT_QUEUE_LEN          4
 
 /** 音量步进（bt_audio_cmd_t 的 VOLUME_UP/DOWN，范围 0..100） */
 #define BT_AUDIO_VOLUME_STEP        5
+
+#define BT_AUDIO_POS_NOTIFY_INTERVAL_MS 1000    /** AVRCP PLAY_POS_CHANGED 通知间隔（ms）：手机按此间隔主动上报播放位置 */
 
 /** AVRCP 绝对音量换算：0..127 → 0..100 */
 #define BT_VOL_AVRC_TO_LOCAL(v)     ((uint8_t)(((uint32_t)(v) * 100 + 63) / 127))
@@ -76,8 +79,9 @@
 /** 每次从 FIFO 取出的 PCM 块长度（int16 采样点数） */
 #define BT_PCM_CHUNK_SAMPLES        2048
 
-/** 模块任务栈（含 4KB PCM 缓冲 + 事件结构体） */
-#define BT_AUDIO_TASK_STACK         8192
+/** 模块任务栈：大 PCM 缓冲已移出栈（A2DP/HFP 下行块放 PSRAM），
+ *  栈上只剩事件结构体（约 536B）与回调调用帧（sync/Amplifier），4KB 足够 */
+#define BT_AUDIO_TASK_STACK         4096
 
 /* 配对 PIN（测试阶段固定，后续可由 UI 配置） */
 #define BT_PIN_CODE                 "0000"
@@ -124,6 +128,12 @@ struct bt_audio_s
     QueueHandle_t        evt_q;          /* 事件队列（协议栈回调入队） */
     TaskHandle_t         task;           /* 模块任务 */
 
+    /* ---- 模块任务缓冲（大缓冲放 PSRAM，省内部 DRAM；栈上只留事件结构体） ---- */
+    int16_t             *task_pcm_buf;     /* A2DP PCM 块缓冲（PSRAM，BT_PCM_CHUNK_SAMPLES×2B） */
+    int16_t             *task_hfp_dn_raw;  /* HFP 下行原始块缓冲（PSRAM，BT_HFP_DN_CHUNK_BYTES） */
+    uint8_t             *evt_q_storage;    /* 事件队列数据缓冲（PSRAM，静态队列用） */
+    StaticQueue_t        evt_q_ctrl;       /* 事件队列控制块（内部 RAM） */
+
     /* ---- 丢帧 / 丢事件统计 ---- */
     uint32_t             dropped_pcm;    /* A2DP FIFO 满丢弃字节数 */
     uint32_t             dropped_evt;    /* 事件队列满丢弃个数 */
@@ -149,6 +159,8 @@ struct bt_audio_s
     esp_avrc_rn_evt_cap_mask_t avrc_peer_rn_cap; /* 手机端支持的通知事件位掩码 */
     uint8_t             avrc_tl;               /* 事务标签循环 0..15 */
     bt_audio_play_state_t play_state;          /* 最近播放状态（AVRCP 上报 / 无 AVRCP 时推断） */
+    uint32_t             play_pos_ms;            /* AVRCP 播放位置（ms，最近一次上报/响应） */
+    bool                 play_pos_valid;          /* 是否收到过位置数据（断开/切曲时重置） */
     bt_audio_track_info_t track_info;          /* 最近曲目信息缓存（AVRCP 元数据） */
     bool                track_info_valid;
 };
@@ -693,6 +705,13 @@ static void bt_audio_avrc_register_rn(void)
         esp_avrc_ct_send_register_notification_cmd(bt_audio_avrc_alloc_tl(),
                                                    ESP_AVRC_RN_VOLUME_CHANGE, 0);
     }
+    if (esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST, cap,
+                                           ESP_AVRC_RN_PLAY_POS_CHANGED))
+    {
+        esp_avrc_ct_send_register_notification_cmd(bt_audio_avrc_alloc_tl(),
+                                                   ESP_AVRC_RN_PLAY_POS_CHANGED,
+                                                   BT_AUDIO_POS_NOTIFY_INTERVAL_MS);
+    }
 }
 
 /** AVRCP 播放状态 → 模块枚举 */
@@ -836,6 +855,8 @@ static void bt_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             s_bt_audio.avrc_peer_rn_cap.bits = 0;
             s_bt_audio.play_state          = BT_AUDIO_PLAY_STATE_UNKNOWN;
             s_bt_audio.track_info_valid    = false;
+            s_bt_audio.play_pos_ms         = 0;
+            s_bt_audio.play_pos_valid      = false;
             memset(&s_bt_audio.track_info, 0, sizeof(s_bt_audio.track_info));
             BT_AUDIO_UNLOCK();
             ESP_LOGI(TAG, "AVRCP disconnected");
@@ -880,6 +901,19 @@ static void bt_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
                 esp_avrc_ct_send_register_notification_cmd(
                     bt_audio_avrc_alloc_tl(), ESP_AVRC_RN_TRACK_CHANGE, 0);
             }
+            /* 新曲位置重置；位置通知随新曲重新注册 */
+            BT_AUDIO_LOCK();
+            s_bt_audio.play_pos_ms    = 0;
+            s_bt_audio.play_pos_valid = false;
+            BT_AUDIO_UNLOCK();
+            if (esp_avrc_rn_evt_bit_mask_operation(
+                    ESP_AVRC_BIT_MASK_OP_TEST, &s_bt_audio.avrc_peer_rn_cap,
+                    ESP_AVRC_RN_PLAY_POS_CHANGED))
+            {
+                esp_avrc_ct_send_register_notification_cmd(
+                    bt_audio_avrc_alloc_tl(), ESP_AVRC_RN_PLAY_POS_CHANGED,
+                    BT_AUDIO_POS_NOTIFY_INTERVAL_MS);
+            }
             memset(&evt, 0, sizeof(evt));
             evt.id = BT_AUDIO_EVT_TRACK_CHANGED;
             bt_audio_post_event(&evt);
@@ -907,6 +941,21 @@ static void bt_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             {
                 esp_avrc_ct_send_register_notification_cmd(
                     bt_audio_avrc_alloc_tl(), ESP_AVRC_RN_VOLUME_CHANGE, 0);
+            }
+            break;
+
+        case ESP_AVRC_RN_PLAY_POS_CHANGED:
+            BT_AUDIO_LOCK();
+            s_bt_audio.play_pos_ms    = param->change_ntf.event_parameter.play_pos;
+            s_bt_audio.play_pos_valid = true;
+            BT_AUDIO_UNLOCK();
+            if (esp_avrc_rn_evt_bit_mask_operation(
+                    ESP_AVRC_BIT_MASK_OP_TEST, &s_bt_audio.avrc_peer_rn_cap,
+                    ESP_AVRC_RN_PLAY_POS_CHANGED))
+            {
+                esp_avrc_ct_send_register_notification_cmd(
+                    bt_audio_avrc_alloc_tl(), ESP_AVRC_RN_PLAY_POS_CHANGED,
+                    BT_AUDIO_POS_NOTIFY_INTERVAL_MS);
             }
             break;
 
@@ -961,6 +1010,8 @@ static void bt_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *
             s_bt_audio.avrc_peer_rn_cap.bits = 0;
             s_bt_audio.play_state          = BT_AUDIO_PLAY_STATE_UNKNOWN;
             s_bt_audio.track_info_valid    = false;
+            s_bt_audio.play_pos_ms         = 0;
+            s_bt_audio.play_pos_valid      = false;
             memset(&s_bt_audio.track_info, 0, sizeof(s_bt_audio.track_info));
         }
         BT_AUDIO_UNLOCK();
@@ -1022,8 +1073,9 @@ static StreamBufferHandle_t bt_audio_sbuf_create(size_t bytes,
 /** bt_audio 任务：在安全上下文调用 on_event / on_pcm，参数在栈上取值 */
 static void bt_audio_task(void *arg)
 {
-    int16_t pcm_buf[BT_PCM_CHUNK_SAMPLES];
-    int16_t hfp_dn_raw[BT_HFP_DN_CHUNK_BYTES / 2];
+    /* 大 PCM 缓冲放 PSRAM（start 时分配）：任务栈仅保留事件结构体与调用帧 */
+    int16_t *pcm_buf = s_bt_audio.task_pcm_buf;
+    int16_t *hfp_dn_raw = s_bt_audio.task_hfp_dn_raw;
     bt_audio_event_t evt;
 
     (void)arg;
@@ -1046,7 +1098,7 @@ static void bt_audio_task(void *arg)
         if (s_bt_audio.hfp_audio_open && s_bt_audio.hfp_dn_fifo != NULL)
         {
             size_t dn = xStreamBufferReceive(s_bt_audio.hfp_dn_fifo, hfp_dn_raw,
-                                             sizeof(hfp_dn_raw), 0);
+                                             BT_HFP_DN_CHUNK_BYTES, 0);
             if (dn >= 2)
             {
                 uint32_t sco_rate = bt_audio_hfp_sco_rate();
@@ -1067,7 +1119,8 @@ static void bt_audio_task(void *arg)
         }
 
         /* 最后处理 A2DP PCM（20ms 超时，兼顾事件实时性） */
-        size_t bytes = xStreamBufferReceive(s_bt_audio.pcm_fifo, pcm_buf, sizeof(pcm_buf),
+        size_t bytes = xStreamBufferReceive(s_bt_audio.pcm_fifo, pcm_buf,
+                                            BT_PCM_CHUNK_SAMPLES * sizeof(int16_t),
                                             pdMS_TO_TICKS(20));
         if (bytes == 0)
         {
@@ -1198,6 +1251,21 @@ esp_err_t bt_audio_destroy(bt_audio_handle_t audio)
         heap_caps_free(s_bt_audio.hfp_dn_fifo_buf);
         s_bt_audio.hfp_dn_fifo_buf = NULL;
     }
+    if (s_bt_audio.task_pcm_buf != NULL)
+    {
+        heap_caps_free(s_bt_audio.task_pcm_buf);
+        s_bt_audio.task_pcm_buf = NULL;
+    }
+    if (s_bt_audio.task_hfp_dn_raw != NULL)
+    {
+        heap_caps_free(s_bt_audio.task_hfp_dn_raw);
+        s_bt_audio.task_hfp_dn_raw = NULL;
+    }
+    if (s_bt_audio.evt_q_storage != NULL)
+    {
+        heap_caps_free(s_bt_audio.evt_q_storage);
+        s_bt_audio.evt_q_storage = NULL;
+    }
 
     if (s_bt_audio.lock != NULL)
     {
@@ -1216,9 +1284,21 @@ esp_err_t bt_audio_destroy(bt_audio_handle_t audio)
 }
 
 /** 初始化蓝牙控制器 + Bluedroid + A2DP（只执行一次，stop 后保留） */
+/** 临时诊断：打印内部/PSRAM 堆占用（定位 WiFi+BT 初始化各阶段内存消耗，联调完删除） */
+static void bt_audio_heap_dump(const char *stage)
+{
+    ESP_LOGI(TAG, "[heap] %s: int free=%u largest=%u, psram free=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
 static esp_err_t bt_stack_init(void)
 {
     esp_err_t err;
+
+    bt_audio_heap_dump("stack init enter");
 
     /* NVS：蓝牙配对/绑定表 */
     err = nvs_flash_init();
@@ -1247,6 +1327,7 @@ static esp_err_t bt_stack_init(void)
         ESP_LOGE(TAG, "controller enable failed: %s", esp_err_to_name(err));
         return err;
     }
+    bt_audio_heap_dump("after controller enable");
 
     /* Bluedroid 协议栈 */
     err = esp_bluedroid_init();
@@ -1261,6 +1342,7 @@ static esp_err_t bt_stack_init(void)
         ESP_LOGE(TAG, "bluedroid enable failed: %s", esp_err_to_name(err));
         return err;
     }
+    bt_audio_heap_dump("after bluedroid enable");
 
     /* AVRCP：音箱需同时注册 TG（接受手机发起的连接/音量命令）与 CT（UI 主动控制手机） */
     /* 注意：AVRCP 必须先于 A2DP 初始化（协议栈要求 AVRC 预先注册）。 */
@@ -1300,6 +1382,7 @@ static esp_err_t bt_stack_init(void)
     esp_hf_client_register_callback(bt_hfp_cb);
     esp_bt_gap_register_callback(bt_gap_cb);
     esp_bt_gap_set_device_name(s_bt_audio.device_name);
+    bt_audio_heap_dump("after profile init");
     return ESP_OK;
 }
 
@@ -1317,6 +1400,8 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
     {
         return ESP_OK;                  /* 已启动 */
     }
+
+    bt_audio_heap_dump("bt_audio_start enter");
 
     if (!s_stack_ready)
     {
@@ -1352,7 +1437,26 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
 
     if (s_bt_audio.evt_q == NULL)
     {
-        s_bt_audio.evt_q = xQueueCreate(BT_EVENT_QUEUE_LEN, sizeof(bt_audio_event_t));
+        /* 队列数据缓冲放 PSRAM（4 条 ≈2.1KB，省内部 RAM），控制块留内部 */
+        if (s_bt_audio.evt_q_storage == NULL)
+        {
+            s_bt_audio.evt_q_storage = (uint8_t *)heap_caps_malloc(
+                BT_EVENT_QUEUE_LEN * sizeof(bt_audio_event_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (s_bt_audio.evt_q_storage == NULL)
+            {
+                s_bt_audio.evt_q_storage = (uint8_t *)heap_caps_malloc(
+                    BT_EVENT_QUEUE_LEN * sizeof(bt_audio_event_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            }
+            if (s_bt_audio.evt_q_storage == NULL)
+            {
+                vStreamBufferDelete(s_bt_audio.pcm_fifo);
+                s_bt_audio.pcm_fifo = NULL;
+                ESP_LOGE(TAG, "evt queue storage alloc failed");
+                return ESP_ERR_NO_MEM;
+            }
+        }
+        s_bt_audio.evt_q = xQueueCreateStatic(BT_EVENT_QUEUE_LEN, sizeof(bt_audio_event_t),
+                                              s_bt_audio.evt_q_storage, &s_bt_audio.evt_q_ctrl);
         if (s_bt_audio.evt_q == NULL)
         {
             vStreamBufferDelete(s_bt_audio.pcm_fifo);
@@ -1399,6 +1503,39 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
     {
         xStreamBufferReset(s_bt_audio.hfp_dn_fifo);
     }
+    /* 任务缓冲：A2DP PCM 块 / HFP 下行块放 PSRAM（省内部 RAM；常规 CPU 读写） */
+    if (s_bt_audio.task_pcm_buf == NULL)
+    {
+        s_bt_audio.task_pcm_buf = (int16_t *)heap_caps_malloc(BT_PCM_CHUNK_SAMPLES * sizeof(int16_t),
+                                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_bt_audio.task_pcm_buf == NULL)
+        {
+            s_bt_audio.task_pcm_buf = (int16_t *)heap_caps_malloc(BT_PCM_CHUNK_SAMPLES * sizeof(int16_t),
+                                                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (s_bt_audio.task_pcm_buf == NULL)
+        {
+            ESP_LOGE(TAG, "task pcm buf alloc failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_bt_audio.task_hfp_dn_raw == NULL)
+    {
+        s_bt_audio.task_hfp_dn_raw = (int16_t *)heap_caps_malloc(BT_HFP_DN_CHUNK_BYTES,
+                                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_bt_audio.task_hfp_dn_raw == NULL)
+        {
+            s_bt_audio.task_hfp_dn_raw = (int16_t *)heap_caps_malloc(BT_HFP_DN_CHUNK_BYTES,
+                                                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (s_bt_audio.task_hfp_dn_raw == NULL)
+        {
+            ESP_LOGE(TAG, "task hfp dn buf alloc failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    bt_audio_heap_dump("before task create");
     BaseType_t rt = xTaskCreate(bt_audio_task, "bt_audio_task", BT_AUDIO_TASK_STACK, NULL, 5, &s_bt_audio.task);
     if (rt != pdPASS)
     {
@@ -1411,7 +1548,9 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
         if (s_bt_audio.hfp_up_fifo_buf != NULL) { heap_caps_free(s_bt_audio.hfp_up_fifo_buf); s_bt_audio.hfp_up_fifo_buf = NULL; }
         if (s_bt_audio.hfp_dn_fifo != NULL) { vStreamBufferDelete(s_bt_audio.hfp_dn_fifo); s_bt_audio.hfp_dn_fifo = NULL; }
         if (s_bt_audio.hfp_dn_fifo_buf != NULL) { heap_caps_free(s_bt_audio.hfp_dn_fifo_buf); s_bt_audio.hfp_dn_fifo_buf = NULL; }
-        ESP_LOGE(TAG, "task create failed");
+        ESP_LOGE(TAG, "task create failed: internal free=%u largest=%u",
+               heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+               heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         return ESP_ERR_NO_MEM;
     }
 
@@ -1679,6 +1818,25 @@ esp_err_t bt_audio_get_play_state(bt_audio_handle_t audio, bt_audio_play_state_t
                : s_bt_audio.a2dp.connected ? BT_AUDIO_PLAY_STATE_PAUSED
                : BT_AUDIO_PLAY_STATE_STOPPED;
     }
+    BT_AUDIO_UNLOCK();
+    return ESP_OK;
+}
+esp_err_t bt_audio_get_position_ms(bt_audio_handle_t audio, uint32_t *position_ms)
+{
+    (void)audio;
+
+    if (position_ms == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    BT_AUDIO_LOCK();
+    if (!s_bt_audio.play_pos_valid)
+    {
+        BT_AUDIO_UNLOCK();
+        return ESP_ERR_NOT_FOUND;   /* 手机未上报过位置（不支持 PLAY_POS_CHANGED / 未播放） */
+    }
+    *position_ms = s_bt_audio.play_pos_ms;
     BT_AUDIO_UNLOCK();
     return ESP_OK;
 }

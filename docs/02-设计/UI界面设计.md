@@ -11,9 +11,9 @@
 
 ### 1.1 设计原则
 
-1. **分层边界不破例**：UI 属于 App 层，只调用 App 层模块（MusicPlay / PlayMode / LightControl）的定稿接口与系统服务查询接口（wifi_manager / node_role / OTA / CallPhone / sync_protocol）；**绝不**直接调用 `bt_audio`、`audio_decoder` 等"被上层模块持有的"中间件句柄，更不碰 ESP-IDF API。
+1. **分层边界不破例**：UI 属于 App 层，只调用 App 层模块（MusicPlay / LightControl）的定稿接口与系统服务查询接口（wifi_manager / node_role / OTA / CallPhone / sync_protocol）；**绝不**直接调用 `bt_audio`、`audio_decoder` 等"被上层模块持有的"中间件句柄，更不碰 ESP-IDF API。
 2. **指令是期望，状态靠回流**：UI 按键后不自行翻转状态显示（只给按压动效），最终状态以 `music_event_t` / `light_event_t` 等事件携带的快照落定；事件未回流前控件呈"等待"半透明态。
-3. **单订阅者接线**：UI 是 MusicPlay / PlayMode / LightControl / OTA 事件的唯一订阅者，由 `app_main` 在创建各模块时把 `on_event` 接线到 UI 提供的转发函数；事件回调上下文**只入队**，不碰 LVGL。
+3. **单订阅者接线**：UI 是 MusicPlay / LightControl / OTA 事件的唯一订阅者，由 `app_main` 在创建各模块时把 `on_event` 接线到 UI 提供的转发函数；事件回调上下文**只入队**，不碰 LVGL。
 4. **资源随包、固件自带**：全量中文字体与图标（lv_font_conv 生成的 C 数组）编译进固件，3 张 PNG 图片经 `spiffs_create_partition_image` 烧录进 Flash `storage` 分区，SD 卡不参与 UI 资源，界面不依赖任何外置存储。
 5. **小屏优先级**：320×240 空间有限，一屏只做一件事；次级功能收进二级页；状态全局常驻（状态栏 + Tab 栏），操作路径最多两跳。
 
@@ -53,7 +53,7 @@
 | :--- | :--- | :--- |
 | 播放/暂停/上下曲/音量/播放模式 | `music_play_command()` / `music_play_set_mode()` / `music_play_set_volume()` | `bt_audio_send_ctrl_cmd()`（AVRCP 由 MusicPlay 转发） |
 | 本地选曲 | `music_play_select_track()` / `music_play_scan_local()` | `audio_decoder_*`、FATFS |
-| 手动切蓝牙/本地源 | `play_mode_set()` | `music_play_switch_source()`（仅 PlayMode 接线回调可用） |
+| 手动切蓝牙/本地源 | `music_play_set_source()` | —（蓝牙优先自动规则在 MusicPlay 内部，无需额外接线） |
 | 开关灯 | `light_control_send(cmd, "bedroom"/"livingroom")` | socket、JSON 组包、组播 |
 | WiFi 配网 | `node_role_get/set()` + `wifi_manager_set_sta()` | NVS 直写、esp_wifi |
 | 连接状态显示 | 轮询 `wifi_manager_get_state()/get_ip()` | 注册 wifi_manager 事件（约定 UI 轮询不订阅） |
@@ -304,7 +304,7 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 | 元素 | 数据来源（显示） | 动作（控制） |
 | :--- | :--- | :--- |
 | 封面 128×128 | `F:/ui_img/Music_Album.png`（Flash `storage` 分区），**恒为占位图**（BT 源无封面接口、本地源不解析 ID3 内嵌图）；分区缺失→内置色块占位 | 无 |
-| 源 chip | `view->source`；`PLAY_MODE_EVT_CHANGED` 刷新 | 点击 → `play_mode_set(另一源)`（见 6.3） |
+| 源 chip | `view->source`；`MUSIC_EVT_SOURCE_CHANGED` 刷新 | 点击 → `music_play_set_source(另一源)`（见 6.3） |
 | 列表入口 | — | 点击 → 本地音乐列表；**BT 源时禁用置灰**（列表是本地源功能） |
 | 标题/副标题 | `view->track`：本地源=`display_name`+文件名；BT 源=歌名+`artist · album`（承载方式见 9.2 建议） | — |
 | 进度条+时间 | 500ms 轮询 `music_play_get_position_ms()`（9.2 建议）；时长 `view->track->duration_ms` | **只读，不支持拖动**（`audio_decoder` 不做 seek，接口不虚构）；**BT 源整段隐藏**（AVRCP 无 position 接口） |
@@ -381,7 +381,7 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 
 | 分区 | 数据/动作 | 备注 |
 | :--- | :--- | :--- |
-| 播放源 | `play_mode_get()` 显示、`play_mode_set()` 切换 | 与播放页源 chip 等效，二选一入口即可，数据同源 |
+| 播放源 | `music_play_get_source()` 显示、`music_play_set_source()` 切换 | 与播放页源 chip 等效，二选一入口即可，数据同源 |
 | 网络 | 轮询 `wifi_manager_get_state()/get_ip()`；`[WiFi 配网]` → 5.6 | ERROR 态红字"凭据错误/重试用尽" |
 | 同步播放 | 1s 轮询 `sync_protocol_master_get_status()` | 未 init → "未启用"；显示 `slave_online`、`last_slave_offset_us`（换算 ms）、`dropped_pkts` |
 | 语音助手 | 1s 轮询 `call_phone_get_state()` | 只读展示，无开关（CallPhone 由唤醒词驱动，不对外发事件） |
@@ -440,15 +440,14 @@ LCD 与 SD 分时复用 SPI2（各持独立 CS；SD 侧用手动 CS 会话，事
 ```reStructuredText
 app_main 初始化顺序（UI 最后创建）：
   MusicPlay 创建  cfg.on_event = ui_on_music_event
-  PlayMode 创建   cfg.on_event = ui_on_play_mode_event
   LightControl 创建 cfg.on_event = ui_on_light_event
   OTA_Update_Init  cfg.event_cb = ui_on_ota_event
   ……
   ui_init(&ui_cfg)   ← 注入各模块句柄（见第 7 章）
 ```
 
-- UI 是以上四路事件的**唯一订阅者**（各模块回调为单槽位，由 app_main 让渡给 UI）。
-- PlayMode 决策（自动切源）产生的 `PLAY_MODE_EVT_CHANGED` 同样走该链路刷新源 chip。
+- UI 是以上三路事件的**唯一订阅者**（各模块回调为单槽位，由 app_main 让渡给 UI）。
+- MusicPlay 内部自动切源（原 PlayMode 决策）产生的 `MUSIC_EVT_SOURCE_CHANGED` 同样走该链路刷新源 chip。
 
 ### 6.2 播放控制流（UI → 手机 AVRCP / 从节点）
 
@@ -461,15 +460,16 @@ UI 触摸(播放页) → music_play_command(TOGGLE/NEXT/PREV/VOL)
 
 - UI 只发"期望"，最终状态以 `music_event_t` 携带的 `music_play_view_t` 快照为准（与架构文档 6.2 完全一致）。
 
-### 6.3 手动切源流（UI → PlayMode）
+### 6.3 手动切源流（UI → MusicPlay）
 
 ```reStructuredText
-UI 点击源 chip / 设置页源按钮 → play_mode_set(source)
-   → PlayMode 决策 → on_switch 回调（app_main 接线）→ music_play_switch_source()
-   → PLAY_MODE_EVT_CHANGED → UI 刷新
+UI 点击源 chip / 设置页源按钮 → music_play_set_source(source)
+   → MusicPlay 状态机串行执行（停旧源 → 起新源）
+   → MUSIC_EVT_SOURCE_CHANGED → UI 刷新
 ```
 
-- **蓝牙优先规则提示**：手机仍连接时手动切本地，会在下一次轮询（≤1s）被自动拉回蓝牙——UI 检测到 `PLAY_MODE_EVT_CHANGED` 与用户期望不符时，Toast 提示"蓝牙已连接，已保持蓝牙模式"。
+- **蓝牙优先规则提示**：手机仍连接时手动切本地，会在下一次轮询（≤1s）被自动拉回蓝牙——UI 检测到 `MUSIC_EVT_SOURCE_CHANGED` 与用户期望不符时，Toast 提示"蓝牙已连接，已保持蓝牙模式"。
+- 参数非法（如 `MUSIC_SOURCE_NONE`）时 `music_play_set_source()` 返回 `ESP_ERR_INVALID_ARG` 并回一个 `MUSIC_EVT_ERROR`。
 
 ### 6.4 灯控流（UI → ESP8266）
 
@@ -547,7 +547,6 @@ typedef struct ui_s *ui_handle_t;
 
 typedef struct {
     music_play_handle_t    music;       /* 可 NULL：播放页/列表页显示"播放模块未就绪" */
-    play_mode_handle_t     play_mode;   /* 可 NULL：手动切源入口禁用 */
     light_control_handle_t light;       /* 可 NULL：灯控页显示"灯控未启用" */
     wifi_manager_handle_t  wifi;        /* 可 NULL：WiFi 图标灰显、配网入口禁用 */
     call_phone_handle_t    call_phone;  /* 可 NULL：麦克风图标灰显 */
@@ -563,7 +562,6 @@ void      ui_deinit(void);                /* 删除 UI_Task、释放 LVGL（整�
  * 硬性约束：内部只做入队（6.8），禁止调用任何 lv_* 与 UI 查询接口
  */
 void ui_on_music_event(const music_event_t *evt, void *user_ctx);
-void ui_on_play_mode_event(const play_mode_event_t *evt, void *user_ctx);
 void ui_on_light_event(const light_event_t *evt, void *user_ctx);
 void ui_on_ota_event(const ota_update_event_info_t *info, void *user_ctx);
 ```
@@ -589,7 +587,6 @@ UI/
 | 缺失项 | 播放页 | 灯控页 | 设置页 | 状态栏 |
 | :--- | :--- | :--- | :--- | :--- |
 | `music == NULL` | "播放模块未就绪"，控制键禁用 | — | 源分区禁用 | BT 灰显 |
-| `play_mode == NULL` | 源 chip 禁用 | — | 源分区禁用 | BT 灰显 |
 | `light == NULL` | — | "灯控未启用" | — | — |
 | `wifi == NULL` | — | — | 配网入口禁用 | WiFi 灰显 |
 | `call_phone == NULL` | — | — | 语音分区"未启用" | 麦克风灰显 |
@@ -687,7 +684,7 @@ esp_err_t music_play_get_position_ms(music_play_handle_t player, uint32_t *posit
 
 ### 9.3 其他确认项（无需改接口）
 
-- 蓝牙图标数据源用 `play_mode_get() == MUSIC_SOURCE_BT` 推断，UI 不查 `bt_audio_get_a2dp_info()`——与"UI 不直接调 bt_audio"边界一致；
+- 蓝牙图标数据源用 `music_play_get_source() == MUSIC_SOURCE_BT` 推断，UI 不查 `bt_audio_get_a2dp_info()`——与"UI 不直接调 bt_audio"边界一致；
 - 音量对 BT 源即 AVRCP absolute volume，由 MusicPlay 内部转发 `bt_audio_set_volume()` 并广播 `SYNC_CMD_VOLUME`，UI 无感知。
 
 ------
@@ -697,7 +694,7 @@ esp_err_t music_play_get_position_ms(music_play_handle_t player, uint32_t *posit
 | 阶段 | 内容 | 准出条件 | 依赖 |
 | :--- | :--- | :--- | :--- |
 | **M1 显示/触摸底座** | 自持 UI_Task + flush/read 适配、主题与内置字体（C 编译进固件）、图标字形资产（symbol 字号启用 + 自定义 iconfont 生成，见 3.3）、状态栏/Tab 栏骨架、三页静态布局（假数据）、页面切换 | 320×240 稳定刷屏 ≈30fps、触摸点击/滚动正常、storage 分区 PNG 加载与占位回退生效；`LCD_TOUCH_SELF_TEST=0` | LCD_Touch（已实现）、storage 分区（已实现，随固件烧录）；MusicPlay 等可为 NULL |
-| **M2 播放链路** | 播放页真实数据、本地列表、音量/模式、pending 态、跑马灯 | 本地源完整闭环（选曲/播放/暂停/切曲/进度/音量）；BT 源标题与控制可用（AVRCP 回流） | MusicPlay / PlayMode 实现（+9.2 建议落地） |
+| **M2 播放链路** | 播放页真实数据、本地列表、音量/模式、pending 态、跑马灯 | 本地源完整闭环（选曲/播放/暂停/切曲/进度/音量）；BT 源标题与控制可用（AVRCP 回流） | MusicPlay（含源选择）实现（+9.2 建议落地） |
 | **M3 灯控 + 配网** | 灯控页三态与回执时序、扫描列表、密码键盘、配网两步流程 | 开灯→ack 落定 <50ms；断网重连图标正确；配网成功落盘 NVS | LightControl / wifi_manager 实现（+9.1 建议落地） |
 | **M4 系统状态收尾** | 设置页同步/语音/OTA 分区、容错矩阵全量验证、Toast 体系 | SD 拔卡降级、各句柄 NULL 降级逐项通过；OTA 进度展示正确 | sync_protocol / CallPhone / OTA |
 

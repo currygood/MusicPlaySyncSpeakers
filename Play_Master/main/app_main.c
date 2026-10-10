@@ -22,6 +22,7 @@
 #include "bt_audio.h"
 #include "call_phone.h"
 #include "light_control.h"
+#include "music_play.h"
 #include "audio_decoder.h"
 #include <ctype.h>
 #include <dirent.h>
@@ -162,65 +163,6 @@ static void Sd_Card_Test(void)
 #define SINE_AMPLITUDE   32000    /* 满幅输出：排除“音量太小”听不见的可能 */
 
 
-/* ======================== 5 秒"嘟嘟"测试音 ======================================= */
-
-
-/**
- * @brief 播放 5 秒“嘟嘟”提示音
- *
- * 生成 800Hz 方波 PCM（16-bit/44.1kHz/双声道），按 0.25s 响、0.25s 停
- * 的节奏通过功放播放，共 5 秒。用作总线化改造后的硬件验证：能听到
- * 有节奏的“嘟嘟”声即说明 microphone + 物理 I2S + 功放链路正常。
- */
-static void play_beep_test(void)
-{
-    ESP_LOGI(TAG, "beep test start: 800Hz square, 5s total");
-
-    if (Amplifier_Init() != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Amplifier_Init failed");
-        return;
-    }
-
-    int16_t chunk[BEEP_CHUNK_SAMPLES * 2];
-    const int period = BEEP_SAMPLE_RATE / BEEP_FREQ_HZ;   /* 55 样本/周期（44.1k/800Hz） */
-    const int half   = period / 2;                        /* 10 样本/半周期 */
-    int phase = 0;                                        /* 相位累加器，跨块连续 */
-    uint32_t elapsed_ms = 0;
-
-    while (elapsed_ms < BEEP_TOTAL_MS)
-    {
-        /* 节奏：前 0.25s 发声，后 0.25s 静音 */
-        bool is_sounding = (elapsed_ms % (BEEP_ON_MS + BEEP_OFF_MS)) < BEEP_ON_MS;
-
-        for (int i = 0; i < BEEP_CHUNK_SAMPLES; i++)
-        {
-            int16_t v = 0;
-            if (is_sounding)
-            {
-                v = ((phase % period) < half) ? BEEP_AMPLITUDE : -BEEP_AMPLITUDE;
-            }
-            chunk[i * 2]     = v;   /* left  slot */
-            chunk[i * 2 + 1] = v;   /* right slot */
-            phase++;   /* 静音期间也推进相位，保证再次发声时波形连续 */
-        }
-
-        esp_err_t ret = Amplifier_Play_Buffer((const uint8_t *)chunk,
-                                              sizeof(chunk), NULL, 1000);
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAG, "beep play failed at %lums: %s (DMA: desc=16, frame=512)",
-                     (unsigned long)elapsed_ms, esp_err_to_name(ret));
-            break;
-        }
-
-        elapsed_ms += (BEEP_CHUNK_SAMPLES * 1000) / BEEP_SAMPLE_RATE;   /* 每块约 32ms */
-    }
-
-    Amplifier_Deinit();
-    ESP_LOGI(TAG, "beep test finished");
-}
-
 
 /* ======================== 共用 SPI2 的测试任务 ========================
  * SD 卡测试与 LCD+触摸测试分时复用同一条 SPI2 总线：
@@ -255,208 +197,6 @@ static void Lcd_Touch_Test_Task(void *arg)
 #endif
     vTaskDelete(NULL);
 }
-
-/* ======================== 麦克风录音 -> 功放回放 测试 ======================== */
-
-#define MIC_TEST_SECONDS       10                   /* 录音时长（秒） */
-#define MIC_TEST_SAMPLE_RATE   44100                /* 采样率：全链路统一 44.1kHz */
-#define MIC_TEST_CHUNK_SAMPLES 512                  /* 每次读取的采样数（单声道 PCM16） */
-#define MIC_TEST_GAIN          16                   /* 录音放大倍数（8/12/16/24/32 自行实验） */
-
-/** 用麦克风录音 10s，再通过功放播放出来 */
-static void Mic_Record_Playback_Test(void)
-{
-    ESP_LOGI(TAG, "=== Mic Record(10s) -> Amplifier Playback Test Start ===");
-
-    /* I2S RX 每个 44.1kHz 帧输出 2 个槽位样本（L/R 各 32bit）：
-     * 先全量采集（2 x 441000），之后按能量去交错还原真正的 44.1kHz 语音 */
-    const size_t totalSamples = MIC_TEST_SECONDS * MIC_TEST_SAMPLE_RATE * 2;
-    const size_t monoBytes    = totalSamples * sizeof(int16_t);          /* 640KB */
-
-    /* 1) 分配录音缓冲：优先 PSRAM，失败退回内部 RAM */
-    int16_t *rec = heap_caps_malloc(monoBytes, MALLOC_CAP_SPIRAM);
-    if (rec == NULL)
-    {
-        ESP_LOGW(TAG, "PSRAM alloc failed (%uB), fallback to internal RAM...", (unsigned)monoBytes);
-        rec = (int16_t *)malloc(monoBytes);
-    }
-    if (rec == NULL)
-    {
-        ESP_LOGE(TAG, "No memory for recording buffer (%uB)", (unsigned)monoBytes);
-        return;
-    }
-
-    int16_t *chunk = (int16_t *)malloc(MIC_TEST_CHUNK_SAMPLES * sizeof(int16_t));
-    if (chunk == NULL)
-    {
-        ESP_LOGE(TAG, "No memory for read chunk buffer");
-        free(rec);
-        return;
-    }
-
-    /* 2) 初始化麦克风（I2S0 RX）和功放（I2S1 TX），采样率均为 44.1kHz */
-    esp_err_t ret = Microphone_Init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Microphone_Init failed: %s", esp_err_to_name(ret));
-        free(chunk);
-        free(rec);
-        return;
-    }
-    ret = Amplifier_Init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Amplifier_Init failed: %s", esp_err_to_name(ret));
-        Microphone_Deinit();
-        free(chunk);
-        free(rec);
-        return;
-    }
-    Amplifier_Set_Volume(80);
-
-    /* 3) 录音 10s：分块读取单声道 PCM16，写入录音缓冲 */
-    size_t recorded = 0;
-    size_t quietCnt = 0;
-    ESP_LOGI(TAG, "Recording %d seconds, please speak/tap near the mic...",
-             MIC_TEST_SECONDS);
-    while (recorded < totalSamples)
-    {
-        size_t want = MIC_TEST_CHUNK_SAMPLES;
-        if (want > totalSamples - recorded)
-        {
-            want = totalSamples - recorded;
-        }
-        size_t got = 0;
-        ret = Microphone_Read_Pcm16(chunk, want, &got, pdMS_TO_TICKS(1000));
-        if (ret != ESP_OK || got == 0)
-        {
-            if (++quietCnt > 50)    /* 连续失败约 50 次才放弃，抗瞬时超时 */
-            {
-                ESP_LOGE(TAG, "Mic read keeps failing: %s, abort",
-                         esp_err_to_name(ret));
-                break;
-            }
-            continue;
-        }
-        quietCnt = 0;
-        memcpy((uint8_t *)rec + recorded * sizeof(int16_t), chunk,
-               got * sizeof(int16_t));
-        recorded += got;
-
-        if (recorded % (MIC_TEST_SAMPLE_RATE * 2) < MIC_TEST_CHUNK_SAMPLES)
-        {
-            ESP_LOGI(TAG, "record: %u/%u samples",
-                     (unsigned)recorded, (unsigned)totalSamples);
-        }
-    }
-    ESP_LOGI(TAG, "Recorded %u samples (%u bytes)",
-             (unsigned)recorded, (unsigned)(recorded * sizeof(int16_t)));
-
-    /* 4) 去交错：每 2 个样本是一帧（两个槽位），取能量大的那个槽，还原 44.1kHz 语音 */
-    {
-        int64_t evenEnergy = 0;
-        int64_t oddEnergy  = 0;
-        for (size_t i = 0; i + 1 < recorded; i += 2)
-        {
-            int64_t a = rec[i];
-            int64_t b = rec[i + 1];
-            evenEnergy += (a < 0) ? -a : a;
-            oddEnergy  += (b < 0) ? -b : b;
-        }
-        int keepLane = (evenEnergy >= oddEnergy) ? 0 : 1;   /* 槽位偏移 0/1 */
-        size_t frames = recorded / 2;
-        for (size_t i = 0; i < frames; i++)
-        {
-            rec[i] = rec[i * 2 + keepLane];
-        }
-        recorded = frames;
-        ESP_LOGI(TAG, "de-interleave: keep slot %d, frames=%u (even=%lld odd=%lld)",
-                 keepLane, (unsigned)recorded,
-                 (long long)evenEnergy, (long long)oddEnergy);
-    }
-
-    /* 5) 波形诊断：基于原始录音的峰值统计（改动后 rec 已是 44.1kHz 单声道） */
-    int32_t peak = 0;
-    uint32_t activeCnt = 0;
-    for (size_t i = 0; i < recorded; i++)
-    {
-        int32_t v = rec[i];
-        if (v < 0)
-        {
-            v = -v;
-        }
-        if (v > peak)
-        {
-            peak = v;
-        }
-        if (v > 200)
-        {
-            activeCnt++;            /* 明显大于静止底噪的采样数 */
-        }
-    }
-    int32_t peakAfter = peak * MIC_TEST_GAIN;
-    if (peakAfter > 32767)
-    {
-        peakAfter = 32767;
-    }
-    ESP_LOGI(TAG, "record raw peak=%d active=%u/%u (raw x%d = %d, 会削顶)",
-             (int)peak, (unsigned)activeCnt, (unsigned)recorded,
-             MIC_TEST_GAIN, (int)peakAfter);
-
-    /* 6) 回放：单声道 -> 立体声（L/R 各一份），分块写入功放。
-     *    不做滤波，仅按 MIC_TEST_GAIN 放大，原始 rec 不被修改。 */
-    ESP_LOGI(TAG, "Playback through NS4168 (~%d seconds) ...",
-             (int)(recorded / MIC_TEST_SAMPLE_RATE));
-    int16_t *stereo = (int16_t *)malloc(MIC_TEST_CHUNK_SAMPLES * 2 * sizeof(int16_t));
-    if (stereo == NULL)
-    {
-        ESP_LOGE(TAG, "No memory for stereo chunk");
-        free(chunk);
-        free(rec);
-        return;
-    }
-    for (size_t off = 0; off < recorded; off += MIC_TEST_CHUNK_SAMPLES)
-    {
-        size_t n = MIC_TEST_CHUNK_SAMPLES;
-        if (n > recorded - off)
-        {
-            n = recorded - off;
-        }
-        for (size_t i = 0; i < n; i++)
-        {
-            int32_t amp = rec[off + i] * MIC_TEST_GAIN;
-            if (amp > 32767)
-            {
-                amp = 32767;
-            }
-            else if (amp < -32768)
-            {
-                amp = -32768;
-            }
-            stereo[i * 2 + 0] = (int16_t)amp;
-            stereo[i * 2 + 1] = (int16_t)amp;
-        }
-        size_t written = 0;
-        ret = Amplifier_Play_Buffer((const uint8_t *)stereo, n * 4,
-                                    &written, 500);
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Playback failed at offset %u: %s",
-                     (unsigned)off, esp_err_to_name(ret));
-            break;
-        }
-    }
-    ESP_LOGI(TAG, "=== Mic Record -> Playback Test Finished ===");
-
-    /* 7) 清理：先停功放，再停麦克风 */
-    Amplifier_Deinit();
-    Microphone_Deinit();
-    free(stereo);
-    free(chunk);
-    free(rec);
-}
-
-
 
 
 /* ======================== 蓝牙 A2DP 测试（bt_audio 模块） ======================= */
@@ -2187,6 +1927,320 @@ test_exit:
     vTaskDelete(NULL);
 }
 
+/* ======================== 第十一阶段：MusicPlay 播放测试 ======================== */
+
+static music_play_handle_t s_musicTestPlayer = NULL;  /* 供 bt_audio → MusicPlay 事件胶水使用 */
+
+/** bt_audio 蓝牙 PCM 直连 sync（music_play.h 依赖接线说明：on_pcm 不经过 MusicPlay 模块） */
+static void Music_Test_Bt_Pcm_Cb(bt_audio_pcm_source_t source, const int16_t *pcm,
+                                 size_t samples, uint32_t sample_rate, void *user_ctx)
+{
+    (void)sample_rate;
+    (void)user_ctx;
+    if (source != BT_AUDIO_PCM_SOURCE_A2DP || pcm == NULL || samples == 0)
+    {
+        return;
+    }
+    sync_protocol_master_push_pcm(pcm, samples);
+}
+
+/** bt_audio 事件 → MusicPlay（App 层胶水；MusicPlay 未创建前忽略） */
+static void Music_Test_Bt_Evt_Cb(const bt_audio_event_t *evt, void *user_ctx)
+{
+    (void)user_ctx;
+    if (evt != NULL && s_musicTestPlayer != NULL)
+    {
+        music_play_on_bt_event(s_musicTestPlayer, evt);
+    }
+}
+
+/** MusicPlay 事件回调（测试观察用） */
+static const char *Music_Test_Evt_Name(music_event_id_t id)
+{
+    switch (id)
+    {
+    case MUSIC_EVT_SOURCE_CHANGED:     return "SOURCE_CHANGED";
+    case MUSIC_EVT_PLAY_STATE_CHANGED: return "PLAY_STATE_CHANGED";
+    case MUSIC_EVT_TRACK_CHANGED:      return "TRACK_CHANGED";
+    case MUSIC_EVT_TRACK_INFO:         return "TRACK_INFO";
+    case MUSIC_EVT_PLAYLIST_CHANGED:   return "PLAYLIST_CHANGED";
+    case MUSIC_EVT_PLAY_MODE_CHANGED:  return "PLAY_MODE_CHANGED";
+    case MUSIC_EVT_VOLUME_CHANGED:     return "VOLUME_CHANGED";
+    case MUSIC_EVT_EOF:                return "EOF";
+    case MUSIC_EVT_ERROR:              return "ERROR";
+    default:                           return "?";
+    }
+}
+
+static void Music_Test_Evt_Cb(const music_event_t *evt, void *user_ctx)
+{
+    (void)user_ctx;
+    if (evt == NULL)
+    {
+        return;
+    }
+    ESP_LOGI(TAG, "[mp-evt] %s: src=%d state=%d vol=%u track=%u/%u",
+             Music_Test_Evt_Name(evt->id),
+             (int)evt->view.source, (int)evt->view.state,
+             evt->view.volume, evt->view.track_index, evt->view.track_count);
+}
+
+/** 打印当前 MusicPlay 视图快照 + 播放位置（get_view 返回内部快照，无需持锁） */
+static void Music_Test_Print_View(const char *tag)
+{
+    const music_play_view_t *v;
+    uint32_t pos = 0;
+
+    if (s_musicTestPlayer == NULL)
+    {
+        return;
+    }
+    v = music_play_get_view(s_musicTestPlayer);
+    if (v == NULL)
+    {
+        return;
+    }
+    music_play_get_position_ms(s_musicTestPlayer, &pos);
+    ESP_LOGI(TAG, "[mp] %s: src=%d state=%d mode=%d vol=%u%% pos=%lums "
+             "track=%u/%u pending=%d stack=%u",
+             tag, (int)v->source, (int)v->state, (int)v->mode, v->volume,
+             (unsigned long)pos, v->track_index, v->track_count,
+             v->pending_cmd ? 1 : 0,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+}
+
+/** 第十一阶段测试：MusicPlay 模块接线 + 播放冒烟（独立任务，避开 main_task 小栈） */
+static void MusicPlay_Test(void *arg)
+{
+    (void)arg;
+    wifi_manager_handle_t wifi        = NULL;
+    wifi_mcast_handle_t   audio_chan  = NULL;
+    wifi_mcast_handle_t   ctrl_chan   = NULL;
+    bt_audio_handle_t     audio       = NULL;
+    music_play_cfg_t      mcfg        = {0};
+    wifi_manager_cfg_t    cfg         = {0};
+    wifi_mcast_cfg_t      mc          = {0};
+    node_role_cfg_t       rcfg        = {0};
+    bt_audio_cfg_t        bcfg        = {0};
+    uint16_t              track_count = 0;
+    esp_err_t             err;
+
+    ESP_LOGI(TAG, "=== MusicPlay Test Start（第十一阶段） ===");
+    ESP_LOGI(TAG, "[heap] test start: int free=%u largest=%u, psram free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    /* 1. 功放 + SD 卡前置（本地播放依赖） */
+    if (Amplifier_Init() != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Amplifier_Init failed");
+        return;
+    }
+    if (SD_Card_Init() != ESP_OK)
+    {
+        ESP_LOGW(TAG, "SD_Card_Init failed, 本地列表将为空（仍可测蓝牙源）");
+    }
+    Amplifier_Set_Volume(80);
+
+    /* 2. NVS 凭据 + 连接热点（与 Sync_Protocol_Test / Light_Control_Test 一致） */
+    err = node_role_init(NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "node_role_init failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+    snprintf(rcfg.wifi_ssid,       sizeof(rcfg.wifi_ssid),       "%s", NODE_ROLE_DEFAULT_SSID);
+    snprintf(rcfg.wifi_password,   sizeof(rcfg.wifi_password),   "%s", NODE_ROLE_DEFAULT_PASSWORD);
+    snprintf(rcfg.ota_server_url,  sizeof(rcfg.ota_server_url),  "%s", NODE_ROLE_DEFAULT_OTA_URL);
+    snprintf(rcfg.multicast_group, sizeof(rcfg.multicast_group), "%s", NODE_ROLE_DEFAULT_GROUP);
+    rcfg.role              = NODE_ROLE_MASTER;
+    rcfg.volume            = NODE_ROLE_DEFAULT_VOLUME;
+    rcfg.play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
+    rcfg.sync_delay_ms     = NODE_ROLE_DEFAULT_SYNC_DELAY_MS;
+    rcfg.audio_sample_rate = NODE_ROLE_DEFAULT_SAMPLE_RATE;
+    err = node_role_set(&rcfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "node_role_set failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    wifi = wifi_manager_create(&cfg);
+    if (wifi == NULL)
+    {
+        ESP_LOGE(TAG, "wifi_manager_create failed");
+        goto test_exit;
+    }
+    wifi_manager_register_event_cb(wifi, Wifi_Test_Evt_Cb, NULL);
+    err = wifi_manager_start(wifi);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "wifi_manager_start failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+    ESP_LOGI(TAG, "connecting to AP, waiting for IP...");
+    for (int i = 0; i < 150; i++)
+    {
+        if (wifi_manager_is_connected(wifi))
+        {
+            char ip[16] = {0};
+            size_t ip_len = sizeof(ip);
+            if (wifi_manager_get_ip(wifi, ip, &ip_len) == ESP_OK)
+            {
+                ESP_LOGI(TAG, "wifi connected, ip=%s rssi=%d",
+                         ip, wifi_manager_get_rssi(wifi));
+            }
+            ESP_LOGI(TAG, "[heap] after wifi connect: int free=%u largest=%u, psram free=%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (i == 149)
+        {
+            ESP_LOGE(TAG, "wait ip timeout, check SSID/PWD");
+            goto test_exit;
+        }
+    }
+
+    /* 3. 组播通道：音频只发（5678）/ 控制收发（5679），MusicPlay 经 cfg 传入 */
+    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
+    mc.port  = SYNC_PROTOCOL_MCAST_PORT_AUDIO;
+    mc.rx_enable = false;
+    err = wifi_manager_mcast_open(wifi, &mc, &audio_chan);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "mcast_open audio_chan failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
+    mc.port  = SYNC_PROTOCOL_MCAST_PORT_CTRL;
+    mc.rx_enable     = true;
+    mc.rx_fifo_bytes = 4096;
+    err = wifi_manager_mcast_open(wifi, &mc, &ctrl_chan);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "mcast_open ctrl_chan failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+    ESP_LOGI(TAG, "[heap] after mcast: int free=%u largest=%u, psram free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    /* 4. bt_audio 创建 + 启动；on_pcm 直连 sync，on_event 胶水进 MusicPlay */
+    bcfg.device_name = "MPS-Sync-Test";
+    bcfg.on_pcm      = Music_Test_Bt_Pcm_Cb;
+    bcfg.on_event    = Music_Test_Bt_Evt_Cb;
+    audio = bt_audio_create(&bcfg);
+    if (audio == NULL)
+    {
+        ESP_LOGE(TAG, "bt_audio_create failed");
+        goto test_exit;
+    }
+    err = bt_audio_start(audio);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "bt_audio_start failed: %s", esp_err_to_name(err));
+        goto test_exit;
+    }
+
+    /* 5. MusicPlay 创建（内部自行 init/deinit sync_protocol；D=0 从 node_role 读） */
+    mcfg.bt_audio      = audio;
+    mcfg.audio_chan    = audio_chan;
+    mcfg.control_chan  = ctrl_chan;
+    mcfg.sync_delay_ms = 0;
+    mcfg.on_event      = Music_Test_Evt_Cb;
+    s_musicTestPlayer  = music_play_create(&mcfg);
+    if (s_musicTestPlayer == NULL)
+    {
+        ESP_LOGE(TAG, "music_play_create failed");
+        goto test_exit;
+    }
+
+    /* 6. 本地播放冒烟：扫描列表 → 播第 1 首 */
+    Music_Test_Print_View("before scan");
+    music_play_scan_local(s_musicTestPlayer);
+    vTaskDelay(pdMS_TO_TICKS(1000));   /* 等扫描完成 */
+    track_count = music_play_get_track_count(s_musicTestPlayer);
+    ESP_LOGI(TAG, "local tracks: %u", track_count);
+
+    if (track_count > 0)
+    {
+        music_play_select_track(s_musicTestPlayer, 0);
+        vTaskDelay(pdMS_TO_TICKS(4000));   /* 听 4s */
+        Music_Test_Print_View("after select 0");
+
+        music_play_command(s_musicTestPlayer, MUSIC_CMD_NEXT);
+        vTaskDelay(pdMS_TO_TICKS(2500));
+        Music_Test_Print_View("after NEXT");
+
+        music_play_command(s_musicTestPlayer, MUSIC_CMD_PAUSE);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        Music_Test_Print_View("after PAUSE");
+
+        music_play_command(s_musicTestPlayer, MUSIC_CMD_RESUME);
+        vTaskDelay(pdMS_TO_TICKS(2500));
+        Music_Test_Print_View("after RESUME");
+
+        music_play_set_mode(s_musicTestPlayer, MUSIC_PLAY_MODE_SINGLE_LOOP);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        music_play_set_mode(s_musicTestPlayer, MUSIC_PLAY_MODE_SEQUENTIAL);
+        vTaskDelay(pdMS_TO_TICKS(300));
+
+        music_play_set_volume(s_musicTestPlayer, 50);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        music_play_command(s_musicTestPlayer, MUSIC_CMD_VOLUME_UP);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        music_play_command(s_musicTestPlayer, MUSIC_CMD_VOLUME_DOWN);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        Music_Test_Print_View("after volume");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "no local mp3, skip local smoke test");
+    }
+
+    /* 7. 切蓝牙源：手机配对/连接后播放，观察 AVRCP 事件与位置推送 */
+    ESP_LOGI(TAG, "switch to BT source, connect your phone...");
+    music_play_set_source(s_musicTestPlayer, MUSIC_SOURCE_BT);
+    music_play_command(s_musicTestPlayer, MUSIC_CMD_PLAY);
+
+    /* 8. 观察循环：每 5s 打印一次视图 + 播放位置 */
+    for (;;)
+    {
+        Music_Test_Print_View("live");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+test_exit:
+    if (s_musicTestPlayer != NULL)
+    {
+        music_play_destroy(s_musicTestPlayer);
+        s_musicTestPlayer = NULL;
+    }
+    if (audio != NULL)
+    {
+        bt_audio_stop(audio);
+        bt_audio_destroy(audio);
+    }
+    if (ctrl_chan != NULL)
+    {
+        wifi_manager_mcast_close(ctrl_chan);
+    }
+    if (audio_chan != NULL)
+    {
+        wifi_manager_mcast_close(audio_chan);
+    }
+    if (wifi != NULL)
+    {
+        wifi_manager_destroy(wifi);
+    }
+    vTaskDelete(NULL);
+}
+
 void app_main(void)
 {
 	SystemStart();
@@ -2229,6 +2283,9 @@ void app_main(void)
 	 * 测试函数自带大栈缓冲，按惯例单独起任务（16KB 栈，避开 main_task 3.5KB 限制） */
 	// xTaskCreatePinnedToCore(Sync_Protocol_Test, "sync_test", 16384, NULL, 5, NULL, 0);
 	
+	/* 第十一阶段：MusicPlay 播放测试（测试任务栈 8192→4096，省内部 DRAM） */
+	xTaskCreatePinnedToCore(MusicPlay_Test, "music_play_test", 4096, NULL, 5, NULL, 0);
+
 	while(1)
 	{
 		vTaskDelay(pdMS_TO_TICKS(1000));

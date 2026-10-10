@@ -6,6 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 # 如需启用 ccache，删除下面这一行即可。
 set(CCACHE_ENABLE OFF CACHE BOOL "Enable ccache for faster rebuilds" FORCE)
 
+set(VERSION 0.1)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
 idf_build_set_property(MINIMAL_BUILD ON)

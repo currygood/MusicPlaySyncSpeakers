@@ -95,6 +95,9 @@ void scr_settings_build(lv_obj_t *page);
 /** UI_Task 转发灯控事件到灯控页（事件队列消费侧） */
 void scr_light_apply_event(const light_event_t *evt);
 
+/** UI_Task 转发播放事件到播放页（事件队列消费侧） */
+void scr_player_apply_event(const music_event_t *evt);
+
 #ifdef __cplusplus
 }
 #endif

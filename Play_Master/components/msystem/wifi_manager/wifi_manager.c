@@ -10,7 +10,11 @@
  *   - 凭据：start 时经 node_role_get() 读取（node_role 为 NVS 唯一管理入口）；
  *     NVS 未配网（ssid 为空）时回退使用本文件头兜底宏，本模块不直接写 NVS；
  *   - 组播：每个通道一个 UDP socket（bind + IP_ADD_MEMBERSHIP 加组），
- *     WiFi 重连 / IP 变化后由模块内部整体重建并重新加组，业务模块无感知。
+ *     WiFi 重连 / IP 变化后由模块内部整体重建并重新加组，业务模块无感知；
+ *     纯发送通道（rx_enable=false，如音频）关闭 IP_MULTICAST_LOOP，主节点
+ *     不再收回自己发出的包；
+ *   - 低延迟场景：esp_wifi_start() 后关闭 WiFi 省电（WIFI_PS_NONE），避免
+ *     音频组播被攒到 DTIM 唤醒窗口突发而打满 TX 缓冲。
  *
  * 接口依据（esp-idf 6.0.1）：
  *   - esp_wifi.h / esp_wifi_types_generic.h：STA 配置、连接、事件枚举；
@@ -138,7 +142,8 @@ static void wifi_mgr_schedule_reconnect(wifi_manager_handle_t h);
 static void wifi_mgr_fire_event(wifi_manager_handle_t h, wifi_event_id_t id);
 static void wifi_mgr_close_all_mcast(wifi_manager_handle_t h);
 static void wifi_mgr_reopen_all_mcast(wifi_manager_handle_t h);
-static int  wifi_mcast_socket_create(const char *group, uint16_t port);
+static int  wifi_mcast_socket_create(const char *group, uint16_t port,
+                                     bool rx_enable);
 static void wifi_mcast_sock_destroy(struct wifi_mcast_s *ch);
 /* ======================== 事件回调（esp_event 任务上下文） ============ */
 
@@ -387,15 +392,18 @@ static void wifi_mgr_fire_event(wifi_manager_handle_t h, wifi_event_id_t id)
 }
 /* ======================== 组播通道（socket 生命周期） ================== */
 
-/** 创建组播 socket：加组 + 绑定端口 + TTL + 非阻塞（参考官方 udp_multicast 示例） */
-static int wifi_mcast_socket_create(const char *group, uint16_t port)
+/** 创建组播 socket：加组 + 绑定端口 + TTL + 非阻塞（参考官方 udp_multicast 示例）
+ *  rx_enable=false（纯发送通道，如音频）关闭组播回环：主节点只发不收，
+ *  不需要把自己发出的包再收一遍。 */
+static int wifi_mcast_socket_create(const char *group, uint16_t port,
+                                    bool rx_enable)
 {
     struct sockaddr_in saddr;
     struct ip_mreq imreq;
     int sock;
     int on = 1;
     uint8_t ttl = 1;
-    uint8_t loop = 1;
+    uint8_t loop = rx_enable ? 1 : 0;
 
     sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0)
@@ -438,8 +446,8 @@ static int wifi_mcast_socket_create(const char *group, uint16_t port)
 
     /* 局域网组播 TTL=1；接收侧非阻塞，由 RX 任务轮询 */
     setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
-    /* 组播回环：本机已加组的 socket 能收到自己发出的包（测试/自环验证用，
-     * lwIP 默认不回环，需显式置 IP_MULTICAST_LOOP） */
+    /* 组播回环：仅接收通道保留（第九阶段自环测试用）；纯发送通道关闭，
+     * 主节点不需要接收自己发出的包（lwIP 默认不回环，这里显式设置） */
     setsockopt(sock, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
     fcntl(sock, F_SETFL, O_NONBLOCK);
 
@@ -487,7 +495,8 @@ static void wifi_mgr_reopen_all_mcast(wifi_manager_handle_t h)
         {
             close(ch->fd);
         }
-        ch->fd = wifi_mcast_socket_create(ch->group, ch->port);
+        ch->fd = wifi_mcast_socket_create(ch->group, ch->port,
+                                          ch->rx_enable);
     }
 }
 
@@ -775,6 +784,18 @@ esp_err_t wifi_manager_start(wifi_manager_handle_t h)
         return err;
     }
 
+    /* 低延迟主节点：关闭 WiFi 省电。默认 WIFI_PS_MIN_MODEM 会把发送攒到
+     * DTIM 唤醒窗口，15ms 音频组播的突发会打满 TX 缓冲 → sendto 返回
+     * ENOMEM（errno=12）。依据 esp_wifi.h 的 esp_wifi_set_ps()；调用位置
+     * 与官方示例 examples/wifi/power_save/main/power_save.c 一致
+     * （esp_wifi_start() 之后）。失败不致命，仅告警。 */
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s",
+                 esp_err_to_name(err));
+    }
+
     ESP_LOGI(TAG, "wifi_manager started");
     return ESP_OK;
 }
@@ -1036,7 +1057,8 @@ esp_err_t wifi_manager_mcast_open(wifi_manager_handle_t h,
     h->mcast_list = ch;
     if (h->state == WIFI_STATE_CONNECTED)
     {
-        ch->fd = wifi_mcast_socket_create(ch->group, ch->port);
+        ch->fd = wifi_mcast_socket_create(ch->group, ch->port,
+                                          ch->rx_enable);
     }
     xSemaphoreGive(h->lock);
 

@@ -9,9 +9,9 @@
  *   - 显示/触摸经 middlewares/LCD_Touch 既有接口适配（ui_disp.c）；
  *   - 页面：状态栏 + 播放 / 灯控 / 设置 三个 Tab + 本地音乐列表二级页；
  *   - 已实现模块（MusicPlay / LightControl / CallPhone / wifi_manager）句柄注入后
- *     走真实接口；MusicPlay 目前只接线了源切换（music_play_set_source / get_source），
- *     播放控制 / 音量 / 进度仍是占位日志，待 UI 接线阶段补齐；
- *   - 未注入或未实现的模块（sync_protocol / OTA）触摸后仅 ESP_LOGI 占位提示。
+ *     走真实接口；MusicPlay 已全量接线（源切换、播放/暂停/上下曲、播放模式、音量、
+ *     进度轮询、本地列表，见 scr_player.c / scr_playlist.c，第十一阶段）；
+ *   - 未注入或未实现的模块（sync_protocol / OTA / WiFi 配网）触摸后仅 ESP_LOGI 占位提示。
  *
  * 依赖注入：ui_cfg_t 各句柄可 NULL，NULL 时对应功能为占位显示。
  */
@@ -36,14 +36,14 @@ typedef struct {
     wifi_manager_handle_t  wifi;       /* 网络状态显示：NULL 时状态栏/设置页占位 */
     light_control_handle_t light;      /* 灯控页真实开关：NULL 时本地演示 + 日志 */
     call_phone_handle_t    call_phone; /* 语音状态显示：NULL 时占位 */
-    music_play_handle_t    music;      /* 播放页/设置页源切换：NULL 时占位日志 */
+    music_play_handle_t    music;      /* 播放页全量（控制/显示/列表）：NULL 时占位日志 */
     /* 后续阶段扩展：sync_protocol / OTA；UI 内部已按"NULL = 占位日志"设计 */
 } ui_cfg_t;
 
 /* ======================== API ============================================================ */
 
 /**
- * @brief UI 初始化：SPIFFS storage 挂载 → I2C 总线 → LCD/触摸 → LVGL → 页面 → UI_Task
+ * @brief UI 初始化：SPIFFS storage 挂载 → I2C 总线 → LCD/触摸 → LVGL
  *
  * 调用时机：app_main 中各模块创建之后（LightControl 若要真实控制需先 create
  * 并把句柄传入 cfg）。cfg 可传 NULL，等价于全 NULL（全占位模式）。
@@ -51,6 +51,15 @@ typedef struct {
  * @return ESP_OK 成功；失败时 UI 不可用（屏幕黑屏，详见日志）
  */
 esp_err_t ui_init(const ui_cfg_t *cfg);
+
+/**
+ * @brief UI 任务主体：主题/页面构建 + 事件分发 + LVGL 渲染循环
+ *
+ * 必须在 ui_init() 成功后、由调用方（UI 任务）本任务上下文调用，且不再返回。
+ * 之所以不再由 ui_init() 内部建任务：内部 RAM 紧张时，最大的那块任务栈
+ * 必须在堆还很完整时先分配（见主音频节点开发过程 十三A）。
+ */
+void ui_run(void);
 
 /** @brief 反初始化（整机下电路径使用；正常运行不需要调用） */
 void ui_deinit(void);

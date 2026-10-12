@@ -1,4 +1,5 @@
 #include "LCD_Touch.h"
+#include "i2c_driver.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -80,7 +81,9 @@ static void LCD_SPI_Init(void)
         .csPin        = LCD_TOUCH_SPI_CS,
         .clockSpeedHz = 10 * 1000 * 1000,
         .mode         = 0,
-        .queueSize    = 7,
+        /* LVGL 刷屏走阻塞式 Spi_Transmit，同一设备不会有多笔事务同时在飞，
+         * 队列深度 2 足够；队列对象本身占内部 RAM，不必按默认值放大 */
+        .queueSize    = 2,
     };
     LcdSpiHandle = Spi_Register_Device(&lcdDevCfg);
 
@@ -175,6 +178,10 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
             {
                 ESP_LOGW(TAG, "[FT6336G] read fail #%lu: %s",
                          (unsigned long)s_touchReadFailCount, esp_err_to_name(ret));
+            }
+            if(s_touchReadFailCount % 25 == 0)
+            {
+                (void)I2c_Reset_Bus(I2c_Get_Global_Bus_Handle());
             }
             continue;
         }
@@ -313,8 +320,9 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
 #endif
 
     ESP_LOGI(TAG, "[FT6336G] Step 6: Creating touch processing task...");
-    xTaskCreatePinnedToCore(LCD_TOUCH_FT6336G_Process_Task, "Touch_Task", 8192, NULL, 3, &TouchTaskHandle, 0);
-    ESP_LOGI(TAG, "[FT6336G] Step 6: Task created (Core 0, Priority 5)");
+    /* FT6336G 只做 I2C 轮询 + 快照缓存（栈上仅 6B 缓冲），2KB 足够 */
+    xTaskCreatePinnedToCore(LCD_TOUCH_FT6336G_Process_Task, "Touch_Task", 2048, NULL, 3, &TouchTaskHandle, 0);
+    ESP_LOGI(TAG, "[FT6336G] Step 6: Task created (Core 0, Priority 3)");
 
     ESP_LOGI(TAG, "[FT6336G] Initialization complete!");
 }
@@ -333,7 +341,10 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
 void LCD_Write_Cmd(uint8_t cmd)
 {
     WRITE_CMD_TO_SET_RS();
-    Spi_Transmit(LcdSpiHandle, &cmd, 1);
+    if (Spi_Transmit(LcdSpiHandle, &cmd, 1) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "write cmd 0x%02X failed", cmd);
+    }
 }
 
 /**
@@ -351,7 +362,10 @@ void LCD_Write_Cmd(uint8_t cmd)
 void LCD_Write_Data(uint8_t data)
 {
     WRITE_DATA_TO_SET_RS();
-    Spi_Transmit(LcdSpiHandle, &data, 1);
+    if (Spi_Transmit(LcdSpiHandle, &data, 1) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "write data 0x%02X failed", data);
+    }
 }
 
 /**
@@ -374,7 +388,10 @@ void LCD_Write_Data(uint8_t data)
 void LCD_Write_Data_16Bit(uint16_t data)
 {
     WRITE_DATA_TO_SET_RS();
-    Spi_Transmit_16Bit(LcdSpiHandle, data);
+    if (Spi_Transmit_16Bit(LcdSpiHandle, data) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "write data 0x%04X failed", data);
+    }
 }
 
 /**
@@ -552,7 +569,10 @@ void LCD_Fill_Color(uint16_t color)
 void LCD_Write_PixelData(const uint16_t *data, uint32_t pixelCount)
 {
     WRITE_DATA_TO_SET_RS();
-    Spi_Transmit(LcdSpiHandle, (const uint8_t *)data, pixelCount * 2);	//*2的原因：每个像素占2字节，16位颜色
+    if (Spi_Transmit(LcdSpiHandle, (const uint8_t *)data, pixelCount * 2) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "write %lu pixels failed", (unsigned long)pixelCount);
+    }
 }
 
 /**

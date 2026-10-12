@@ -32,10 +32,13 @@
 
 static const char *TAG = "UI";
 
-/* 渲染缓冲：40 行 × 320 像素 × 2B = 25.6KB（UI 界面设计 2.4；
- * 分配失败时逐级减半到最小 8 行，尽量保住可运行） */
-#define UI_FLUSH_ROWS_MAX   40
-#define UI_FLUSH_ROWS_MIN   8
+/* 渲染缓冲：必须落内部 DMA RAM（LCD 经 SPI DMA 直传），是内部 DRAM 的大头。
+ * 40 行 × 320 像素 × 2B = 25.6KB → 16 行 = 10.2KB → 8 行 = 5.1KB；
+ * 8 行 ≈ 1/30 屏，整屏多 flush 几次，对本 UI（静态页面为主）足够，
+ * 而省下的 5KB 内部 RAM 正好用来放任务栈（见十三A内存记录）。
+ * 分配失败时仍逐级减半到最小 1 行（极端内存下保证 UI 先活过来）。 */
+#define UI_FLUSH_ROWS_MAX   8
+#define UI_FLUSH_ROWS_MIN   1
 
 static i2c_master_bus_handle_t s_i2cBus = NULL;
 
@@ -277,18 +280,23 @@ esp_err_t ui_lvgl_port_init(void)
     lv_display_set_flush_cb(disp, ui_flush_cb);
 
     /* 渲染缓冲：DMA 可达的内部 RAM（LCD 直传给 SPI DMA） */
+    ESP_LOGI(TAG, "DMA heap before flush buffer: free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     while (flushBuf == NULL && rows >= UI_FLUSH_ROWS_MIN)
     {
         flushBuf = heap_caps_malloc(LCD_WIDTH * rows * sizeof(uint16_t),
                                     MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         if (flushBuf == NULL)
         {
-            rows /= 2;
+            rows--;
         }
     }
     if (flushBuf == NULL)
     {
-        ESP_LOGE(TAG, "DMA flush buffer alloc failed");
+        ESP_LOGE(TAG, "DMA flush buffer alloc failed (min=%u bytes, int largest=%u)",
+                 (unsigned)(LCD_WIDTH * UI_FLUSH_ROWS_MIN * sizeof(uint16_t)),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
         return ESP_ERR_NO_MEM;
     }
     bufBytes = LCD_WIDTH * rows * sizeof(uint16_t);

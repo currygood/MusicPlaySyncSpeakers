@@ -26,6 +26,7 @@
 | `W wifi_manager: mcast sendto failed ret=-1 errno=12` | 组播发包失败 | WiFi 省电攒包 + 组播回环 | `WIFI_PS_NONE` + 关 `IP_MULTICAST_LOOP` |
 | 本地曲只出一帧就哑（`pos` 卡 26ms） | 播放一帧后无声 | 同一曲被 open 两遍 | `SELECT_TRACK` 先落 view 再切源 |
 | `SYNC_START sent` 出现在 `stop` 之前 | 从节点会抖 | stop 后补发旧流 SYNC_START | `sync_protocol` 加流代号 `stream_gen` |
+| `AMPLIFIER: volume set: 6%`（唤醒手机助手后） | 本机音量被压到 6%，手机音量键拉满无效 | HFP `+VGS`(0~15) 通话音量流被当成用户音量下发 | +VGS 只记录不跟随（见 4.9） |
 
 ## 3. 核心问题：内部 RAM 不足
 
@@ -215,6 +216,22 @@ music_play.c:929 '%s' directive output may be truncated writing up to 255 bytes 
 ### 4.8 烧录 `A fatal error occurred: The chip stopped responding`
 
 esptool 写 flash 中途 `StopIteration`。非代码问题：串口/USB 链路抖动，或芯片在写 flash 时被复位。重插 USB / 复位后重烧即可（本次一次即恢复）。
+
+### 4.9 语音唤醒唤起手机助手后音量被压到 6%（HFP +VGS ≠ 媒体音量）
+
+现象：语音唤醒 → HFP 上行唤起手机语音助手后，助手应答声音极小，本机音量变成 6%，
+手机音量键拉到最大也没用。
+
+根因：HFP `+VGS`（AG 上报，0~15）是**通话/SCO 音量流**，AVRCP 绝对音量（0~127）是
+**媒体音量流**，两者独立。旧代码把 `+VGS` 归一化成 0~100 后当成用户音量下发
+（`BT_AUDIO_EVT_VOLUME_CHANGED` → 功放 + sync 广播 + NVS 持久化）。手机在助手/通话
+期间常报 `+VGS=1` → 6%，音量被写死；媒体流未变，按媒体音量键不产生新事件，所以调
+不回来。
+
+修复（`bt_audio.c`）：`ESP_HF_CLIENT_VOLUME_CONTROL_EVT` 只记录 `+VGS`，不投事件、
+不改功放、不落 NVS；AVRCP 三个音量入口改传原始 0~127 并打
+`AVRCP abs vol r (0~127) -> n% (media volume, applied)` 日志。详见
+`note/HFP下行无声-声道与音量bug.md` 第 6 节。
 
 ## 5. 经验
 

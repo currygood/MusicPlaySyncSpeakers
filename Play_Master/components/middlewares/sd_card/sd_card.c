@@ -25,6 +25,7 @@
 #include "diskio_impl.h"
 #include "ff.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -491,7 +492,7 @@ static esp_err_t Sd_Read_Sector(uint32_t sector, uint8_t *buffer)
             err = Sd_Rx(buffer, Sd.sector_size);
             if (err == ESP_OK)
             {
-                Sd_Rx(crc, sizeof(crc));    /* CRC 关闭状态，丢弃 */
+                err = Sd_Rx(crc, sizeof(crc));    /* CRC 关闭状态，仅收不校验 */
             }
         }
         else
@@ -881,6 +882,30 @@ static DRESULT Sd_Disk_Ioctl(BYTE pdrv, BYTE ctrl, void *buff)
 /**
  * @brief 注册自定义 diskio 并挂载 FATFS 到 /sdcard
  */
+/**
+ * f_mkfs 工作区（>= FF_MAX_SS）：只在格式化时用一次。
+ * 以前是两份 static [4096] 落内部 DRAM（共 8KB）；现在合并为一份并放 PSRAM
+ * —— bsp/spi_driver 已对非 DMA 缓冲做中转，SD 写盘不再要求缓冲 DMA 可达。
+ */
+static uint8_t *Sd_Mkfs_Work(void)
+{
+    static uint8_t *s_mkfs_work = NULL;
+
+    if (s_mkfs_work == NULL)
+    {
+        s_mkfs_work = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_mkfs_work == NULL)
+        {
+            s_mkfs_work = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (s_mkfs_work != NULL)
+        {
+            memset(s_mkfs_work, 0, 4096);
+        }
+    }
+    return s_mkfs_work;
+}
+
 /** 卸载 + f_mkfs 重建 + 重新挂载；挂载成功后清除一次性格式化标志 */
 static FRESULT sd_mkfs_and_mount(FATFS *fs_obj, const char *drv)
 {
@@ -894,8 +919,13 @@ static FRESULT sd_mkfs_and_mount(FATFS *fs_obj, const char *drv)
     opt.n_root  = 0;                          /* 自动 */
     opt.au_size = 0;                          /* 自动 */
 
-    static uint8_t s_mkfs_work[4096];         /* >= FF_MAX_SS */
-    FRESULT fres = f_mkfs(drv, &opt, s_mkfs_work, sizeof(s_mkfs_work));
+    uint8_t *mkfs_work = Sd_Mkfs_Work();
+    if (mkfs_work == NULL)
+    {
+        ESP_LOGE(TAG, "FORMAT: mkfs work buffer alloc failed");
+        return FR_NOT_ENOUGH_CORE;
+    }
+    FRESULT fres = f_mkfs(drv, &opt, mkfs_work, 4096);
     if (fres != FR_OK)
     {
         ESP_LOGE(TAG, "FORMAT: f_mkfs failed (%d)", (int)fres);
@@ -1086,8 +1116,13 @@ esp_err_t SD_Card_Format(void)
     opt.n_root  = 0;                          /* 自动 */
     opt.au_size = 0;                          /* 自动 */
 
-    static uint8_t s_mkfs_work[4096];         /* >= FF_MAX_SS */
-    res = f_mkfs(drv, &opt, s_mkfs_work, sizeof(s_mkfs_work));
+    uint8_t *mkfs_work = Sd_Mkfs_Work();
+    if (mkfs_work == NULL)
+    {
+        ESP_LOGE(TAG, "FORMAT: mkfs work buffer alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+    res = f_mkfs(drv, &opt, mkfs_work, 4096);
     if (res != FR_OK)
     {
         ESP_LOGE(TAG, "FORMAT: f_mkfs failed (%d)", res);

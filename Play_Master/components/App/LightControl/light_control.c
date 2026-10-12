@@ -33,11 +33,13 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "cJSON.h"
 
@@ -362,7 +364,8 @@ light_control_handle_t light_control_create(const light_control_cfg_t *cfg)
         return NULL;
     }
 
-    h = calloc(1, sizeof(*h));
+    /* 句柄 / 队列 / 信号量放 PSRAM：内部 DRAM 留给任务栈与 DMA（见调试笔记） */
+    h = heap_caps_calloc(1, sizeof(*h), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (h == NULL)
     {
         ESP_LOGE(TAG, "create: no mem");
@@ -375,9 +378,10 @@ light_control_handle_t light_control_create(const light_control_cfg_t *cfg)
     h->on_event          = cfg->on_event;
     h->event_ctx         = cfg->event_ctx;
 
-    h->cmd_q        = xQueueCreate(LC_CMD_QUEUE_LEN, sizeof(light_queue_msg_t));
-    h->lock         = xSemaphoreCreateMutex();
-    h->destroy_done = xSemaphoreCreateBinary();
+    h->cmd_q        = xQueueCreateWithCaps(LC_CMD_QUEUE_LEN,
+                                           sizeof(light_queue_msg_t), MALLOC_CAP_SPIRAM);
+    h->lock         = xSemaphoreCreateMutexWithCaps(MALLOC_CAP_SPIRAM);
+    h->destroy_done = xSemaphoreCreateBinaryWithCaps(MALLOC_CAP_SPIRAM);
     if (h->cmd_q == NULL || h->lock == NULL || h->destroy_done == NULL)
     {
         ESP_LOGE(TAG, "create: queue/sem create failed");
@@ -399,17 +403,17 @@ light_control_handle_t light_control_create(const light_control_cfg_t *cfg)
 fail:
     if (h->cmd_q != NULL)
     {
-        vQueueDelete(h->cmd_q);
+        vQueueDeleteWithCaps(h->cmd_q);
     }
     if (h->lock != NULL)
     {
-        vSemaphoreDelete(h->lock);
+        vSemaphoreDeleteWithCaps(h->lock);
     }
     if (h->destroy_done != NULL)
     {
-        vSemaphoreDelete(h->destroy_done);
+        vSemaphoreDeleteWithCaps(h->destroy_done);
     }
-    free(h);
+    heap_caps_free(h);
     return NULL;
 }
 
@@ -434,10 +438,10 @@ void light_control_destroy(light_control_handle_t h)
         return;
     }
 
-    vQueueDelete(h->cmd_q);
-    vSemaphoreDelete(h->lock);
-    vSemaphoreDelete(h->destroy_done);
-    free(h);
+    vQueueDeleteWithCaps(h->cmd_q);
+    vSemaphoreDeleteWithCaps(h->lock);
+    vSemaphoreDeleteWithCaps(h->destroy_done);
+    heap_caps_free(h);
     ESP_LOGI(TAG, "destroy done");
 }
 

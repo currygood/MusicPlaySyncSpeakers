@@ -40,6 +40,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -1240,7 +1241,8 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
         return NULL;
     }
 
-    h = calloc(1, sizeof(*h));
+    /* 句柄 / 队列 / 信号量都放 PSRAM：内部 DRAM 留给任务栈与 DMA（见调试笔记） */
+    h = heap_caps_calloc(1, sizeof(*h), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (h == NULL)
     {
         ESP_LOGE(TAG, "create: no mem");
@@ -1252,9 +1254,10 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
     h->source_poll_ms = (cfg->source_poll_ms != 0) ? cfg->source_poll_ms
                                                    : MP_SOURCE_POLL_MS_DEFAULT;
 
-    h->lock         = xSemaphoreCreateMutex();
-    h->destroy_done = xSemaphoreCreateBinary();
-    h->cmd_q        = xQueueCreate(MP_CMD_QUEUE_LEN, sizeof(music_msg_t));
+    h->lock         = xSemaphoreCreateMutexWithCaps(MALLOC_CAP_SPIRAM);
+    h->destroy_done = xSemaphoreCreateBinaryWithCaps(MALLOC_CAP_SPIRAM);
+    h->cmd_q        = xQueueCreateWithCaps(MP_CMD_QUEUE_LEN, sizeof(music_msg_t),
+                                           MALLOC_CAP_SPIRAM);
     if (h->lock == NULL || h->destroy_done == NULL || h->cmd_q == NULL)
     {
         ESP_LOGE(TAG, "create: queue/sem create failed: free=%u largest=%u",
@@ -1328,17 +1331,17 @@ fail:
     }
     if (h->cmd_q != NULL)
     {
-        vQueueDelete(h->cmd_q);
+        vQueueDeleteWithCaps(h->cmd_q);
     }
     if (h->lock != NULL)
     {
-        vSemaphoreDelete(h->lock);
+        vSemaphoreDeleteWithCaps(h->lock);
     }
     if (h->destroy_done != NULL)
     {
-        vSemaphoreDelete(h->destroy_done);
+        vSemaphoreDeleteWithCaps(h->destroy_done);
     }
-    free(h);
+    heap_caps_free(h);
     return NULL;
 }
 
@@ -1373,14 +1376,14 @@ esp_err_t music_play_destroy(music_play_handle_t player)
     {
         sync_protocol_master_deinit();
     }
-    vQueueDelete(player->cmd_q);
-    vSemaphoreDelete(player->lock);
-    vSemaphoreDelete(player->destroy_done);
+    vQueueDeleteWithCaps(player->cmd_q);
+    vSemaphoreDeleteWithCaps(player->lock);
+    vSemaphoreDeleteWithCaps(player->destroy_done);
     if (player->tracks != NULL)
     {
         free(player->tracks);
     }
-    free(player);
+    heap_caps_free(player);
     ESP_LOGI(TAG, "destroyed");
     return ESP_OK;
 }

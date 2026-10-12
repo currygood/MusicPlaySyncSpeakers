@@ -70,6 +70,12 @@ i2c_master_bus_handle_t I2c_Get_Global_Bus_Handle(void) {
     return global_i2c_bus;
 }
 
+// 复位 I2C 控制器状态（用于 SDA/SCL 被从设备拉低后的软件恢复）
+esp_err_t I2c_Reset_Bus(i2c_master_bus_handle_t bus_handle) {
+    if (bus_handle == NULL) return ESP_ERR_INVALID_ARG;
+    return i2c_master_bus_reset(bus_handle);
+}
+
 // 在 i2c_driver.c 中添加
 esp_err_t I2c_Write_Bytes(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8_t *buffer, size_t count) {
     // OLED 的逻辑通常是 [控制字节/寄存器] + [连续的数据]

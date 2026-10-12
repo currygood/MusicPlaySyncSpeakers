@@ -10,6 +10,7 @@
 
 #include "ui_priv.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
@@ -99,15 +100,22 @@ void ui_nav_goto(ui_page_t page)
 
 /* ======================== UI_Task 与事件队列 ======================== */
 
-/** UI_Task：Core 1 / 优先级 12 / 栈 13312（架构文档第 6 章任务表） */
-static void ui_task(void *arg)
+/**
+ * UI 任务主体：由 app_main 最早创建的那个任务进入（原因见 ui.h/ui_run）。
+ * 主题与页面构建也放在这里，避免 LVGL 小对象在任务栈分配前先吃光内部 RAM。
+ */
+void ui_run(void)
 {
     light_event_t evt;
     music_event_t mevt;
-    (void)arg;
 
-    ESP_LOGI(TAG, "UI_Task started (core=%d, prio=%d)",
-             (int)xPortGetCoreID(), (int)uxTaskPriorityGet(NULL));
+    s_taskHandle = xTaskGetCurrentTaskHandle();
+    ESP_LOGI(TAG, "UI task running (core=%d, prio=%d, hwm_words=%u)",
+             (int)xPortGetCoreID(), (int)uxTaskPriorityGet(NULL),
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
+    ui_theme_init();
+    ui_pages_create();
 
     for (;;)
     {
@@ -123,6 +131,7 @@ static void ui_task(void *arg)
                xQueueReceive(s_musicEvtQueue, &mevt, 0) == pdTRUE)
         {
             scr_player_apply_event(&mevt);
+            scr_playlist_apply_event(&mevt);
         }
 
         lv_timer_handler();
@@ -238,23 +247,16 @@ esp_err_t ui_init(const ui_cfg_t *cfg)
     ui_boot_selftest();
 #endif
 
-    /* 3) 主题 + 页面构建（此时尚未创建 UI_Task，无并发触碰 LVGL） */
-    ui_theme_init();
-    ui_pages_create();
+    /* 3) 主题 + 页面构建在 ui_run() 里做：LVGL 的 widget/style 都是几百字节的
+     *    小块 malloc，配置 SPIRAM_MALLOC_ALWAYSINTERNAL=4096 时会优先吃内部
+     *    DRAM；先让 UI 任务栈（app_main 最先创建）占住，页面构建不足时落 PSRAM */
 
-    /* 4) 灯控事件队列 + UI_Task（Core 1 / 12 / 13312） */
-    s_lightEvtQueue = xQueueCreate(8, sizeof(light_event_t));
-    s_musicEvtQueue = xQueueCreate(8, sizeof(music_event_t));
+    /* 4) 灯控/播放事件队列（PSRAM：内部 DRAM 留给任务栈与 DMA） */
+    s_lightEvtQueue = xQueueCreateWithCaps(8, sizeof(light_event_t), MALLOC_CAP_SPIRAM);
+    s_musicEvtQueue = xQueueCreateWithCaps(8, sizeof(music_event_t), MALLOC_CAP_SPIRAM);
     if (s_lightEvtQueue == NULL || s_musicEvtQueue == NULL)
     {
         ESP_LOGE(TAG, "event queue create failed");
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (xTaskCreatePinnedToCore(ui_task, "UI_Task", 13312, NULL, 12,
-                                &s_taskHandle, 1) != pdPASS)
-    {
-        ESP_LOGE(TAG, "UI_Task create failed");
         return ESP_ERR_NO_MEM;
     }
 
@@ -284,12 +286,12 @@ void ui_deinit(void)
     }
     if (s_lightEvtQueue != NULL)
     {
-        vQueueDelete(s_lightEvtQueue);
+        vQueueDeleteWithCaps(s_lightEvtQueue);
         s_lightEvtQueue = NULL;
     }
     if (s_musicEvtQueue != NULL)
     {
-        vQueueDelete(s_musicEvtQueue);
+        vQueueDeleteWithCaps(s_musicEvtQueue);
         s_musicEvtQueue = NULL;
     }
     s_inited = false;

@@ -1,255 +1,192 @@
-﻿#include <stdio.h>
-#include <stdlib.h>
+﻿/**
+ * @file app_main.c
+ * @brief 主音频节点应用入口（十三A阶段：最终整合）
+ *
+ * 启动流程（《主音频节点开发过程》十三A阶段）：
+ *   app_main:
+ *     1) nvs_flash_init → node_role_init（NVS 唯一入口，WiFi/OTA 参数来源）
+ *     2) wifi_manager_create/start → 等待拿到 IP
+ *     3) OTA_Update_Init + CheckAndUpgrade（有新固件则下载校验后重启；无则继续）
+ *     4) Microphone_Init → Amplifier_Init（麦克风 RX / 功放 TX 物理链路）
+ *     5) 串行创建各功能任务（前一个 boot 任务跑完退出后再建下一个，
+ *        避免多个 boot 栈同时占内部 DRAM；依赖关系经事件组就绪位衔接）：
+ *        MusicPlay    : SD 卡 + 组播通道 + bt_audio + music_play_create（内部建 MusicPlay_Task）
+ *        CallPhone    : 等蓝牙就绪 → esp-sr 唤醒词检测（内部建 CallPhone_Task）
+ *        LightControl : 等 wifi 就绪 → 灯控组播通道 + light_control_create（内部建 SmartHome_Task）
+ *        UI           : 等各句柄就绪 → ui_init（LCD/触摸屏，内部建 UI_Task）
+ *
+ * 线程/内存约定（见 note/MusicPlay调试笔记.md）：
+ *   - main_task 栈仅 3584B，SD/蓝牙/LVGL/esp-sr 等重活一律单独起任务；
+ *   - 内部 DRAM 是最稀缺资源（WiFi+BT 已占 ~90KB，见调试笔记 3.1 曲线）：
+ *     非 DMA 的大缓冲 / 队列 / 信号量 / 模块句柄一律进 PSRAM，只有任务栈、
+ *     中断上下文与 DMA 描述符留内部 RAM；boot 任务用完即退出回收栈；
+ *   - 任务间只共享句柄与就绪事件位，模块内部常驻任务由各模块 create 自建。
+ */
+
+#include <stdio.h>
 #include <string.h>
-#include <math.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "esp_heap_caps.h"
-#include "esp_timer.h"
-#include <sys/stat.h>
-#include <errno.h>
-#include "driver/gpio.h"
+#include "nvs_flash.h"
+
 #include "StartAndStop.h"
-#include "sd_card.h"
-#include "amplifier.h"
-#include "i2s_driver.h"
+#include "node_role.h"
+#include "wifi_manager.h"
+#include "OTA_Update.h"
 #include "microphone.h"
-#include "LCD_Touch.h"
-#include "i2c_driver.h"
-#include <stdbool.h>
+#include "amplifier.h"
+#include "sd_card.h"
 #include "bt_audio.h"
+#include "sync_protocol.h"
+#include "music_play.h"
 #include "call_phone.h"
 #include "light_control.h"
-#include "music_play.h"
-#include "audio_decoder.h"
-#include <ctype.h>
-#include <dirent.h>
-#include "nvs_flash.h"
-#include "wifi_manager.h"
-#include "node_role.h"
-#include "sync_protocol.h"
 #include "ui.h"
-
 
 static const char *TAG = "AppMain";
 
-/** 一次性格式化开关：第一次烧录置 1（会清空整张卡！）；确认正常后改 0 */
-#define SD_CARD_FORMAT_ONCE 0
+/* ======================== 任务就绪事件位 ======================== */
+/* 各模块初始化在独立任务里完成，依赖方用事件组等待上游就绪 */
 
-/** 输出数据前 16 字节 hex，便于与写入内容逐字节比对 */
-static void Sd_Test_Hex(const char *label, const char *data, size_t len)
-{
-    char line[64];
-    size_t n = 0;
-    size_t show = (len > 16) ? 16 : len;
-    for (size_t i = 0; i < show; i++)
-    {
-        n += snprintf(line + n, sizeof(line) - n, "%02X", (uint8_t)data[i]);
-    }
-    ESP_LOGI(TAG, "%s %s", label, line);
-}
+#define APP_EVT_WIFI_READY   (1 << 0)   /* wifi_manager 已连接并拿到 IP */
+#define APP_EVT_BT_READY     (1 << 1)   /* bt_audio 已创建并启动 */
+#define APP_EVT_MUSIC_READY  (1 << 2)   /* music_play 已创建 */
+#define APP_EVT_CALL_READY   (1 << 3)   /* call_phone 已创建并开始监听 */
+#define APP_EVT_LIGHT_READY  (1 << 4)   /* light_control 已创建 */
 
-static void Sd_Card_Test(void)
-{
-    const char *testFilePath = "/sdcard/test.txt";
-    const char *testData = "Hello SD Card! This is a test message.";
-    uint8_t readBuffer[128] = {0};
-    size_t bytesWritten = 0;
-    size_t bytesRead = 0;
+/* 失败位：供依赖方不再无限等待（值为高位，避免与就绪位混淆） */
+#define APP_EVT_BT_FAILED    (1 << 8)
+#define APP_EVT_MUSIC_FAILED (1 << 9)
+#define APP_EVT_CALL_FAILED  (1 << 10)
+#define APP_EVT_LIGHT_FAILED (1 << 11)
 
-    ESP_LOGI(TAG, "=== SD Card Test Start ===");
+/* ======================== 常量 ======================== */
 
-#if SD_CARD_FORMAT_ONCE
-    SD_Card_Set_Format_Once(true);
-#endif
+/** 蓝牙广播名（主节点） */
+#define APP_BT_DEVICE_NAME      "MPS-Sync-Speaker"
 
-    esp_err_t ret = SD_Card_Init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "SD_Card_Init failed: %d", ret);
-        return;
-    }
-    ESP_LOGI(TAG, "SD Card init success, mount point: %s", SD_Card_Get_Mount_Point());
+/** 灯控组播通道（分层设计 3.4.2：239.0.0.2:8889，代码常量不入 NVS） */
+#define APP_LIGHT_MCAST_GROUP   "239.0.0.2"
+#define APP_LIGHT_MCAST_PORT    8889
 
-    sd_card_file_handle_t file = SD_Card_Open(testFilePath, "w");
-    if (file == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to open file for writing: %s", testFilePath);
-        return;
-    }
+/** WiFi 等待 IP 超时（轮询 100ms x 200 = 20s） */
+#define APP_WIFI_WAIT_TRIES     200
 
-    ret = SD_Card_Write(file, testData, strlen(testData), &bytesWritten);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "SD_Card_Write failed: %d", ret);
-        SD_Card_Close(file);
-        return;
-    }
-    ESP_LOGI(TAG, "Write %d bytes to %s", bytesWritten, testFilePath);
-    Sd_Test_Hex("written:  ", testData, strlen(testData));
+/** 各 boot 任务栈/优先级（mp/cp/lc 创建完即退出；UI 任务常驻，见下） */
+#define APP_BOOT_TASK_PRIO      5
+#define APP_MUSIC_TASK_STACK    4096
+#define APP_CALL_TASK_STACK     4096
+#define APP_LIGHT_TASK_STACK    3072
+/* UI 任务栈最大，必须趁内部堆还没被 WiFi/BT/其它任务切碎时最先创建；
+ * 10240（原 UI_Task 13312）：省 3KB，实际水位由 ui_run() 打印 hwm_words 复核 */
+#define APP_UI_TASK_STACK       10240
+#define APP_UI_TASK_PRIO        12
 
-    SD_Card_Close(file);
-    ESP_LOGI(TAG, "File closed after writing");
-    SD_Card_Diag_File();   /* FAT 层诊断：目录项/FAT/物理数据扇区 */
+/** 依赖等待超时（ms）：上游异常时避免永久挂起 */
+#define APP_DEP_WAIT_MS         60000
 
-    file = SD_Card_Open(testFilePath, "r");
-    if (file == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to open file for reading: %s", testFilePath);
-        return;
-    }
+/* ======================== 全局运行上下文 ======================== */
 
-    memset(readBuffer, 0, sizeof(readBuffer));
-    ret = SD_Card_Read(file, readBuffer, sizeof(readBuffer) - 1, &bytesRead);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "SD_Card_Read failed: %d", ret);
-        SD_Card_Close(file);
-        return;
-    }
-    readBuffer[bytesRead] = '\0';
-    ESP_LOGI(TAG, "Read %d bytes from %s: \"%s\"", bytesRead, testFilePath, (char *)readBuffer);
-    Sd_Test_Hex("readback: ", (const char *)readBuffer, bytesRead);
+/** 各任务共享的句柄与就绪事件组（只写一次、读取方判空） */
+typedef struct {
+    EventGroupHandle_t     evt;         /* 就绪/失败事件位 */
+    wifi_manager_handle_t  wifi;
+    bt_audio_handle_t      bt;
+    wifi_mcast_handle_t    audio_chan;  /* 音频通道 239.0.0.1:5678（只发） */
+    wifi_mcast_handle_t    control_chan;/* 控制通道 239.0.0.1:5679（收发） */
+    wifi_mcast_handle_t    light_chan;  /* 灯控通道 239.0.0.2:8889（收发） */
+    music_play_handle_t    music;
+    call_phone_handle_t    call;
+    light_control_handle_t light;
+} app_ctx_t;
 
-    if (strcmp((char *)readBuffer, testData) == 0)
-    {
-        ESP_LOGI(TAG, "Read data matches written data! Test PASS");
-    }
-    else
-    {
-        ESP_LOGE(TAG, "Read data does NOT match! Test FAIL");
-    }
+static app_ctx_t s_app;
 
-    SD_Card_Close(file);
-    ESP_LOGI(TAG, "File closed after reading");
-
-    ret = remove(testFilePath);
-    if (ret == 0)
-    {
-        ESP_LOGI(TAG, "File deleted successfully: %s", testFilePath);
-    }
-    else
-    {
-        ESP_LOGE(TAG, "Failed to delete file: %s (error: %d)", testFilePath, ret);
-    }
-
-    file = SD_Card_Open(testFilePath, "r");
-    if (file == NULL)
-    {
-        ESP_LOGI(TAG, "File not found after deletion - confirmed! Test PASS");
-    }
-    else
-    {
-        ESP_LOGE(TAG, "File still exists after deletion! Test FAIL");
-        SD_Card_Close(file);
-    }
-
-    ESP_LOGI(TAG, "=== SD Card Test End ===");
-}
-
-#define BEEP_FREQ_HZ        800      /* 方波频率（Hz），听感接近“嘟” */
-#define BEEP_SAMPLE_RATE    44100    /* 与功放总线采样率一致（全链路固定 44.1kHz） */
-#define BEEP_AMPLITUDE      6000     /* 幅度，避免大音量削波 */
-#define BEEP_ON_MS          250      /* 每次鸣响时长 */
-#define BEEP_OFF_MS         250      /* 每次静音时长 */
-#define BEEP_TOTAL_MS       5000     /* 总时长：5 秒 → 10 声“嘟” */
-#define BEEP_CHUNK_SAMPLES  512      /* 每块采样数（512/44.1k ≈ 11.6ms） */
-
-/* ======================== 持续正弦波输出测试（示波器） ============================ */
-
-#define SINE_FREQ_HZ     1000     /* 正弦波频率（Hz） */
-#define SINE_AMPLITUDE   32000    /* 满幅输出：排除“音量太小”听不见的可能 */
-
-
-
-/* ======================== 共用 SPI2 的测试任务 ========================
- * SD 卡测试与 LCD+触摸测试分时复用同一条 SPI2 总线：
- * 先跑 SD 任务（初始化总线），完成后通知 LCD 任务开始初始化/刷屏。
+/**
+ * HFP 下行单声道 → 立体声扩展缓冲（bt_audio 任务上下文，非 ISR/DMA）
+ *
+ * 内部 DRAM 是最稀缺资源（WiFi + BT 已占 ~90KB）：这类"大数据缓冲"一律放
+ * PSRAM，只把任务栈 / DMA 描述符留给内部 RAM。分配失败时回退内部 RAM。
  */
+#define APP_HFP_DN_STEREO_SAMPLES  2048
+static int16_t *s_hfpDnStereoBuf = NULL;
 
-#if LCD_TOUCH_SELF_TEST
-extern void Lcd_Touch_Test(void);   /* LCD_Touch.c 内部自检入口，非公共 API */
-#endif
+/* ======================== 通用工具 ======================== */
 
-static TaskHandle_t s_lcdTestTask = NULL;
-
-/** SD 卡测试任务：跑完文件系统测试后通知 LCD 任务 */
-static void Sd_Card_Test_Task(void *arg)
+/**
+ * 打印内部 DRAM / DMA 可用内部 RAM / PSRAM 余量（内存紧张时定位用，见调试笔记）
+ *
+ * "dma" 那一栏最关键：SPI 等外设驱动的收发缓冲只能落在
+ * MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL 区，这一栏一旦见底，任何一笔
+ * "驱动私有 bounce 缓冲"的分配都会失败（原因见 spi_driver.c 顶部说明）。
+ */
+static void App_Log_Heap(const char *stage)
 {
-    Sd_Card_Test();
-
-    if (s_lcdTestTask != NULL)
-    {
-        xTaskNotifyGive(s_lcdTestTask);
-    }
-    vTaskDelete(NULL);
+    ESP_LOGI(TAG, "[heap] %s: int free=%u largest=%u | dma free=%u largest=%u | psram free=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
-/** LCD + 触摸测试任务：等 SD 测试完成通知后开始（内部 while(1)） */
-static void Lcd_Touch_Test_Task(void *arg)
+/**
+ * @brief 等待事件位（就绪位或失败位任一即可唤醒），超时仅告警
+ *
+ * @param bits       关心的位（就绪 | 失败）
+ * @param timeout_ms 超时（ms）
+ * @param what       日志用名称
+ * @return 已置位的事件位
+ */
+static EventBits_t App_Wait_Bits(EventBits_t bits, uint32_t timeout_ms, const char *what)
 {
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(60000));   /* 最多等 60s，防死锁 */
-
-#if LCD_TOUCH_SELF_TEST
-    Lcd_Touch_Test();
-#endif
-    vTaskDelete(NULL);
+    EventBits_t got = xEventGroupWaitBits(s_app.evt, bits, pdFALSE, pdFALSE,
+                                          pdMS_TO_TICKS(timeout_ms));
+    if ((got & bits) == 0)
+    {
+        ESP_LOGW(TAG, "wait %s timeout (%u ms)", what, (unsigned)timeout_ms);
+    }
+    return got;
 }
 
-
-/* ======================== 蓝牙 A2DP 测试（bt_audio 模块） ======================= */
-
-static bool s_btA2dpConnected = false;
-static TaskHandle_t s_btHfpTestTask = NULL;   /* HFP 语音测试任务句柄 */
-
-static int16_t s_hfpDnStereoBuf[2048];
-
-/** bt_audio PCM 回调（bt_audio 任务上下文）：直喂功放验证音频链路 */
-static void App_Bt_Pcm_Cb(bt_audio_pcm_source_t source, const int16_t *pcm,
-                          size_t samples, uint32_t sample_rate, void *user_ctx)
+/**
+ * @brief 创建 boot 引导任务，创建失败必须显式上报
+ *
+ * 内部 RAM 紧张时 xTaskCreatePinnedToCore 会返回失败；此前未检查返回值，
+ * UI 引导任务静默消失（无任何日志），排查代价很高（见十三A记录）。
+ * 失败时同步置 FAILED 位，依赖方不必等满超时即可降级继续。
+ */
+static bool App_Boot_Task_Create(TaskFunction_t entry, const char *name,
+                                 uint32_t stack_bytes, UBaseType_t prio, BaseType_t core,
+                                 EventBits_t failed_bit)
 {
-    (void)sample_rate;
-    (void)user_ctx;
-
-    if (pcm == NULL || samples == 0)
+    if (xTaskCreatePinnedToCore(entry, name, stack_bytes, NULL, prio,
+                                NULL, core) == pdPASS)
     {
-        return;
+        return true;
     }
-    /* A2DP 需等连接；HFP 下行（44.1kHz 单声道）直接播放便于测试应答 */
-    if (source == BT_AUDIO_PCM_SOURCE_A2DP && !s_btA2dpConnected)
-    {
-        return;
-    }
-
-    /* HFP 下行是 44.1kHz 单声道，而功放总线为双声道（L/R 写同一份）：
-     * 单声道原样写入会被当作双声道帧解析（且字节数常非 4 的倍数，
-     * i2s_channel_write 会拒绝），必须先扩为立体声再交给功放。 */
-    if (source == BT_AUDIO_PCM_SOURCE_HFP_DOWNLINK)
-    {
-        if (samples > (sizeof(s_hfpDnStereoBuf) / (2 * sizeof(int16_t))))
-        {
-            ESP_LOGW(TAG, "HFP mono chunk too large: %u", (unsigned)samples);
-            return;
-        }
-        int16_t *out = s_hfpDnStereoBuf;
-        for (size_t i = 0; i < samples; i++)
-        {
-            out[i * 2]     = pcm[i];
-            out[i * 2 + 1] = pcm[i];
-        }
-        Amplifier_Play_Buffer((const uint8_t *)out, samples * 4, NULL, 200);
-        return;
-    }
-
-    Amplifier_Play_Buffer((const uint8_t *)pcm, samples * sizeof(int16_t), NULL, 200);
+    ESP_LOGE(TAG, "[boot] %s create failed (stack=%u, int free=%u largest=%u)",
+             name, (unsigned)stack_bytes,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    xEventGroupSetBits(s_app.evt, failed_bit);
+    return false;
 }
 
-/** bt_audio 事件回调：打印连接/流状态，并同步播放开关 */
-static void App_Bt_Evt_Cb(const bt_audio_event_t *evt, void *user_ctx)
+/* ======================== WiFi ======================== */
+
+/** wifi_manager 事件回调：仅打印状态变化 */
+static void App_Wifi_Evt_Cb(const wifi_mgr_event_t *evt, void *ctx)
 {
-    (void)user_ctx;
+    (void)ctx;
     if (evt == NULL)
     {
         return;
@@ -257,733 +194,11 @@ static void App_Bt_Evt_Cb(const bt_audio_event_t *evt, void *user_ctx)
 
     switch (evt->id)
     {
-    case BT_AUDIO_EVT_A2DP_CONNECTED:
-        ESP_LOGI(TAG, "A2DP connected");
-        s_btA2dpConnected = true;
-        break;
-    case BT_AUDIO_EVT_A2DP_DISCONNECTED:
-        ESP_LOGI(TAG, "A2DP disconnected");
-        s_btA2dpConnected = false;
-        break;
-    case BT_AUDIO_EVT_A2DP_STREAM_STARTED:
-        ESP_LOGI(TAG, "A2DP stream started");
-        break;
-    case BT_AUDIO_EVT_A2DP_STREAM_STOPPED:
-        ESP_LOGI(TAG, "A2DP stream stopped");
-        break;
-    case BT_AUDIO_EVT_A2DP_SAMPLE_RATE_CHANGED:
-        ESP_LOGI(TAG, "A2DP sample rate: %lu Hz", (unsigned long)evt->data.sample_rate);
-        break;
-    case BT_AUDIO_EVT_HFP_CONNECTED:
-        ESP_LOGI(TAG, "HFP SLC connected");
-        if (s_btHfpTestTask != NULL)
-        {
-            xTaskNotifyGive(s_btHfpTestTask);
-        }
-        break;
-    case BT_AUDIO_EVT_HFP_DISCONNECTED:
-        ESP_LOGI(TAG, "HFP SLC disconnected");
-        break;
-    case BT_AUDIO_EVT_HFP_AUDIO_OPEN:
-        ESP_LOGI(TAG, "HFP SCO open (%lu Hz)", (unsigned long)evt->data.sample_rate);
-        break;
-    case BT_AUDIO_EVT_HFP_AUDIO_CLOSE:
-        ESP_LOGI(TAG, "HFP SCO closed");
-        break;
-    case BT_AUDIO_EVT_PLAY_STATE_CHANGED:
-        ESP_LOGI(TAG, "AVRCP play state: %d", evt->data.play_state);
-        break;
-    case BT_AUDIO_EVT_TRACK_CHANGED:
-        ESP_LOGI(TAG, "AVRCP track changed");
-        break;
-    case BT_AUDIO_EVT_TRACK_INFO:
-        ESP_LOGI(TAG, "AVRCP track: %s | %s | %s (dur=%lu ms)",
-                 evt->data.track_info.title,
-                 evt->data.track_info.artist,
-                 evt->data.track_info.album,
-                 (unsigned long)evt->data.track_info.duration_ms);
-        break;
-    case BT_AUDIO_EVT_VOLUME_CHANGED:
-    {
-        /* 手机侧调音量（HFP +VGS / AVRCP 绝对音量，bt_audio 已统一为 0~100）
-         * → 同步本机功放（0% 即静音，属正常用户设置，不做下限处理）。 */
-        ESP_LOGI(TAG, "volume change: phone=%u%%", evt->data.volume);
-        Amplifier_Set_Volume(evt->data.volume);
-        break;
-    }
-    default:
-        break;
-    }
-}
-
-/** HFP 语音测试任务：HFP SLC 连接后自动发送 AT+BVRA=1 唤醒手机语音助手 */
-static void BtHfp_Test_Task(void *arg)
-{
-    bt_audio_handle_t audio = (bt_audio_handle_t)arg;
-
-    ESP_LOGI(TAG, "HFP test: waiting for HFP SLC connected...");
-    for (;;)
-    {
-        /* 等待 HFP SLC 建立（事件回调通知） */
-        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000)) != pdTRUE)
-        {
-            continue;   /* 超时未连接，继续等待 */
-        }
-
-        /* SLC 刚建立，稍作延迟再发送激活命令 */
-        vTaskDelay(pdMS_TO_TICKS(500));
-
-        esp_err_t err = bt_audio_hfp_start_voice(audio);
-        if (err != ESP_OK)
-        {
-            ESP_LOGW(TAG, "HFP start_voice failed: %s", esp_err_to_name(err));
-            continue;
-        }
-        ESP_LOGI(TAG, "HFP start_voice OK, waiting SCO open...");
-
-        /* 等待 SCO 打开（手机语音助手界面出现） */
-        if (bt_audio_hfp_wait_audio_open(audio, 5000) == ESP_OK)
-        {
-            ESP_LOGI(TAG, "HFP SCO opened! 下行应答已送往功放（如手机有播报会听到）");
-        }
-        else
-        {
-            ESP_LOGW(TAG, "HFP SCO not opened within 5s");
-        }
-    }
-}
-
-/** ===== 临时测试：HFP 上行（麦克风 -> SCO -> 手机） =====
- *  验证用：读 INMP441 -> 去交错选槽 -> 44.1kHz 单声道 -> bt_audio_hfp_send_pcm
- *  等 CallPhone 实现后由它接管这条链路，本任务删除。
- */
-static void BtHfp_UpTest_Task(void *arg)
-{
-    bt_audio_handle_t audio = (bt_audio_handle_t)arg;
-    int16_t raw[512];    /* 交错双槽样本（每 I2S 帧 2 个槽） */
-    int16_t mono[256];   /* 去交错后的单声道 PCM */
-    int keepLane = -1;   /* 语音所在槽位（首次能量统计后固定） */
-    uint32_t drops = 0;
-
-    esp_err_t ret;
-    ESP_LOGI(TAG, "HFP up test: mic ready, waiting SCO open...");
-
-    for (;;)
-    {
-        /* SCO 未打开就不读麦克风，避免白丢数据 */
-        if (!bt_audio_hfp_is_audio_open(audio))
-        {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        size_t got = 0;
-        ret = Microphone_Read_Pcm16(raw, sizeof(raw) / sizeof(raw[0]), &got, pdMS_TO_TICKS(1000));
-        if (ret != ESP_OK || got < 2)
-        {
-            continue;
-        }
-
-        size_t frames = got / 2;   /* 每帧两个槽 */
-        size_t lane0 = 0, lane1 = 0;
-        for (size_t i = 0; i < frames; i++)
-        {
-            int a = raw[i * 2 + 0];
-            int b = raw[i * 2 + 1];
-            lane0 += (a < 0) ? (size_t)(-a) : (size_t)a;
-            lane1 += (b < 0) ? (size_t)(-b) : (size_t)b;
-        }
-        if (keepLane < 0)
-        {
-            keepLane = (lane0 >= lane1) ? 0 : 1;
-            ESP_LOGI(TAG, "HFP up test: keep I2S slot %d", keepLane);
-        }
-        for (size_t i = 0; i < frames; i++)
-        {
-            mono[i] = raw[i * 2 + keepLane];
-        }
-
-        esp_err_t sret = bt_audio_hfp_send_pcm(audio, mono, frames, 50);
-        if (sret != ESP_OK)
-        {
-            if (++drops % 100 == 1)
-            {
-                ESP_LOGW(TAG, "HFP up test: send_pcm %s", esp_err_to_name(sret));
-            }
-        }
-    }
-}
-
-/** AVRCP 测试任务：手机连接后依次发控制命令 + 分档调音量（UI 音量走 set_volume） */
-static void BtAvrc_Test_Task(void *arg)
-{
-    bt_audio_handle_t audio = (bt_audio_handle_t)arg;
-    static const bt_audio_cmd_t seq[] = {
-        BT_AUDIO_CMD_TOGGLE_PLAY,   /* 按当前播放状态自动播放/暂停 */
-        BT_AUDIO_CMD_PLAY,
-        BT_AUDIO_CMD_PAUSE,
-        BT_AUDIO_CMD_NEXT,
-        BT_AUDIO_CMD_PREV,
-        BT_AUDIO_CMD_VOLUME_UP,     /* 走 SetAbsoluteVolume */
-        BT_AUDIO_CMD_VOLUME_DOWN,
-    };
-
-    ESP_LOGI(TAG, "AVRCP test: waiting for phone A2DP connected...");
-    while (!s_btA2dpConnected)
-    {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    vTaskDelay(pdMS_TO_TICKS(1500));   /* 给 AVRCP 链路建立留时间 */
-
-    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
-    {
-        esp_err_t err = bt_audio_send_ctrl_cmd(audio, seq[i]);
-        ESP_LOGI(TAG, "AVRCP ctrl cmd %d -> %s", seq[i], esp_err_to_name(err));
-        vTaskDelay(pdMS_TO_TICKS(1200));
-    }
-
-    /* 音量分档测试（UI 旋钮/按键最终都调 bt_audio_set_volume） */
-    static const uint8_t vols[] = { 100, 70, 40, 10, 60, 85 };
-    for (size_t i = 0; i < sizeof(vols) / sizeof(vols[0]); i++)
-    {
-        esp_err_t err = bt_audio_set_volume(audio, vols[i]);
-        Amplifier_Set_Volume(vols[i]);   /* 测试：本机功放音量跟随 */
-        ESP_LOGI(TAG, "set volume %u -> %s", vols[i], esp_err_to_name(err));
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-
-    /* 曲目/状态查询（元数据事件也已在 App_Bt_Evt_Cb 打印） */
-    const bt_audio_track_info_t *ti = NULL;
-    esp_err_t err = bt_audio_get_track_info(audio, &ti);
-    if (err == ESP_OK && ti != NULL)
-    {
-        ESP_LOGI(TAG, "query track: %s | %s | %s", ti->title, ti->artist, ti->album);
-    }
-    else
-    {
-        ESP_LOGW(TAG, "get_track_info: %s", esp_err_to_name(err));
-    }
-
-    bt_audio_play_state_t st = BT_AUDIO_PLAY_STATE_UNKNOWN;
-    err = bt_audio_get_play_state(audio, &st);
-    if (err == ESP_OK)
-    {
-        ESP_LOGI(TAG, "query play state: %d", st);
-    }
-
-    ESP_LOGI(TAG, "AVRCP test done, volume=%u", bt_audio_get_volume(audio));
-    vTaskDelete(NULL);
-}
-
-/** 蓝牙 A2DP 测试：创建并启动 bt_audio，等手机连接后 on_pcm 直连功放 */
-static void BtA2dp_Test(void)
-{
-    /* 注意：必须先初始化麦克风（I2S RX）再初始化功放（I2S TX），否则麦克风不可用 */
-    esp_err_t ret = Microphone_Init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Microphone_Init failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    ret = Amplifier_Init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Amplifier_Init failed: %s", esp_err_to_name(ret));
-        Microphone_Deinit();
-        return;
-    }
-    Amplifier_Set_Volume(100);
-
-    bt_audio_cfg_t cfg = {
-        .device_name = "MPS-Sync-Test",
-        .on_pcm      = App_Bt_Pcm_Cb,
-        .on_event    = App_Bt_Evt_Cb,
-    };
-    bt_audio_handle_t audio = bt_audio_create(&cfg);
-    if (audio == NULL)
-    {
-        ESP_LOGE(TAG, "bt_audio_create failed");
-        Amplifier_Deinit();
-        return;
-    }
-
-    ret = bt_audio_start(audio);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "bt_audio_start failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    ESP_LOGI(TAG, "A2DP test: waiting for phone...");
-    ESP_LOGI(TAG, "free heap after bt start: internal=%lu B, psram=%lu B",
-             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
-    // /* HFP 语音测试任务：SLC 连接后自动唤醒手机语音助手 */
-    // if (xTaskCreate(BtHfp_Test_Task, "bt_hfp_test", 8192, audio, 5,
-    //                 &s_btHfpTestTask) != pdPASS)
-    // {
-    //     ESP_LOGE(TAG, "bt_hfp_test task create failed");
-    // }
-
-    /* AVRCP 测试任务：连接后自动发控制命令 + 音量分档 */
-    if (xTaskCreate(BtAvrc_Test_Task, "bt_avrc_test", 8192, audio, 5, NULL) != pdPASS)
-    {
-        ESP_LOGE(TAG, "bt_avrc_test task create failed");
-    }
-
-    // /* ===== 临时测试：麦克风上行 -> bt_audio -> 手机（CallPhone 落地后删除） ===== */
-    // if (xTaskCreatePinnedToCore(BtHfp_UpTest_Task, "bt_hfp_uptest",
-    //                             8192, audio, 5, NULL, 1) != pdPASS)
-    // {
-    //     ESP_LOGE(TAG, "bt_hfp_uptest task create failed");
-    // }
-}
-
-/* ======================== 第四阶段：CallPhone 接线测试 ======================== */
-
-/*
- * 接线顺序（见《主音频节点开发过程》第四阶段）：
- *   Microphone_Init()（INMP441 + 麦克风 FIFO）→ bt_audio_create
- *   → call_phone_create
- *
- * 说明：麦克风 FIFO 由 microphone 模块统一管理，call_phone 直接
- * 通过 Microphone_Read_* 读取，无需再暴露总线句柄。
- */
-
-/* 监视任务上下文 */
-typedef struct {
-    call_phone_handle_t cp;
-    bt_audio_handle_t   audio;   /* 供打印 SCO 状态 */
-} call_test_ctx_t;
-
-/** 演示用：STREAMING 持续 CALL_STREAM_KEEP_SECS 秒后自动挂断 */
-#define CALL_STREAM_KEEP_SECS  20
-
-static const char *Call_State_Name(call_phone_state_t state)
-{
-    switch (state)
-    {
-    case CALL_PHONE_STATE_IDLE:       return "IDLE";
-    case CALL_PHONE_STATE_LISTENING:  return "LISTENING";
-    case CALL_PHONE_STATE_CONNECTING: return "CONNECTING";
-    case CALL_PHONE_STATE_STREAMING:  return "STREAMING";
-    default:                          return "??";
-    }
-}
-
-/** CallPhone 状态监视任务：打印状态迁移 + 自动挂断演示 + 周期打印内存 */
-static void CallPhone_Test_Monitor(void *arg)
-{
-    call_test_ctx_t    *ctx  = (call_test_ctx_t *)arg;
-    call_phone_state_t  last = CALL_PHONE_STATE_IDLE;
-    uint32_t            stream_sec = 0;
-    uint32_t            tick = 0;
-    call_phone_state_t  st;
-
-    for (;;)
-    {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-
-        if (call_phone_get_state(ctx->cp, &st) != ESP_OK)
-        {
-            continue;
-        }
-
-        if (st != last)
-        {
-            ESP_LOGI(TAG, "CallPhone state: %s -> %s",
-                     Call_State_Name(last), Call_State_Name(st));
-            last = st;
-            stream_sec = 0;
-        }
-
-        if (st == CALL_PHONE_STATE_STREAMING)
-        {
-            stream_sec++;
-            ESP_LOGI(TAG, "CallPhone streaming: SCO %s, %u s",
-                     bt_audio_hfp_is_audio_open(ctx->audio) ? "open" : "closed",
-                     (unsigned int)stream_sec);
-            if (stream_sec >= CALL_STREAM_KEEP_SECS)
-            {
-                ESP_LOGI(TAG, "CallPhone demo: auto hangup after %u s",
-                         (unsigned int)stream_sec);
-                call_phone_hangup(ctx->cp);
-                stream_sec = 0;
-                last = CALL_PHONE_STATE_IDLE;   /* 强制下一轮打印回 LISTENING */
-            }
-        }
-        else if (st == CALL_PHONE_STATE_CONNECTING && (++stream_sec % 5) == 0)
-        {
-            ESP_LOGI(TAG, "CallPhone connecting: waiting SCO open %u s...",
-                     (unsigned int)stream_sec);
-        }
-
-        /* 每 10s 打印内存余量（对照阶段三问题6：内部 RAM 紧张） */
-        if (++tick % 10 == 0)
-        {
-            ESP_LOGI(TAG, "CallPhone heap: internal=%lu B, psram=%lu B",
-                     (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                     (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-        }
-    }
-}
-
-/** 第四阶段接线测试：Microphone_Init()（RX 总线）→ bt_audio_create → call_phone_create */
-static void CallPhone_Test(void)
-{
-    esp_err_t ret;
-
-    /* 1) microphone 模块初始化（自建 RX 总线 + INMP441 使能；先于 TX） */
-    ret = Microphone_Init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Microphone_Init failed: %s", esp_err_to_name(ret));
-        return;
-    }
-
-    /* 2) 功放（TX）——HFP 下行经 on_pcm 播放 */
-    ret = Amplifier_Init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Amplifier_Init failed: %s", esp_err_to_name(ret));
-        Microphone_Deinit();
-        return;
-    }
-    Amplifier_Set_Volume(100);
-
-    /* 3) bt_audio：复用 HFP 能力 + 下行/事件回调 */
-    bt_audio_cfg_t bt_cfg = {
-        .device_name = "MPS-Sync-Test",
-        .on_pcm      = App_Bt_Pcm_Cb,
-        .on_event    = App_Bt_Evt_Cb,
-    };
-    bt_audio_handle_t audio = bt_audio_create(&bt_cfg);
-    if (audio == NULL)
-    {
-        ESP_LOGE(TAG, "bt_audio_create failed");
-        Amplifier_Deinit();
-        Microphone_Deinit();
-        return;
-    }
-
-    ret = bt_audio_start(audio);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "bt_audio_start failed: %s", esp_err_to_name(ret));
-        return;
-    }
-
-    /* 4) CallPhone：esp-sr 唤醒词检测 + HFP 上行（读 microphone FIFO） */
-    call_phone_cfg_t cp_cfg = {
-        .audio          = audio,
-        .sample_rate    = 44100,
-    };
-    call_phone_handle_t cp = call_phone_create(&cp_cfg);
-    if (cp == NULL)
-    {
-        ESP_LOGE(TAG, "call_phone_create failed");
-        return;
-    }
-
-    ret = call_phone_start_listening(cp);
-    ESP_LOGI(TAG, "CallPhone start listening: %s (唤醒词: 你好小智)",
-             esp_err_to_name(ret));
-    if (ret != ESP_OK)
-    {
-        return;
-    }
-
-    /* 5) 状态监视任务（状态迁移 / 自动挂断 / 内存监视） */
-    call_test_ctx_t *ctx = (call_test_ctx_t *)calloc(1, sizeof(*ctx));
-    if (ctx != NULL)
-    {
-        ctx->cp = cp;
-        ctx->audio = audio;
-        if (xTaskCreatePinnedToCore(CallPhone_Test_Monitor, "call_mon",
-                                    4096, ctx, 5, NULL, 1) != pdPASS)
-        {
-            ESP_LOGE(TAG, "call_phone monitor task create failed");
-            free(ctx);
-        }
-    }
-
-    ESP_LOGI(TAG, "CallPhone phase-4 test ready: 请连接手机并说 你好小智");
-    ESP_LOGI(TAG, "free heap after bt+callphone: internal=%lu B, psram=%lu B",
-             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-}
-
-/* ======================== audio_decoder（SD 卡 MP3 播放）测试 ===================== */
-
-/** 测试音乐目录：SD 卡 FATFS 挂载点 /sdcard/music */
-#define AUDIO_DEC_TEST_DIR  SD_CARD_MOUNT_POINT "/music"
-
-/** 单声道→立体声扩展缓冲容量（minimp3 单帧上限 1152 采样/声道 × 2 声道 × 2 缓冲） */
-#define AUDIO_DEC_STEREO_BUF_SAMPLES  (1152 * 2 * 2)
-
-/** 测试超时基线：估不出时长时最多播放 60s */
-#define AUDIO_DEC_TEST_TIMEOUT_MS     60000
-
-/** 单声道→立体声扩展工作缓冲（测试回调使用） */
-static int16_t *s_audDecStereoBuf = NULL;
-
-/** 音频解码测试状态（事件回调写入，主测试循环轮询） */
-static volatile bool s_audDecTestEof = false;
-static volatile bool s_audDecTestErr = false;
-static volatile uint64_t s_audDecTestBytes = 0;  /* 统计：累计回调输出字节 */
-
-/** audio_decoder 事件回调：打印 READY，EOF/ERROR 记录到测试状态 */
-static void Audio_Dec_Test_Evt_Cb(audio_decoder_event_id_t event,
-                                  const audio_decoder_info_t *info,
-                                  void *user_ctx)
-{
-    (void)user_ctx;
-    if (event == AUDIO_DECODER_EVT_READY && info != NULL)
-    {
-        ESP_LOGI(TAG, "decoder READY: %luHz/%uch dur=%lums bitrate=%lubps",
-                 (unsigned long)info->sample_rate, info->channels,
-                 (unsigned long)info->duration_ms,
-                 (unsigned long)info->bitrate_bps);
-    }
-    else if (event == AUDIO_DECODER_EVT_EOF)
-    {
-        s_audDecTestEof = true;
-        ESP_LOGI(TAG, "decoder EOF");
-    }
-    else if (event == AUDIO_DECODER_EVT_ERROR)
-    {
-        s_audDecTestErr = true;
-        ESP_LOGE(TAG, "decoder ERROR");
-    }
-}
-
-/** audio_decoder PCM 回调：不经 sync_protocol，PCM 直接进功放播放 */
-static void Audio_Dec_Test_Pcm_Cb(const int16_t *pcm, size_t samples,
-                                  uint32_t sample_rate, uint8_t channels,
-                                  void *user_ctx)
-{
-    (void)user_ctx;
-
-    if (pcm == NULL || samples == 0)
-    {
-        return;
-    }
-    s_audDecTestBytes += samples * sizeof(int16_t);
-
-    /* 全链路固定 44.1kHz：非 44.1kHz 文件播放速率会偏移，仅提示一次 */
-    if (sample_rate != AMPLIFIER_SAMPLE_RATE)
-    {
-        static bool warned = false;
-        if (!warned)
-        {
-            warned = true;
-            ESP_LOGW(TAG, "mp3 sample_rate=%lu != %d，速率不准确（建议 44.1kHz）",
-                     (unsigned long)sample_rate, AMPLIFIER_SAMPLE_RATE);
-        }
-    }
-
-    /* 单声道 → 立体声（L/R 写同一份），保证全链路双声道语义 */
-    if (channels == 1 && s_audDecStereoBuf != NULL)
-    {
-        size_t frames = samples;   /* 单声道：1 采样 = 1 帧 */
-        if (frames > (AUDIO_DEC_STEREO_BUF_SAMPLES / 2))
-        {
-            frames = AUDIO_DEC_STEREO_BUF_SAMPLES / 2;
-        }
-        for (size_t i = 0; i < frames; i++)
-        {
-            s_audDecStereoBuf[i * 2 + 0] = pcm[i];
-            s_audDecStereoBuf[i * 2 + 1] = pcm[i];
-        }
-        Amplifier_Play_Buffer((const uint8_t *)s_audDecStereoBuf,
-                              frames * 4, NULL, 200);
-        return;
-    }
-
-    Amplifier_Play_Buffer((const uint8_t *)pcm, samples * sizeof(uint16_t),
-                          NULL, 200);
-}
-
-/** 在 /sdcard/music 下寻找第一个 .mp3 文件（大小写不敏感） */
-static bool Audio_Dec_Test_Find_Mp3(char *path, size_t pathSize)
-{
-    DIR *dir = opendir(AUDIO_DEC_TEST_DIR);
-    if (dir == NULL)
-    {
-        ESP_LOGE(TAG, "opendir failed: %s", AUDIO_DEC_TEST_DIR);
-        return false;
-    }
-
-    bool found = false;
-    struct dirent *ent = NULL;
-    while ((ent = readdir(dir)) != NULL)
-    {
-        const char *dot = NULL;
-        if (ent->d_name[0] == '.')
-        {
-            continue;
-        }
-        dot = strrchr(ent->d_name, '.');
-        if (dot != NULL && strlen(dot) == 4 &&
-            tolower((unsigned char)dot[1]) == 'm' &&
-            tolower((unsigned char)dot[2]) == 'p' &&
-            tolower((unsigned char)dot[3]) == '3')
-        {
-            /* 跳过目录项：FATFS 对“目录名伪装成 .mp3”也能打开成功，
-             * 但 fseek/fread 全部失败（即本次遇到的故障模式） */
-            if (ent->d_type == DT_DIR)
-            {
-                ESP_LOGW(TAG, "skip dir-like mp3 entry: %s", ent->d_name);
-                continue;
-            }
-            snprintf(path, pathSize, "%s/%s", AUDIO_DEC_TEST_DIR, ent->d_name);
-            found = true;
-            break;
-        }
-    }
-    closedir(dir);
-    return found;
-}
-
-/**
- * @brief 测试：SD 卡 /sdcard/music → audio_decoder 解码 → 功放播放（不经 sync_protocol）
- */
-static void Audio_Decoder_Test(void)
-{
-    char path[256] = {0};
-    audio_decoder_handle_t dec = NULL;
-    audio_decoder_info_t info;
-    uint32_t pos_ms = 0;
-    uint32_t cap_ms = 0;
-    esp_err_t ret;
-
-    ESP_LOGI(TAG, "=== Audio Decoder Test Start ===");
-
-    ret = Amplifier_Init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Amplifier_Init failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    Amplifier_Set_Volume(80);
-
-    ret = SD_Card_Init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "SD_Card_Init failed: %s", esp_err_to_name(ret));
-        Amplifier_Deinit();
-        return;
-    }
-    ESP_LOGI(TAG, "SD card mounted at %s", SD_Card_Get_Mount_Point());
-
-    ret = audio_decoder_init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "audio_decoder_init failed: %s", esp_err_to_name(ret));
-        audio_decoder_deinit();
-        Amplifier_Deinit();
-        return;
-    }
-
-    /* 找一首测试曲目（music 文件夹下的第一个 .mp3） */
-    if (!Audio_Dec_Test_Find_Mp3(path, sizeof(path)))
-    {
-        ESP_LOGE(TAG, "no .mp3 file found under %s", AUDIO_DEC_TEST_DIR);
-        audio_decoder_deinit();
-        Amplifier_Deinit();
-        return;
-    }
-    ESP_LOGI(TAG, "test track: %s", path);
-
-    /* 单声道→立体声扩展缓冲 */
-    s_audDecStereoBuf = (int16_t *)malloc(AUDIO_DEC_STEREO_BUF_SAMPLES *
-                                          sizeof(int16_t));
-    if (s_audDecStereoBuf == NULL)
-    {
-        ESP_LOGE(TAG, "stereo buffer alloc failed");
-        audio_decoder_deinit();
-        Amplifier_Deinit();
-        return;
-    }
-
-    /* 打开：内部创建解码任务，文件头解析完成后回调 READY */
-    audio_decoder_cfg_t cfg = {
-        .on_pcm    = Audio_Dec_Test_Pcm_Cb,
-        .pcm_ctx   = NULL,
-        .on_event  = Audio_Dec_Test_Evt_Cb,
-        .event_ctx = NULL,
-    };
-    dec = audio_decoder_open(path, &cfg);
-    if (dec == NULL)
-    {
-        ESP_LOGE(TAG, "audio_decoder_open failed: %s", path);
-        goto test_exit;
-    }
-
-    memset(&info, 0, sizeof(info));
-    if (audio_decoder_get_info(dec, &info) == ESP_OK)
-    {
-        ESP_LOGI(TAG, "track info: %luHz/%uch  dur=%lu ms  bitrate=%lubps",
-                 (unsigned long)info.sample_rate, info.channels,
-                 (unsigned long)info.duration_ms,
-                 (unsigned long)info.bitrate_bps);
-    }
-
-    ret = audio_decoder_play(dec);
-    ESP_LOGI(TAG, "audio_decoder_play: %s", esp_err_to_name(ret));
-
-    /* 播放到 EOF（或兜底超时），每秒打印一次进度 */
-    cap_ms = (info.duration_ms > 0) ? (info.duration_ms + 3000)
-                                    : AUDIO_DEC_TEST_TIMEOUT_MS;
-    for (uint32_t elapsed = 0; elapsed < cap_ms &&
-                               !s_audDecTestEof && !s_audDecTestErr;
-         elapsed += 1000)
-    {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        if (audio_decoder_get_position_ms(dec, &pos_ms) == ESP_OK)
-        {
-            ESP_LOGI(TAG, "position %lu / %lu ms  heap=%u  pcm_bytes=%llu",
-                     (unsigned long)pos_ms, (unsigned long)info.duration_ms,
-                     (unsigned int)esp_get_free_heap_size(),
-                     (unsigned long long)s_audDecTestBytes);
-        }
-    }
-
-    ESP_LOGI(TAG, "=== Audio Decoder Test Finished (eof=%d err=%d) ===",
-             s_audDecTestEof, s_audDecTestErr);
-
-test_exit:
-    if (dec != NULL)
-    {
-        audio_decoder_close(dec);
-        dec = NULL;
-    }
-    free(s_audDecStereoBuf);
-    s_audDecStereoBuf = NULL;
-    /* 功放与 SD 卡保持挂起状态，便于后续其他顶层测试复用 */
-}
-
-/* ======================== WiFi / 组播测试 ======================== */
-
-/** 测试组播组与端口（与分层设计 3.4.2 的音频通道约定一致） */
-#define WIFI_TEST_MCAST_GROUP  "239.0.0.1"
-#define WIFI_TEST_MCAST_PORT   5678
-
-/** 测试发送次数 */
-#define WIFI_TEST_SEND_COUNT   10
-
-/** 测试用：wifi_manager 事件回调（仅打印状态变化，测试观察用） */
-static void Wifi_Test_Evt_Cb(const wifi_mgr_event_t *evt, void *ctx)
-{
-    (void)ctx;
-
-    switch (evt->id)
-    {
     case WIFI_EVT_CONNECTED:
         ESP_LOGI(TAG, "[wifi] CONNECTED ip=%s rssi=%d", evt->ip, evt->rssi);
         break;
     case WIFI_EVT_DISCONNECTED:
-        ESP_LOGI(TAG, "[wifi] DISCONNECTED");
+        ESP_LOGW(TAG, "[wifi] DISCONNECTED");
         break;
     case WIFI_EVT_RECONNECTING:
         ESP_LOGI(TAG, "[wifi] RECONNECTING");
@@ -996,1298 +211,530 @@ static void Wifi_Test_Evt_Cb(const wifi_mgr_event_t *evt, void *ctx)
     }
 }
 
-/**
- * @brief 测试：wifi_manager 连接热点，并沿组播通道发送/接收 UDP 数据
- *
- * 说明：
- *   - 凭据：测试开头把整份运行参数（含 HW666）经 node_role_set 写入 NVS，
- *     wifi_manager 启动时经 node_role_get() 直接从 NVS 读取连接热点；
- *   - 自环：wifi_manager 已开 IP_MULTICAST_LOOP，本机发的包会经 lwIP 回环回本机，
- *     单机即可验证"发->收"闭环（从/灯控未实现时用）；
- *   - 串口按序打印 CONNECTED -> 每包 send 结果 -> recv 结果（应收到刚发的内容）。
- */
-static void Wifi_Mcast_Test(void)
+/** 初始化 wifi_manager 并等待拿到 IP（凭据由 wifi_manager 经 node_role 读取） */
+static void App_Wifi_Start(void)
 {
-    wifi_manager_handle_t wifi = NULL;
-    wifi_mcast_handle_t   chan = NULL;
-    wifi_manager_cfg_t    cfg  = {0};
-    wifi_mcast_cfg_t      mc   = {0};
-    char txbuf[64];
-    char rxbuf[256];
-    size_t rx_len = 0;
-    node_role_cfg_t rcfg = {0};
-    esp_err_t err;
+    wifi_manager_cfg_t cfg = {0};   /* 默认：10s 连接超时 / 3s 重连 / 无限重连 */
+    esp_err_t          err;
 
-    /* 1. 运行参数整体保存进 NVS（node_role 为唯一管理入口）：全部字段显式赋值
-     *    （默认值来自 node_role.h 公共宏，与《nvs存储.md》一致），node_role_set 整包写回；
-     *    wifi 连接凭据也在其中，wifi_manager 启动时经 node_role_get() 直接读取 */
-    err = node_role_init(NULL);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "node_role_init failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    snprintf(rcfg.wifi_ssid,         sizeof(rcfg.wifi_ssid),         "%s", NODE_ROLE_DEFAULT_SSID);
-    snprintf(rcfg.wifi_password,     sizeof(rcfg.wifi_password),     "%s", NODE_ROLE_DEFAULT_PASSWORD);
-    snprintf(rcfg.ota_server_url,    sizeof(rcfg.ota_server_url),    "%s", NODE_ROLE_DEFAULT_OTA_URL);
-    snprintf(rcfg.multicast_group,   sizeof(rcfg.multicast_group),   "%s", NODE_ROLE_DEFAULT_GROUP);
-    rcfg.role              = NODE_ROLE_MASTER;
-    rcfg.volume            = NODE_ROLE_DEFAULT_VOLUME;
-    rcfg.play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
-    rcfg.sync_delay_ms     = NODE_ROLE_DEFAULT_SYNC_DELAY_MS;
-    rcfg.audio_sample_rate = NODE_ROLE_DEFAULT_SAMPLE_RATE;
-
-    err = node_role_set(&rcfg);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "node_role_set failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    /* 读回并打印整份配置，确认 NVS 里保存的是完整参数（不只是 WiFi 两个字段） */
-    if (node_role_get(&rcfg) == ESP_OK)
-    {
-        ESP_LOGI(TAG, "node_role saved to NVS: role=%u ssid=\"%s\" vol=%u rate=%u delay=%u grp=\"%s\" ota=\"%s\"",
-                 (unsigned)rcfg.role, rcfg.wifi_ssid, (unsigned)rcfg.volume,
-                 (unsigned)rcfg.audio_sample_rate, (unsigned)rcfg.sync_delay_ms,
-                 rcfg.multicast_group, rcfg.ota_server_url);
-    }
-
-    ESP_LOGI(TAG, "=== Wifi Multicast Test Start (SSID=\"%s\") ===",
-             rcfg.wifi_ssid);
-
-    /* 默认配置：连接超时 10s、重连间隔 3s、max_retries=0 无限重连 */
-    wifi = wifi_manager_create(&cfg);
-    if (wifi == NULL)
+    s_app.wifi = wifi_manager_create(&cfg);
+    if (s_app.wifi == NULL)
     {
         ESP_LOGE(TAG, "wifi_manager_create failed");
-        goto test_exit;
+        return;
     }
-    wifi_manager_register_event_cb(wifi, Wifi_Test_Evt_Cb, NULL);
+    wifi_manager_register_event_cb(s_app.wifi, App_Wifi_Evt_Cb, NULL);
 
-    err = wifi_manager_start(wifi);
+    err = wifi_manager_start(s_app.wifi);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "wifi_manager_start failed: %s", esp_err_to_name(err));
-        goto test_exit;
+        return;
     }
-    ESP_LOGI(TAG, "connecting to AP, waiting for IP...");
+    ESP_LOGI(TAG, "connecting to AP, waiting for IP ...");
 
-    /* 轮询等待拿到 IP（最多 15s，超时即退出测试） */
-    for (int i = 0; i < 150; i++)
+    for (int i = 0; i < APP_WIFI_WAIT_TRIES; i++)
     {
-        if (wifi_manager_is_connected(wifi))
+        if (wifi_manager_is_connected(s_app.wifi))
         {
-            char ip[16] = {0};
+            char   ip[16] = {0};
             size_t ip_len = sizeof(ip);
-            if (wifi_manager_get_ip(wifi, ip, &ip_len) == ESP_OK)
+            if (wifi_manager_get_ip(s_app.wifi, ip, &ip_len) == ESP_OK)
             {
-                ESP_LOGI(TAG, "wifi connected, ip=%s rssi=%d",
-                         ip, wifi_manager_get_rssi(wifi));
+                ESP_LOGI(TAG, "wifi connected: ip=%s rssi=%d",
+                         ip, wifi_manager_get_rssi(s_app.wifi));
             }
-            break;
+            xEventGroupSetBits(s_app.evt, APP_EVT_WIFI_READY);
+            return;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
-        if (i == 149)
-        {
-            ESP_LOGE(TAG, "wait ip timeout, please check SSID/PWD");
-            goto test_exit;
-        }
     }
 
-    /* 打开音频组播通道：rx_enable=true，自环回包会进 RX FIFO */
-    mc.group          = WIFI_TEST_MCAST_GROUP;
-    mc.port           = WIFI_TEST_MCAST_PORT;
-    mc.rx_enable      = true;
-    mc.rx_fifo_bytes  = 4096;
-    err = wifi_manager_mcast_open(wifi, &mc, &chan);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "mcast_open %s:%u failed: %s",
-                 WIFI_TEST_MCAST_GROUP, WIFI_TEST_MCAST_PORT,
-                 esp_err_to_name(err));
-        goto test_exit;
-    }
-
-    for (int seq = 0; seq < WIFI_TEST_SEND_COUNT; seq++)
-    {
-        int n = snprintf(txbuf, sizeof(txbuf),
-                         "WIFI_TEST seq=%d cnt=%d", seq, WIFI_TEST_SEND_COUNT);
-
-        err = wifi_manager_mcast_send(chan, txbuf, (size_t)n, 1000);
-        ESP_LOGI(TAG, "mcast send[%d/%d] %d bytes -> %s",
-                 seq + 1, WIFI_TEST_SEND_COUNT, n,
-                 (err == ESP_OK) ? "OK" : esp_err_to_name(err));
-
-        /* 接收本机刚发出去的包（lwIP 组播回环），200ms 超时 */
-        memset(rxbuf, 0, sizeof(rxbuf));
-        err = wifi_manager_mcast_recv(chan, rxbuf, sizeof(rxbuf) - 1,
-                                      &rx_len, 200);
-        if (err == ESP_OK)
-        {
-            rxbuf[rx_len] = '\0';
-            ESP_LOGI(TAG, "mcast recv %d bytes: \"%s\"", (int)rx_len, rxbuf);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    ESP_LOGI(TAG, "=== Wifi Multicast Test Finished ===");
-
-test_exit:
-    if (chan != NULL)
-    {
-        wifi_manager_mcast_close(chan);
-        chan = NULL;
-    }
-    wifi_manager_destroy(wifi);
+    ESP_LOGE(TAG, "wait IP timeout (请检查 NVS 中的 SSID/密码)");
 }
 
-/* ======================== LightControl 灯控回环测试 ======================== */
+/* ======================== OTA ======================== */
 
-/** 灯控组播通道（分层设计 3.4.2：灯控 239.0.0.2:8889，代码常量不入 NVS） */
-#define LIGHT_TEST_MCAST_GROUP      "239.0.0.2"
-#define LIGHT_TEST_MCAST_PORT       8889
-
-/** 测试灯名（尚未实现的灯控端按此名开关） */
-#define LIGHT_TEST_LIGHT            "bathroom"
-
-/** 测试用状态上报超时（ms）：缩短至 3s，便于验证超时回落 UNKNOWN 路径 */
-#define LIGHT_TEST_STATE_TIMEOUT_MS 3000
-
-/** 每步等待模块收包/处理的时间（ms） */
-#define LIGHT_TEST_STEP_DELAY_MS    300
-
-/** 测试用：LightControl 事件回调（正式实现由 UI 刷灯图标，这里仅打印） */
-static void Light_Test_Evt_Cb(const light_event_t *evt, void *user_ctx)
+static const char *App_Ota_Evt_Name(ota_update_event_t evt)
 {
-    (void)user_ctx;
-    const char *id_str = (evt->id == LIGHT_EVT_ACK)    ? "ACK"    :
-                         (evt->id == LIGHT_EVT_STATUS) ? "STATUS" : "ERROR";
-    const char *st_str = (evt->data.state == LIGHT_STATE_ON)  ? "ON"     :
-                         (evt->data.state == LIGHT_STATE_OFF) ? "OFF"    : "UNKNOWN";
-
-    ESP_LOGI(TAG, "[light] EVENT %s light=\"%s\" ok=%d state=%s",
-             id_str, evt->data.light, evt->data.ok, st_str);
+    switch (evt)
+    {
+    case OTA_UPDATE_EVT_CHECK_STARTED:     return "CHECK_STARTED";
+    case OTA_UPDATE_EVT_UP_TO_DATE:        return "UP_TO_DATE";
+    case OTA_UPDATE_EVT_UPDATE_AVAILABLE:  return "UPDATE_AVAILABLE";
+    case OTA_UPDATE_EVT_DOWNLOAD_STARTED:  return "DOWNLOAD_STARTED";
+    case OTA_UPDATE_EVT_DOWNLOAD_PROGRESS: return "DOWNLOAD_PROGRESS";
+    case OTA_UPDATE_EVT_DOWNLOAD_FINISHED: return "DOWNLOAD_FINISHED";
+    case OTA_UPDATE_EVT_READY_TO_REBOOT:   return "READY_TO_REBOOT";
+    case OTA_UPDATE_EVT_ABORTED:           return "ABORTED";
+    default:                               return "?";
+    }
 }
 
-/** 测试模拟灯控端回包：直接向灯控组播通道发一帧 JSON（ack/status） */
-static void Light_Test_Simulate_Device(wifi_mcast_handle_t chan, const char *json)
-{
-    esp_err_t err = wifi_manager_mcast_send(chan, json, strlen(json), 1000);
-    ESP_LOGI(TAG, "[light] simulate device %d bytes: %s -> %s",
-             (int)strlen(json), json,
-             (err == ESP_OK) ? "OK" : esp_err_to_name(err));
-}
-
-/** 测试查询并打印某灯当前状态（模块内部缓存） */
-static void Light_Test_Show_State(light_control_handle_t lc, const char *label)
-{
-    light_state_t st = LIGHT_STATE_UNKNOWN;
-    const char *st_str;
-    esp_err_t err = light_control_get_state(lc, LIGHT_TEST_LIGHT, &st);
-
-    st_str = (st == LIGHT_STATE_ON)  ? "ON"  :
-             (st == LIGHT_STATE_OFF) ? "OFF" : "UNKNOWN";
-    ESP_LOGI(TAG, "[light] %s: get_state=%s (%s)", label, st_str,
-             (err == ESP_OK) ? "OK" : esp_err_to_name(err));
-}
-
-/**
- * @brief 第七阶段测试：LightControl 灯控模块回环测试
- *
- * 说明：
- *   - 灯控端尚未实现，测试采用"单机回环 + 模拟回包"：
- *     1) light_control_send() 下发的 on/off 指令经组播回环，模块自己的
- *        SmartHome_Task 应收到原始帧（日志 "recv ... {\"cmd\":\"on\"...}"）；
- *     2) 由本测试代替灯控端回 ack/status 帧，验证解析与事件回调链路
- *        （LIGHT_EVT_ACK / LIGHT_EVT_STATUS / 超时 LIGHT_EVT_ERROR）；
- *     3) state_timeout_ms 临时缩短为 3s，验证超时后状态落回 UNKNOWN。
- */
-static void Light_Control_Test(void)
-{
-    wifi_manager_handle_t  wifi  = NULL;
-    wifi_mcast_handle_t    chan  = NULL;
-    light_control_handle_t lc    = NULL;
-    wifi_manager_cfg_t     cfg   = {0};
-    wifi_mcast_cfg_t       mc    = {0};
-    light_control_cfg_t    lcfg  = {0};
-    node_role_cfg_t        rcfg  = {0};
-    esp_err_t              err;
-
-    /* 1. 运行参数写入 NVS（与 Wifi_Mcast_Test 一致，wifi_manager 启动时读凭据） */
-    err = node_role_init(NULL);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "node_role_init failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    snprintf(rcfg.wifi_ssid,       sizeof(rcfg.wifi_ssid),       "%s", NODE_ROLE_DEFAULT_SSID);
-    snprintf(rcfg.wifi_password,   sizeof(rcfg.wifi_password),   "%s", NODE_ROLE_DEFAULT_PASSWORD);
-    snprintf(rcfg.ota_server_url,  sizeof(rcfg.ota_server_url),  "%s", NODE_ROLE_DEFAULT_OTA_URL);
-    snprintf(rcfg.multicast_group, sizeof(rcfg.multicast_group), "%s", NODE_ROLE_DEFAULT_GROUP);
-    rcfg.role              = NODE_ROLE_MASTER;
-    rcfg.volume            = NODE_ROLE_DEFAULT_VOLUME;
-    rcfg.play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
-    rcfg.sync_delay_ms     = NODE_ROLE_DEFAULT_SYNC_DELAY_MS;
-    rcfg.audio_sample_rate = NODE_ROLE_DEFAULT_SAMPLE_RATE;
-
-    err = node_role_set(&rcfg);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "node_role_set failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    ESP_LOGI(TAG, "=== Light Control Loopback Test Start (SSID=\"%s\") ===",
-             rcfg.wifi_ssid);
-
-    /* 2. WiFi 连接（与 mcast 测试一致，等待 IP） */
-    wifi = wifi_manager_create(&cfg);
-    if (wifi == NULL)
-    {
-        ESP_LOGE(TAG, "wifi_manager_create failed");
-        goto test_exit;
-    }
-    wifi_manager_register_event_cb(wifi, Wifi_Test_Evt_Cb, NULL);
-
-    err = wifi_manager_start(wifi);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "wifi_manager_start failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-    ESP_LOGI(TAG, "connecting to AP, waiting for IP...");
-
-    for (int i = 0; i < 150; i++)
-    {
-        if (wifi_manager_is_connected(wifi))
-        {
-            char ip[16] = {0};
-            size_t ip_len = sizeof(ip);
-            if (wifi_manager_get_ip(wifi, ip, &ip_len) == ESP_OK)
-            {
-                ESP_LOGI(TAG, "wifi connected, ip=%s rssi=%d",
-                         ip, wifi_manager_get_rssi(wifi));
-            }
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (i == 149)
-        {
-            ESP_LOGE(TAG, "wait ip timeout, please check SSID/PWD");
-            goto test_exit;
-        }
-    }
-
-    /* 3. 灯控组播通道：0x8889, rx_enable 打开（本机回环/模拟回包都进接收 FIFO） */
-    mc.group        = LIGHT_TEST_MCAST_GROUP;
-    mc.port         = LIGHT_TEST_MCAST_PORT;
-    mc.rx_enable    = true;
-    mc.rx_fifo_bytes = 4096;
-    err = wifi_manager_mcast_open(wifi, &mc, &chan);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "mcast_open %s:%u failed: %s",
-                 LIGHT_TEST_MCAST_GROUP, LIGHT_TEST_MCAST_PORT,
-                 esp_err_to_name(err));
-        goto test_exit;
-    }
-
-    /* 4. 创建 LightControl（内部创建 SmartHome_Task，Core 0） */
-    lcfg.chan              = chan;
-    lcfg.tx_timeout_ms     = 100;       /* 与模块默认一致（100ms） */
-    lcfg.state_timeout_ms  = LIGHT_TEST_STATE_TIMEOUT_MS;   /* 3s（生产默认 90s） */
-    lcfg.on_event          = Light_Test_Evt_Cb;
-    lc = light_control_create(&lcfg);
-    if (lc == NULL)
-    {
-        ESP_LOGE(TAG, "light_control_create failed");
-        goto test_exit;
-    }
-
-    /* 5. 未收到任何上行：状态应为 UNKNOWN */
-    Light_Test_Show_State(lc, "before report");
-
-    /* 6. 发送开灯指令：包组播回环，模块收底打印 "recv ... {\"cmd\":\"on\"...}" */
-    err = light_control_send(lc, LIGHT_CMD_ON, LIGHT_TEST_LIGHT);
-    ESP_LOGI(TAG, "[light] light_control_send(ON) -> %s",
-             (err == ESP_OK) ? "OK" : esp_err_to_name(err));
-    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
-
-    /* 7. 模拟灯控端回 ack ok=true -> LIGHT_EVT_ACK，状态 ON */
-    Light_Test_Simulate_Device(chan,
-        "{\"cmd\":\"ack\",\"light\":\"bathroom\",\"ok\":true}");
-    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
-    Light_Test_Show_State(lc, "after ack ok=true");
-
-    /* 8. OFF 指令 + ack ok=false -> 状态 OFF */
-    err = light_control_send(lc, LIGHT_CMD_OFF, LIGHT_TEST_LIGHT);
-    ESP_LOGI(TAG, "[light] light_control_send(OFF) -> %s",
-             (err == ESP_OK) ? "OK" : esp_err_to_name(err));
-    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
-    Light_Test_Simulate_Device(chan,
-        "{\"cmd\":\"ack\",\"light\":\"bathroom\",\"ok\":false}");
-    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
-    Light_Test_Show_State(lc, "after ack ok=false");
-
-    /* 9. 模拟周期 status 上报 ok=true -> LIGHT_EVT_STATUS，状态 ON */
-    Light_Test_Simulate_Device(chan,
-        "{\"cmd\":\"status\",\"light\":\"bathroom\",\"ok\":true}");
-    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STEP_DELAY_MS));
-    Light_Test_Show_State(lc, "after status ok=true");
-
-    /* 10. 超时（3s 无上报）-> LIGHT_EVT_ERROR，状态 UNKNOWN */
-    ESP_LOGI(TAG, "[light] wait %d ms with no report, expect timeout -> UNKNOWN",
-             LIGHT_TEST_STATE_TIMEOUT_MS);
-    vTaskDelay(pdMS_TO_TICKS(LIGHT_TEST_STATE_TIMEOUT_MS + 1000));
-    Light_Test_Show_State(lc, "after timeout");
-
-    ESP_LOGI(TAG, "=== Light Control Loopback Test Finished ===");
-
-test_exit:
-    if (lc != NULL)
-    {
-        light_control_destroy(lc);
-        lc = NULL;
-    }
-    if (chan != NULL)
-    {
-        wifi_manager_mcast_close(chan);
-        chan = NULL;
-    }
-    wifi_manager_destroy(wifi);
-}
-
-/* ======================== 第八阶段：UI 模块联调测试 ======================== */
-
-/**
- * @brief 第八阶段测试：UI 模块（LVGL 9.6 自持 UI_Task）
- *
- * 说明：
- *   - ui_init(NULL)：全占位模式（未接 LightControl/CallPhone/wifi_manager 句柄），
- *     显示/触摸/切页为真实功能，业务按键按下仅打 [占位] 日志注明将来调用的接口；
- *   - UI 内部自举顺序：SPIFFS storage 挂载（图片）→ I2C 总线 → LCD/触摸
- *     → LVGL 9.6 移植 → 页面构建 → UI_Task（Core 1 / 优先级 12 / 栈 13312）；
- *   - 观察点：①屏幕出现"状态栏 + 播放页 + Tab 栏"，封面/灯泡 PNG 正常显示
- *     （需 menuconfig 开 CONFIG_LV_USE_LODEPNG）；②三个 Tab 切换、本地列表
- *     进出；③按播放键/拨灯开关/点配网等，串口打印对应 [占位] 日志；
- *   - 无 SD 卡也不影响本测试（图片已烧录 flash storage 分区，SD 仅音乐用）；
- *   - 与 MP3 解码测试互斥：两者任务同在 Core 1 会互相抢占，分开验证。
- */
-static void UI_Test(void)
-{
-    esp_err_t ret;
-
-    ESP_LOGI(TAG, "=== UI Test Start（第八阶段：界面联调） ===");
-    ESP_LOGI(TAG, "free heap before UI: internal=%lu B, psram=%lu B",
-             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
-    ret = ui_init(NULL);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "ui_init failed: %s", esp_err_to_name(ret));
-        return;
-    }
-
-    ESP_LOGI(TAG, "free heap after UI: internal=%lu B, psram=%lu B",
-             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    ESP_LOGI(TAG, "=== UI Test running: 触摸切 Tab / 按播放键 / 拨灯开关，观察 [占位] 日志 ===");
-}
-
-/* ======================== 第九阶段：sync_protocol 同步播放模块测试 ======================== */
-
-/** 测试用正弦波参数：1kHz / 幅度 8000（约 49% 满幅，便于听感对比） */
-#define SYNC_TEST_SINE_HZ      (1000)
-#define SYNC_TEST_SINE_AMP     (8000)
-#define SYNC_TEST_2PI          (6.2831853f)
-
-/** 测试采样率：与全链路一致（AMPLIFIER_SAMPLE_RATE = 44.1kHz） */
-#define SYNC_TEST_SAMPLE_RATE  (44100)
-
-/** 每 10ms 推 441 个 mono 采样 = 44.1kHz（与模块消费速率相等，不欠载） */
-#define SYNC_TEST_PUSH_SAMPLES (441)
-
-/** 音频回环校验包数（每帧 15ms，20 包约 300ms） */
-#define SYNC_TEST_AUDIO_PKTS   (20)
-
-/** 回环接收超时（ms） */
-#define SYNC_TEST_RECV_TMO_MS  (500)
-
-/** 测试喂音任务停止标志（测试主流程退出时置位） */
-static volatile bool s_sync_test_stop = false;
-
-/** 正弦相位游标（喂音任务独占写入） */
-static uint32_t s_sync_test_phase = 0;
-
-/** 测试用：sync_protocol 事件回调（仅打印状态变化，观察状态机用） */
-static void Sync_Test_Evt_Cb(const sync_protocol_event_t *evt, void *ctx)
+/** OTA 事件回调：打印状态/进度（正式 UI 展示后续接入） */
+static void App_Ota_Evt_Cb(const ota_update_event_info_t *info, void *ctx)
 {
     (void)ctx;
-    const char *id_str = (evt->id == SYNC_EVT_STATE_CHANGED)   ? "STATE_CHANGED" :
-                         (evt->id == SYNC_EVT_STREAM_CHANGED)  ? "STREAM_CHANGED" :
-                         (evt->id == SYNC_EVT_SLAVE_SYNCED)    ? "SLAVE_SYNCED" :
-                         (evt->id == SYNC_EVT_SLAVE_LOST)      ? "SLAVE_LOST" :
-                         (evt->id == SYNC_EVT_ERROR)           ? "ERROR" : "UNKNOWN";
-    ESP_LOGI(TAG, "[sync] EVT %s state=%d stream=%u", id_str,
-             (int)evt->status.state, evt->status.stream_id);
-}
-
-/** 测试：持续把 1kHz 正弦 PCM 推进 sync_protocol。
- * 按"距上一拍经过的实时间"补推采样（欠长采样数累积）,长期平均速率严格
- * 等于 44.1kHz——不再用"固定 10ms + 现算 441 点"（那样实际喂入 < 消费，
- * 本地 D 缓冲永远灌不满）。 */
-static void Sync_Test_Feed_Task(void *arg)
-{
-    int16_t chunk[SYNC_TEST_PUSH_SAMPLES];
-    (void)arg;
-    int64_t last_us = esp_timer_get_time();
-    int64_t owed    = 0;   /* 与 44.1kHz 对齐的累计欠账采样数 */
-
-    while (!s_sync_test_stop)
+    if (info == NULL)
     {
-        vTaskDelay(pdMS_TO_TICKS(10));
-
-        int64_t now_us = esp_timer_get_time();
-        owed += ((now_us - last_us) * SYNC_TEST_SAMPLE_RATE + 500000) / 1000000;
-        last_us = now_us;
-
-        while (owed >= (int64_t)SYNC_TEST_PUSH_SAMPLES)
-        {
-            for (size_t i = 0; i < SYNC_TEST_PUSH_SAMPLES; i++)
-            {
-                chunk[i] = (int16_t)(SYNC_TEST_SINE_AMP *
-                            sinf(SYNC_TEST_2PI * SYNC_TEST_SINE_HZ *
-                                 (float)s_sync_test_phase / SYNC_TEST_SAMPLE_RATE));
-                s_sync_test_phase++;
-            }
-            sync_protocol_master_push_pcm(chunk, SYNC_TEST_PUSH_SAMPLES);
-            owed -= (int64_t)SYNC_TEST_PUSH_SAMPLES;
-        }
+        return;
     }
-    vTaskDelete(NULL);
+    ESP_LOGI(TAG, "[ota] %s version=%s progress=%d%% http=%d",
+             App_Ota_Evt_Name(info->event), info->version,
+             info->progress_percent, info->http_status);
 }
 
 /**
- * @brief 第九阶段测试：sync_protocol 同步播放模块（单机自环）
+ * @brief WiFi 就绪后检查是否需要 OTA 升级
  *
- * 说明：
- *   - 测试以独立任务运行（app_main 主任务栈仅 3584B，本测试函数的
- *     pkt[2048] 等栈占用 + 深日志调用会发生栈溢出，故按现有惯例
- *     xTaskCreatePinnedToCore 单独起任务，栈给 16KB）；
- *   - 单机即可验证“发→收”闭环：wifi_manager 已开 IP_MULTICAST_LOOP，且
- *     SO_REUSEADDR 允许同一组播端口绑定多个 socket，每个组播包会向该端口
- *     每个成员拷一份——因此模块 TX 用的发送 socket（只发）与测试自用的
- *     嗅探 socket（只收）可并行存在；
- *   - 控制通道必须开 rx：sync_protocol 主节点侧要收从节点的 PING 并回 PONG；
- *   - 覆盖点（从节点未实现，先验证主节点协议行为）：
- *     ① 音频帧自环：magic/stream_id/seq 连续/帧长 1322|1324/时间戳间隔≈15ms/载荷非 0；
- *     ② 控制命令自环：broadcast PLAY/PAUSE/NEXT/VOLUME 的 4 字节基础帧到 5679；
- *     ③ PING→PONG 应答：构造 t1=now 的 PING 发到控制通道，模块自动回 PONG（t1<t2<=t3）；
- *     ④ pause/resume 状态机：暂停期间不再发包，恢复后 D 缓冲重灌回到 PLAYING；
- *   - 本地最终出声：直接走 amplifier（Amplifier_Play_Buffer），应能听到 1kHz
- *     正弦——为后续主从同拍播放做前置验证。
+ * 有新固件：模块内部下载→校验 SHA256→切换分区→esp_restart()（不返回）；
+ * 已是最新或检测失败：记录日志后继续往下启动。
  */
-static void Sync_Protocol_Test(void *arg)
+static void App_Ota_Check(void)
 {
-    (void)arg;
-    wifi_manager_handle_t wifi = NULL;
-    wifi_mcast_handle_t   audio_tx = NULL;   /* 传给 sync_protocol：音频只发 */
-    wifi_mcast_handle_t   ctrl_tx  = NULL;   /* 传给 sync_protocol：控制收发 */
-    wifi_mcast_handle_t   audio_rx = NULL;   /* 测试自环：嗅探音频帧 */
-    wifi_mcast_handle_t   ctrl_rx  = NULL;   /* 测试自环：嗅探控制帧 */
-    wifi_manager_cfg_t    cfg  = {0};
-    wifi_mcast_cfg_t      mc   = {0};
-    node_role_cfg_t       rcfg = {0};
-    sync_protocol_master_cfg_t scfg = {0};
-    sync_protocol_master_status_t st;
-    uint8_t pkt[2048];
-    size_t  len = 0;
-    uint16_t stream_id = 0;
-    uint16_t prev_seq  = 0;
-    uint64_t prev_ts   = 0;
-    bool got_prev = false;
-    int  fail  = 0;
-    esp_err_t err;
+    ota_update_config_t cfg = {0};
+    esp_err_t           err;
 
-    ESP_LOGI(TAG, "=== Sync Protocol Test Start（第九阶段：同步播放自环） ===");
-
-    /* 0. 功放初始化：sync_protocol 本地播放最终经 amplifier 写 I2S */
-    if (Amplifier_Init() != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Amplifier_Init failed");
-        goto test_exit;
-    }
-    Amplifier_Set_Volume(80);
-
-    /* 1. 运行参数写入 NVS + 连接热点（与 Wifi_Mcast_Test 一致） */
-    err = node_role_init(NULL);
+    cfg.event_cb = App_Ota_Evt_Cb;
+    err = OTA_Update_Init(&cfg);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "node_role_init failed: %s", esp_err_to_name(err));
-        goto test_exit;
+        ESP_LOGE(TAG, "OTA_Update_Init failed: %s", esp_err_to_name(err));
+        return;
     }
 
-    snprintf(rcfg.wifi_ssid,         sizeof(rcfg.wifi_ssid),         "%s", NODE_ROLE_DEFAULT_SSID);
-    snprintf(rcfg.wifi_password,     sizeof(rcfg.wifi_password),     "%s", NODE_ROLE_DEFAULT_PASSWORD);
-    snprintf(rcfg.ota_server_url,    sizeof(rcfg.ota_server_url),    "%s", NODE_ROLE_DEFAULT_OTA_URL);
-    snprintf(rcfg.multicast_group,   sizeof(rcfg.multicast_group),   "%s", NODE_ROLE_DEFAULT_GROUP);
-    rcfg.role              = NODE_ROLE_MASTER;
-    rcfg.volume            = NODE_ROLE_DEFAULT_VOLUME;
-    rcfg.play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
-    rcfg.sync_delay_ms     = NODE_ROLE_DEFAULT_SYNC_DELAY_MS;
-    rcfg.audio_sample_rate = NODE_ROLE_DEFAULT_SAMPLE_RATE;
-    err = node_role_set(&rcfg);
-    if (err != ESP_OK)
+    ESP_LOGI(TAG, "checking OTA ...");
+    err = OTA_Update_CheckAndUpgrade();
+    if (err == ESP_OK)
     {
-        ESP_LOGE(TAG, "node_role_set failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-
-    wifi = wifi_manager_create(&cfg);
-    if (wifi == NULL)
-    {
-        ESP_LOGE(TAG, "wifi_manager_create failed");
-        goto test_exit;
-    }
-    wifi_manager_register_event_cb(wifi, Wifi_Test_Evt_Cb, NULL);
-    err = wifi_manager_start(wifi);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "wifi_manager_start failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-    ESP_LOGI(TAG, "connecting to AP, waiting for IP...");
-    for (int i = 0; i < 150; i++)
-    {
-        if (wifi_manager_is_connected(wifi))
-        {
-            char ip[16] = {0};
-            size_t ip_len = sizeof(ip);
-            if (wifi_manager_get_ip(wifi, ip, &ip_len) == ESP_OK)
-            {
-                ESP_LOGI(TAG, "wifi connected, ip=%s rssi=%d",
-                         ip, wifi_manager_get_rssi(wifi));
-            }
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (i == 149)
-        {
-            ESP_LOGE(TAG, "wait ip timeout, check SSID/PWD");
-            goto test_exit;
-        }
-    }
-
-    /* 2. 打开组播通道（同端口允许多个 socket：每个组播包各收一份拷贝） */
-    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
-    mc.port  = SYNC_PROTOCOL_MCAST_PORT_AUDIO;
-    mc.rx_enable = false;                  /* 模块音频通道只发 */
-    err = wifi_manager_mcast_open(wifi, &mc, &audio_tx);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "mcast_open audio_tx failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-
-    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
-    mc.port  = SYNC_PROTOCOL_MCAST_PORT_CTRL;
-    mc.rx_enable     = true;               /* 模块控制通道要收 PING→回 PONG */
-    mc.rx_fifo_bytes = 4096;
-    err = wifi_manager_mcast_open(wifi, &mc, &ctrl_tx);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "mcast_open ctrl_tx failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-
-    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
-    mc.port  = SYNC_PROTOCOL_MCAST_PORT_AUDIO;
-    mc.rx_enable = true;                   /* 测试自环：嗅探音频帧 */
-    mc.rx_fifo_bytes = 8192;
-    err = wifi_manager_mcast_open(wifi, &mc, &audio_rx);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "mcast_open audio_rx failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-
-    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
-    mc.port  = SYNC_PROTOCOL_MCAST_PORT_CTRL;
-    mc.rx_enable = true;   /* 测试自环：嗅探控制帧 */
-    mc.rx_fifo_bytes = 4096;
-    err = wifi_manager_mcast_open(wifi, &mc, &ctrl_rx);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "mcast_open ctrl_rx failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-
-    /* 3. sync_protocol 初始化 + 启动流（44.1kHz mono）*/
-    scfg.sync_delay_ms    = rcfg.sync_delay_ms;   /* 200ms（NVS 参数） */
-    scfg.frame_duration_ms = 15;
-    scfg.delay_queue_pkts  = 0;                   /* 默认 16 */
-    scfg.ingress_bytes     = 0;                   /* 默认 24KB */
-    scfg.audio_chan        = audio_tx;
-    scfg.control_chan      = ctrl_tx;
-    err = sync_protocol_master_init(&scfg);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "sync_protocol_master_init failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-    sync_protocol_master_register_event_cb(Sync_Test_Evt_Cb, NULL);
-
-    err = sync_protocol_master_start(0, SYNC_TEST_SAMPLE_RATE, 1);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "sync_protocol_master_start failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-    sync_protocol_master_get_status(&st);
-    stream_id = st.stream_id;
-    ESP_LOGI(TAG, "stream started: id=%u state=%d(0=PREPARING)", stream_id, (int)st.state);
-
-    /* 4. 启动正弦喂入任务（独立任务，不阻塞本测试的阻塞接收） */
-    s_sync_test_stop  = false;
-    s_sync_test_phase = 0;
-    if (xTaskCreatePinnedToCore(Sync_Test_Feed_Task, "sync_feed", 4096,
-                                NULL, 5, NULL, 0) != pdPASS)
-    {
-        ESP_LOGE(TAG, "Sync_Test_Feed_Task create failed");
-        fail++;
-    }
-
-    /* 5. 阶段 A：音频帧自环逐包校验 */
-    ESP_LOGI(TAG, "[A] audio frame loopback: %d pkts", SYNC_TEST_AUDIO_PKTS);
-    for (int i = 0; i < SYNC_TEST_AUDIO_PKTS; i++)
-    {
-        sync_audio_pkt_hdr_t *h = (sync_audio_pkt_hdr_t *)pkt;
-        const int16_t *pcm;
-        int64_t delta_us = 0;
-
-        len = 0;
-        err = wifi_manager_mcast_recv(audio_rx, pkt, sizeof(pkt), &len,
-                                      SYNC_TEST_RECV_TMO_MS * 4);
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(TAG, "[A][%d] recv failed: %s", i, esp_err_to_name(err));
-            fail++;
-            continue;
-        }
-        if (len < SYNC_AUDIO_HDR_SIZE || h->magic != SYNC_MAGIC)
-        {
-            ESP_LOGE(TAG, "[A][%d] bad magic/len=%u", i, (unsigned)len);
-            fail++;
-            continue;
-        }
-        if (h->stream_id != stream_id)
-        {
-            ESP_LOGE(TAG, "[A][%d] stream=%u expect=%u", i, h->stream_id, stream_id);
-            fail++;
-        }
-        if (len != SYNC_AUDIO_HDR_SIZE + h->data_len ||
-            (h->data_len != 1322 && h->data_len != 1324))
-        {
-            ESP_LOGE(TAG, "[A][%d] data_len=%u len=%u", i, h->data_len, (unsigned)len);
-            fail++;
-        }
-        if (got_prev && (uint16_t)(h->seq - prev_seq) != 1)
-        {
-            ESP_LOGE(TAG, "[A][%d] seq jump %u->%u", i, prev_seq, h->seq);
-            fail++;
-        }
-        if (got_prev)
-        {
-            delta_us = (int64_t)h->timestamp_us - (int64_t)prev_ts;
-            if (delta_us < 3000 || delta_us > 40000)
-            {
-                ESP_LOGE(TAG, "[A][%d] frame interval %lldus", i, (long long)delta_us);
-                fail++;
-            }
-        }
-        pcm = (const int16_t *)(pkt + SYNC_AUDIO_HDR_SIZE);
-        if (pcm[0] == 0 && pcm[1] == 0 && pcm[2] == 0 && pcm[3] == 0)
-        {
-            ESP_LOGE(TAG, "[A][%d] payload all zero", i);
-            fail++;
-        }
-        got_prev = true;
-        prev_seq = h->seq;
-        prev_ts  = h->timestamp_us;
-        if (i % 5 == 0)
-        {
-            ESP_LOGI(TAG, "[A][%d] seq=%u len=%u ts=%llu delta=%lldus",
-                     i, h->seq, h->data_len, (unsigned long long)h->timestamp_us,
-                     (long long)delta_us);
-        }
-    }
-
-    /* 6. 阶段 B：控制命令帧自环（PLAY/PAUSE/NEXT/VOLUME） */
-    ESP_LOGI(TAG, "[B] control cmd loopback");
-    {
-        static const sync_protocol_cmd_t cmds[] = {
-            SYNC_CMD_PLAY, SYNC_CMD_PAUSE, SYNC_CMD_NEXT, SYNC_CMD_VOLUME,
-        };
-        for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++)
-        {
-            uint8_t param = (cmds[i] == SYNC_CMD_VOLUME) ? 0x3C : 0;
-            bool got = false;
-
-            err = sync_protocol_master_broadcast_cmd(cmds[i], param);
-            if (err != ESP_OK)
-            {
-                ESP_LOGE(TAG, "[B] send cmd 0x%02X failed: %s",
-                         cmds[i], esp_err_to_name(err));
-                fail++;
-                continue;
-            }
-            for (int tries = 0; tries < 20 && !got; tries++)
-            {
-                len = 0;
-                err = wifi_manager_mcast_recv(ctrl_rx, pkt, sizeof(pkt), &len, 200);
-                if (err != ESP_OK)
-                {
-                    break;
-                }
-                if (len != sizeof(sync_ctrl_basic_t))
-                {
-                    continue;   /* 扩展帧（START/HEARTBEAT/PING/PONG）跳过 */
-                }
-                sync_ctrl_basic_t *b = (sync_ctrl_basic_t *)pkt;
-                if (b->magic != SYNC_MAGIC || b->cmd != (uint8_t)cmds[i] ||
-                    b->param != param)
-                {
-                    ESP_LOGW(TAG, "[B] unexpected basic frame magic=%04X cmd=%02X param=%u",
-                             b->magic, b->cmd, b->param);
-                    continue;
-                }
-                ESP_LOGI(TAG, "[B] cmd=0x%02X param=%u loopback OK", b->cmd, b->param);
-                got = true;
-            }
-            if (!got)
-            {
-                ESP_LOGE(TAG, "[B] cmd 0x%02X not seen on loopback", cmds[i]);
-                fail++;
-            }
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
-
-    /* 7. 阶段 C：PING→PONG 自环（模块应收 PING 并自动回 PONG） */
-    ESP_LOGI(TAG, "[C] PING/PONG roundtrip");
-    {
-        sync_ctrl_ext_t     *ext = (sync_ctrl_ext_t *)pkt;
-        sync_ping_payload_t  ping_payload;
-        uint64_t t1 = (uint64_t)esp_timer_get_time();
-        bool got_pong = false;
-
-        ping_payload.t1_us = t1;
-        memset(pkt, 0, sizeof(pkt));
-        ext->magic = SYNC_MAGIC;
-        ext->type  = SYNC_MSG_PING;
-        ext->len   = sizeof(ping_payload);
-        memcpy(ext->data, &ping_payload, sizeof(ping_payload));
-        err = wifi_manager_mcast_send(ctrl_tx, pkt,
-                                      sizeof(sync_ctrl_ext_t) + sizeof(ping_payload), 100);
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(TAG, "[C] PING send failed: %s", esp_err_to_name(err));
-            fail++;
-        }
-        else
-        {
-            for (int tries = 0; tries < 40 && !got_pong; tries++)
-            {
-                len = 0;
-                err = wifi_manager_mcast_recv(ctrl_rx, pkt, sizeof(pkt), &len, 200);
-                if (err != ESP_OK)
-                {
-                    break;
-                }
-                if (len < sizeof(sync_ctrl_ext_t) ||
-                    ((sync_ctrl_ext_t *)pkt)->magic != SYNC_MAGIC)
-                {
-                    continue;
-                }
-                ext = (sync_ctrl_ext_t *)pkt;
-                if (ext->type != SYNC_MSG_PONG ||
-                    ext->len != sizeof(sync_pong_payload_t))
-                {
-                    continue;
-                }
-                sync_pong_payload_t *pong = (sync_pong_payload_t *)ext->data;
-                if (pong->t1_us != t1)
-                {
-                    continue;
-                }
-                if (pong->t1_us <= pong->t2_us && pong->t2_us <= pong->t3_us &&
-                    (pong->t2_us - t1) < 5000000u &&
-                    (pong->t3_us - pong->t2_us) < 1000000u)
-                {
-                    ESP_LOGI(TAG, "[C] PONG OK: t1=%llu t2=%llu t3=%llu",
-                             (unsigned long long)pong->t1_us,
-                             (unsigned long long)pong->t2_us,
-                             (unsigned long long)pong->t3_us);
-                    got_pong = true;
-                }
-                else
-                {
-                    ESP_LOGE(TAG, "[C] PONG timing bad: t1=%llu t2=%llu t3=%llu",
-                             (unsigned long long)pong->t1_us,
-                             (unsigned long long)pong->t2_us,
-                             (unsigned long long)pong->t3_us);
-                    fail++;
-                }
-            }
-            if (!got_pong)
-            {
-                ESP_LOGE(TAG, "[C] no PONG on loopback");
-                fail++;
-            }
-        }
-    }
-
-    /* 8. 阶段 D：pause/resume 状态机 */
-    ESP_LOGI(TAG, "[D] pause/resume state machine");
-    err = sync_protocol_master_pause();
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "[D] pause failed: %s", esp_err_to_name(err));
-        fail++;
-    }
-    sync_protocol_master_get_status(&st);
-    if (st.state != SYNC_STATE_PAUSED)
-    {
-        ESP_LOGE(TAG, "[D] pause -> state=%d", (int)st.state);
-        fail++;
+        ESP_LOGI(TAG, "OTA: firmware up to date, continue boot");
     }
     else
     {
-        ESP_LOGI(TAG, "[D] paused OK");
+        ESP_LOGW(TAG, "OTA check failed (%s), continue boot", esp_err_to_name(err));
     }
-    /* 暂停期间 TX 应停止发包：取两个时刻对比 */
-    vTaskDelay(pdMS_TO_TICKS(300));
-    sync_protocol_master_get_status(&st);
-    uint32_t paused_tx = st.tx_pkts;
-    vTaskDelay(pdMS_TO_TICKS(400));
-    sync_protocol_master_get_status(&st);
-    if (st.tx_pkts != paused_tx)
-    {
-        ESP_LOGE(TAG, "[D] tx advanced while paused: %u -> %u", paused_tx, st.tx_pkts);
-        fail++;
-    }
-
-    err = sync_protocol_master_resume();
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "[D] resume failed: %s", esp_err_to_name(err));
-        fail++;
-    }
-    vTaskDelay(pdMS_TO_TICKS(700));   /* 等待 D 缓冲重新灌满 */
-    sync_protocol_master_get_status(&st);
-    if (st.state != SYNC_STATE_PLAYING || st.tx_pkts == 0 || st.dropped_pkts != 0)
-    {
-        ESP_LOGE(TAG, "[D] resume misbehave: state=%d tx=%u dropped=%u",
-                 (int)st.state, st.tx_pkts, st.dropped_pkts);
-        fail++;
-    }
-    else
-    {
-        ESP_LOGI(TAG, "[D] resumed OK: state=%d tx=%u dropped=%u",
-                 (int)st.state, st.tx_pkts, st.dropped_pkts);
-    }
-
-    /* 9. 阶段 E：本地出声观察 + 收尾状态快照 */
-    ESP_LOGI(TAG, "[E] keep playing 2s（应能听到 1kHz 正弦，主节点本地功放出声）");
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    sync_protocol_master_get_status(&st);
-    ESP_LOGI(TAG, "final status: state=%d stream=%u tx=%u dropped=%u "
-             "ingress=%uB dq_used=%u delta_us=%lld slave_online=%d",
-             (int)st.state, st.stream_id, st.tx_pkts, st.dropped_pkts,
-             (unsigned)st.ingress_used, (unsigned)st.delay_queue_used,
-             (long long)st.play_delta_us, st.slave_online ? 1 : 0);
-
-    /* 收尾：停喂入 → 停流 → 反初始化 */
-    s_sync_test_stop = true;
-    vTaskDelay(pdMS_TO_TICKS(30));
-    sync_protocol_master_stop();
-    sync_protocol_master_deinit();
-    ESP_LOGI(TAG, "=== Sync Protocol Test Finished (fail=%d) ===", fail);
-
-test_exit:
-    if (audio_rx != NULL) wifi_manager_mcast_close(audio_rx);
-    if (ctrl_rx  != NULL) wifi_manager_mcast_close(ctrl_rx);
-    if (audio_tx != NULL) wifi_manager_mcast_close(audio_tx);
-    if (ctrl_tx  != NULL) wifi_manager_mcast_close(ctrl_tx);
-    wifi_manager_destroy(wifi);
-    vTaskDelete(NULL);
 }
 
-/* ======================== 第十一阶段：MusicPlay 播放测试 ======================== */
+/* ======================== 蓝牙 PCM / 事件胶水 ======================== */
 
-static music_play_handle_t s_musicTestPlayer = NULL;  /* 供 bt_audio → MusicPlay 事件胶水使用 */
-
-/** bt_audio 蓝牙 PCM 直连 sync（music_play.h 依赖接线说明：on_pcm 不经过 MusicPlay 模块） */
-static void Music_Test_Bt_Pcm_Cb(bt_audio_pcm_source_t source, const int16_t *pcm,
-                                 size_t samples, uint32_t sample_rate, void *user_ctx)
+/**
+ * @brief bt_audio PCM 回调（bt_audio 任务上下文）
+ *
+ *   - A2DP 音乐：直连 sync_protocol_master_push_pcm()（不经过 MusicPlay），
+ *     由 sync_protocol 统一打时间戳、组播并本地延迟播放；
+ *   - HFP 下行（语音助手应答）：44.1kHz 单声道，而功放总线为立体声，
+ *     先扩展为 L/R 相同再交功放（见 note/HFP下行无声-声道与音量bug.md）。
+ */
+static void App_Bt_Pcm_Cb(bt_audio_pcm_source_t source, const int16_t *pcm,
+                          size_t samples, uint32_t sample_rate, void *user_ctx)
 {
     (void)sample_rate;
     (void)user_ctx;
-    if (source != BT_AUDIO_PCM_SOURCE_A2DP || pcm == NULL || samples == 0)
+
+    if (pcm == NULL || samples == 0)
     {
         return;
     }
-    sync_protocol_master_push_pcm(pcm, samples);
-}
 
-/** bt_audio 事件 → MusicPlay（App 层胶水；MusicPlay 未创建前忽略） */
-static void Music_Test_Bt_Evt_Cb(const bt_audio_event_t *evt, void *user_ctx)
-{
-    (void)user_ctx;
-    if (evt != NULL && s_musicTestPlayer != NULL)
+    if (source == BT_AUDIO_PCM_SOURCE_A2DP)
     {
-        music_play_on_bt_event(s_musicTestPlayer, evt);
+        sync_protocol_master_push_pcm(pcm, samples);
+        return;
+    }
+
+    if (source == BT_AUDIO_PCM_SOURCE_HFP_DOWNLINK)
+    {
+        if (s_hfpDnStereoBuf == NULL)
+        {
+            return;
+        }
+        if (samples > APP_HFP_DN_STEREO_SAMPLES)
+        {
+            ESP_LOGW(TAG, "HFP mono chunk too large: %u", (unsigned)samples);
+            return;
+        }
+        for (size_t i = 0; i < samples; i++)
+        {
+            s_hfpDnStereoBuf[i * 2]     = pcm[i];
+            s_hfpDnStereoBuf[i * 2 + 1] = pcm[i];
+        }
+        Amplifier_Play_Buffer((const uint8_t *)s_hfpDnStereoBuf,
+                              samples * 2 * sizeof(int16_t), NULL, 200);
     }
 }
 
-/** MusicPlay 事件回调（测试观察用） */
-static const char *Music_Test_Evt_Name(music_event_id_t id)
-{
-    switch (id)
-    {
-    case MUSIC_EVT_SOURCE_CHANGED:     return "SOURCE_CHANGED";
-    case MUSIC_EVT_PLAY_STATE_CHANGED: return "PLAY_STATE_CHANGED";
-    case MUSIC_EVT_TRACK_CHANGED:      return "TRACK_CHANGED";
-    case MUSIC_EVT_TRACK_INFO:         return "TRACK_INFO";
-    case MUSIC_EVT_PLAYLIST_CHANGED:   return "PLAYLIST_CHANGED";
-    case MUSIC_EVT_PLAY_MODE_CHANGED:  return "PLAY_MODE_CHANGED";
-    case MUSIC_EVT_VOLUME_CHANGED:     return "VOLUME_CHANGED";
-    case MUSIC_EVT_EOF:                return "EOF";
-    case MUSIC_EVT_ERROR:              return "ERROR";
-    default:                           return "?";
-    }
-}
-
-static void Music_Test_Evt_Cb(const music_event_t *evt, void *user_ctx)
+/** bt_audio 事件回调：全部交给 MusicPlay（MusicPlay 未就绪前忽略） */
+static void App_Bt_Evt_Cb(const bt_audio_event_t *evt, void *user_ctx)
 {
     (void)user_ctx;
     if (evt == NULL)
     {
         return;
     }
-    ESP_LOGI(TAG, "[mp-evt] %s: src=%d state=%d vol=%u track=%u/%u",
-             Music_Test_Evt_Name(evt->id),
-             (int)evt->view.source, (int)evt->view.state,
-             evt->view.volume, evt->view.track_index, evt->view.track_count);
+    if (s_app.music != NULL)
+    {
+        music_play_on_bt_event(s_app.music, evt);
+    }
 }
 
-/** 打印当前 MusicPlay 视图快照 + 播放位置（get_view 返回内部快照，无需持锁） */
-static void Music_Test_Print_View(const char *tag)
-{
-    const music_play_view_t *v;
-    uint32_t pos = 0;
+/* ======================== 各功能 boot 任务 ======================== */
 
-    if (s_musicTestPlayer == NULL)
-    {
-        return;
-    }
-    v = music_play_get_view(s_musicTestPlayer);
-    if (v == NULL)
-    {
-        return;
-    }
-    music_play_get_position_ms(s_musicTestPlayer, &pos);
-    ESP_LOGI(TAG, "[mp] %s: src=%d state=%d mode=%d vol=%u%% pos=%lums "
-             "track=%u/%u pending=%d stack=%u",
-             tag, (int)v->source, (int)v->state, (int)v->mode, v->volume,
-             (unsigned long)pos, v->track_index, v->track_count,
-             v->pending_cmd ? 1 : 0,
-             (unsigned)uxTaskGetStackHighWaterMark(NULL));
-}
-
-/** 第十一阶段测试：MusicPlay 模块接线 + 播放冒烟（独立任务，避开 main_task 小栈） */
-static void MusicPlay_Test(void *arg)
+/**
+ * @brief MusicPlay 任务：SD 卡 + 组播通道 + 蓝牙 + music_play_create
+ *
+ * 蓝牙句柄由本任务创建并经全局上下文共享给 CallPhone（唤醒后 HFP 上行）。
+ */
+static void App_MusicPlay_Task(void *arg)
 {
     (void)arg;
-    wifi_manager_handle_t wifi        = NULL;
-    wifi_mcast_handle_t   audio_chan  = NULL;
-    wifi_mcast_handle_t   ctrl_chan   = NULL;
-    bt_audio_handle_t     audio       = NULL;
-    music_play_cfg_t      mcfg        = {0};
-    wifi_manager_cfg_t    cfg         = {0};
-    wifi_mcast_cfg_t      mc          = {0};
-    node_role_cfg_t       rcfg        = {0};
-    bt_audio_cfg_t        bcfg        = {0};
-    uint16_t              track_count = 0;
-    esp_err_t             err;
+    music_play_cfg_t mcfg = {0};
+    wifi_mcast_cfg_t mc   = {0};
+    bt_audio_cfg_t   bcfg = {0};
+    bool             bt_ready = false;
+    esp_err_t        err;
 
-    ESP_LOGI(TAG, "=== MusicPlay Test Start（第十一阶段） ===");
-    ESP_LOGI(TAG, "[heap] test start: int free=%u largest=%u, psram free=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    ESP_LOGI(TAG, "[MusicPlay] boot: SD card / mcast / bt_audio / music_play");
 
-    /* 1. 功放 + SD 卡前置（本地播放依赖） */
-    if (Amplifier_Init() != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Amplifier_Init failed");
-        return;
-    }
+    /* 1) SD 卡（本地播放依赖；失败仅告警，蓝牙源仍可用） */
     if (SD_Card_Init() != ESP_OK)
     {
-        ESP_LOGW(TAG, "SD_Card_Init failed, 本地列表将为空（仍可测蓝牙源）");
-    }
-    Amplifier_Set_Volume(80);
-
-    /* 2. NVS 凭据 + 连接热点（与 Sync_Protocol_Test / Light_Control_Test 一致） */
-    err = node_role_init(NULL);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "node_role_init failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-    snprintf(rcfg.wifi_ssid,       sizeof(rcfg.wifi_ssid),       "%s", NODE_ROLE_DEFAULT_SSID);
-    snprintf(rcfg.wifi_password,   sizeof(rcfg.wifi_password),   "%s", NODE_ROLE_DEFAULT_PASSWORD);
-    snprintf(rcfg.ota_server_url,  sizeof(rcfg.ota_server_url),  "%s", NODE_ROLE_DEFAULT_OTA_URL);
-    snprintf(rcfg.multicast_group, sizeof(rcfg.multicast_group), "%s", NODE_ROLE_DEFAULT_GROUP);
-    rcfg.role              = NODE_ROLE_MASTER;
-    rcfg.volume            = NODE_ROLE_DEFAULT_VOLUME;
-    rcfg.play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
-    rcfg.sync_delay_ms     = NODE_ROLE_DEFAULT_SYNC_DELAY_MS;
-    rcfg.audio_sample_rate = NODE_ROLE_DEFAULT_SAMPLE_RATE;
-    err = node_role_set(&rcfg);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "node_role_set failed: %s", esp_err_to_name(err));
-        goto test_exit;
+        ESP_LOGW(TAG, "[MusicPlay] SD_Card_Init failed, 本地列表将为空");
     }
 
-    wifi = wifi_manager_create(&cfg);
-    if (wifi == NULL)
-    {
-        ESP_LOGE(TAG, "wifi_manager_create failed");
-        goto test_exit;
-    }
-    wifi_manager_register_event_cb(wifi, Wifi_Test_Evt_Cb, NULL);
-    err = wifi_manager_start(wifi);
+    /* 2) 组播通道：音频只发(5678) / 控制收发(5679)，MusicPlay 经 cfg 传入 */
+    mc.group         = SYNC_PROTOCOL_MCAST_GROUP;
+    mc.port          = SYNC_PROTOCOL_MCAST_PORT_AUDIO;
+    mc.rx_enable     = false;
+    err = wifi_manager_mcast_open(s_app.wifi, &mc, &s_app.audio_chan);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "wifi_manager_start failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-    ESP_LOGI(TAG, "connecting to AP, waiting for IP...");
-    for (int i = 0; i < 150; i++)
-    {
-        if (wifi_manager_is_connected(wifi))
-        {
-            char ip[16] = {0};
-            size_t ip_len = sizeof(ip);
-            if (wifi_manager_get_ip(wifi, ip, &ip_len) == ESP_OK)
-            {
-                ESP_LOGI(TAG, "wifi connected, ip=%s rssi=%d",
-                         ip, wifi_manager_get_rssi(wifi));
-            }
-            ESP_LOGI(TAG, "[heap] after wifi connect: int free=%u largest=%u, psram free=%u",
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (i == 149)
-        {
-            ESP_LOGE(TAG, "wait ip timeout, check SSID/PWD");
-            goto test_exit;
-        }
+        ESP_LOGE(TAG, "[MusicPlay] mcast_open audio failed: %s", esp_err_to_name(err));
+        goto fail;
     }
 
-    /* 3. 组播通道：音频只发（5678）/ 控制收发（5679），MusicPlay 经 cfg 传入 */
-    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
-    mc.port  = SYNC_PROTOCOL_MCAST_PORT_AUDIO;
-    mc.rx_enable = false;
-    err = wifi_manager_mcast_open(wifi, &mc, &audio_chan);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "mcast_open audio_chan failed: %s", esp_err_to_name(err));
-        goto test_exit;
-    }
-    mc.group = SYNC_PROTOCOL_MCAST_GROUP;
-    mc.port  = SYNC_PROTOCOL_MCAST_PORT_CTRL;
+    mc.group         = SYNC_PROTOCOL_MCAST_GROUP;
+    mc.port          = SYNC_PROTOCOL_MCAST_PORT_CTRL;
     mc.rx_enable     = true;
     mc.rx_fifo_bytes = 4096;
-    err = wifi_manager_mcast_open(wifi, &mc, &ctrl_chan);
+    err = wifi_manager_mcast_open(s_app.wifi, &mc, &s_app.control_chan);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "mcast_open ctrl_chan failed: %s", esp_err_to_name(err));
-        goto test_exit;
+        ESP_LOGE(TAG, "[MusicPlay] mcast_open ctrl failed: %s", esp_err_to_name(err));
+        goto fail;
     }
-    ESP_LOGI(TAG, "[heap] after mcast: int free=%u largest=%u, psram free=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    /* 4. bt_audio 创建 + 启动；on_pcm 直连 sync，on_event 胶水进 MusicPlay */
-    bcfg.device_name = "MPS-Sync-Test";
-    bcfg.on_pcm      = Music_Test_Bt_Pcm_Cb;
-    bcfg.on_event    = Music_Test_Bt_Evt_Cb;
-    audio = bt_audio_create(&bcfg);
-    if (audio == NULL)
+    /* 3) 蓝牙：on_pcm 直连 sync，on_event 胶水进 MusicPlay */
+    bcfg.device_name = APP_BT_DEVICE_NAME;
+    bcfg.on_pcm      = App_Bt_Pcm_Cb;
+    bcfg.on_event    = App_Bt_Evt_Cb;
+    s_app.bt = bt_audio_create(&bcfg);
+    if (s_app.bt == NULL)
     {
-        ESP_LOGE(TAG, "bt_audio_create failed");
-        goto test_exit;
+        ESP_LOGE(TAG, "[MusicPlay] bt_audio_create failed");
+        goto fail;
     }
-    err = bt_audio_start(audio);
+    err = bt_audio_start(s_app.bt);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "bt_audio_start failed: %s", esp_err_to_name(err));
-        goto test_exit;
+        ESP_LOGE(TAG, "[MusicPlay] bt_audio_start failed: %s", esp_err_to_name(err));
+        goto fail;
     }
 
-    /* 5. MusicPlay 创建（内部自行 init/deinit sync_protocol；D=0 从 node_role 读） */
-    mcfg.bt_audio      = audio;
-    mcfg.audio_chan    = audio_chan;
-    mcfg.control_chan  = ctrl_chan;
+    /* 蓝牙就绪：CallPhone（esp-sr）依赖 bt_audio 句柄 */
+    bt_ready = true;
+    xEventGroupSetBits(s_app.evt, APP_EVT_BT_READY);
+    App_Log_Heap("after bt_audio");
+
+    /* 4) MusicPlay：内部自行 init/deinit sync_protocol（D=0 从 node_role 读） */
+    mcfg.bt_audio      = s_app.bt;
+    mcfg.audio_chan    = s_app.audio_chan;
+    mcfg.control_chan  = s_app.control_chan;
     mcfg.sync_delay_ms = 0;
-    mcfg.on_event      = Music_Test_Evt_Cb;
-    s_musicTestPlayer  = music_play_create(&mcfg);
-    if (s_musicTestPlayer == NULL)
+    mcfg.on_event      = ui_on_music_event;
+    s_app.music = music_play_create(&mcfg);
+    if (s_app.music == NULL)
     {
-        ESP_LOGE(TAG, "music_play_create failed");
-        goto test_exit;
+        ESP_LOGE(TAG, "[MusicPlay] music_play_create failed");
+        goto fail;
     }
 
-    /* 6. 本地播放冒烟：扫描列表 → 播第 1 首 */
-    Music_Test_Print_View("before scan");
-    music_play_scan_local(s_musicTestPlayer);
-    vTaskDelay(pdMS_TO_TICKS(1000));   /* 等扫描完成 */
-    track_count = music_play_get_track_count(s_musicTestPlayer);
-    ESP_LOGI(TAG, "local tracks: %u", track_count);
+    /* 5) 开机即扫描本地列表（自动源选择未连蓝牙时落本地源） */
+    music_play_scan_local(s_app.music);
 
-    if (track_count > 0)
+    xEventGroupSetBits(s_app.evt, APP_EVT_MUSIC_READY);
+    ESP_LOGI(TAG, "[MusicPlay] boot done");
+    vTaskDelete(NULL);
+    return;
+
+fail:
+    if (!bt_ready)
     {
-        music_play_select_track(s_musicTestPlayer, 0);
-        vTaskDelay(pdMS_TO_TICKS(4000));   /* 听 4s */
-        Music_Test_Print_View("after select 0");
-
-        music_play_command(s_musicTestPlayer, MUSIC_CMD_NEXT);
-        vTaskDelay(pdMS_TO_TICKS(2500));
-        Music_Test_Print_View("after NEXT");
-
-        music_play_command(s_musicTestPlayer, MUSIC_CMD_PAUSE);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        Music_Test_Print_View("after PAUSE");
-
-        music_play_command(s_musicTestPlayer, MUSIC_CMD_RESUME);
-        vTaskDelay(pdMS_TO_TICKS(2500));
-        Music_Test_Print_View("after RESUME");
-
-        music_play_set_mode(s_musicTestPlayer, MUSIC_PLAY_MODE_SINGLE_LOOP);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        music_play_set_mode(s_musicTestPlayer, MUSIC_PLAY_MODE_SEQUENTIAL);
-        vTaskDelay(pdMS_TO_TICKS(300));
-
-        music_play_set_volume(s_musicTestPlayer, 50);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        music_play_command(s_musicTestPlayer, MUSIC_CMD_VOLUME_UP);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        music_play_command(s_musicTestPlayer, MUSIC_CMD_VOLUME_DOWN);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        Music_Test_Print_View("after volume");
+        xEventGroupSetBits(s_app.evt, APP_EVT_BT_FAILED);
     }
-    else
-    {
-        ESP_LOGW(TAG, "no local mp3, skip local smoke test");
-    }
-
-    /* 7. 切蓝牙源：手机配对/连接后播放，观察 AVRCP 事件与位置推送 */
-    ESP_LOGI(TAG, "switch to BT source, connect your phone...");
-    music_play_set_source(s_musicTestPlayer, MUSIC_SOURCE_BT);
-    music_play_command(s_musicTestPlayer, MUSIC_CMD_PLAY);
-
-    /* 8. 观察循环：每 5s 打印一次视图 + 播放位置 */
-    for (;;)
-    {
-        Music_Test_Print_View("live");
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-
-test_exit:
-    if (s_musicTestPlayer != NULL)
-    {
-        music_play_destroy(s_musicTestPlayer);
-        s_musicTestPlayer = NULL;
-    }
-    if (audio != NULL)
-    {
-        bt_audio_stop(audio);
-        bt_audio_destroy(audio);
-    }
-    if (ctrl_chan != NULL)
-    {
-        wifi_manager_mcast_close(ctrl_chan);
-    }
-    if (audio_chan != NULL)
-    {
-        wifi_manager_mcast_close(audio_chan);
-    }
-    if (wifi != NULL)
-    {
-        wifi_manager_destroy(wifi);
-    }
+    xEventGroupSetBits(s_app.evt, APP_EVT_MUSIC_FAILED);
     vTaskDelete(NULL);
 }
 
-void app_main(void)
+/**
+ * @brief CallPhone 任务：等蓝牙就绪 → esp-sr 唤醒词检测（麦克风上行）
+ *
+ * 先等 MusicPlay 完成蓝牙初始化（拿到 bt_audio 句柄），再创建 esp-sr
+ * 唤醒检测链路；麦克风 FIFO 由 app_main 的 Microphone_Init() 提前备好。
+ */
+static void App_CallPhone_Task(void *arg)
 {
-	SystemStart();
-	StartAndStop_Init();
+    (void)arg;
+    call_phone_cfg_t ccfg = {0};
+    EventBits_t      bits;
 
-	nvs_flash_init();
+    ESP_LOGI(TAG, "[CallPhone] boot: waiting for bluetooth ready ...");
+    bits = App_Wait_Bits(APP_EVT_BT_READY | APP_EVT_BT_FAILED,
+                         APP_DEP_WAIT_MS, "bluetooth ready");
 
-	if (esp_psram_is_initialized()) {
-        printf("PSRAM 初始化成功！可用大小: %d 字节\n", esp_psram_get_size());
-    } else {
-        printf("PSRAM 未找到或未初始化！\n");
+    if (s_app.bt == NULL || (bits & APP_EVT_BT_READY) == 0)
+    {
+        ESP_LOGE(TAG, "[CallPhone] bluetooth not ready, skip esp-sr init");
+        xEventGroupSetBits(s_app.evt, APP_EVT_CALL_FAILED);
+        vTaskDelete(NULL);
+        return;
     }
 
-	/* 麦克风录音 10s -> 功放回放测试（测试完请注释掉） */
-	// Mic_Record_Playback_Test();
+    ccfg.audio       = s_app.bt;
+    ccfg.sample_rate = 44100;   /* 全链路固定 44.1kHz，模块内重采样到 16k */
 
-    /* 蓝牙 A2DP 测试（bt_audio 模块） */
-    // BtA2dp_Test();
+    s_app.call = call_phone_create(&ccfg);
+    if (s_app.call == NULL)
+    {
+        ESP_LOGE(TAG, "[CallPhone] call_phone_create failed");
+        xEventGroupSetBits(s_app.evt, APP_EVT_CALL_FAILED);
+        vTaskDelete(NULL);
+        return;
+    }
 
-    /* 第四阶段：CallPhone 接线测试（完成后请注释掉） */
-    // CallPhone_Test();   /* 与 MP3 解码测试共用功放，跑 audio_decoder 测试时临时屏蔽 */
+    if (call_phone_start_listening(s_app.call) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "[CallPhone] start_listening failed");
+        xEventGroupSetBits(s_app.evt, APP_EVT_CALL_FAILED);
+        vTaskDelete(NULL);
+        return;
+    }
 
-	/* SD 卡测试与 LCD 测试各自为任务：同一条 SPI2 总线，SD 测完再通知 LCD */
-	// xTaskCreatePinnedToCore(Sd_Card_Test_Task, "sd_test", 8192, NULL, 5, NULL, 0);
-	// xTaskCreatePinnedToCore(Lcd_Touch_Test_Task, "lcd_test", 8192, NULL, 4, &s_lcdTestTask, 0);
+    ESP_LOGI(TAG, "[CallPhone] boot done (唤醒词: 你好小智)");
+    xEventGroupSetBits(s_app.evt, APP_EVT_CALL_READY);
+    vTaskDelete(NULL);
+}
 
-	/* SD 卡 MP3 播放测试（audio_decoder 模块）：不经 sync_protocol，直接经功放播放 */
-    // Audio_Decoder_Test();   /* 测 UI 时临时屏蔽：解码与 UI_Task 同在 Core 1 会互相抢占 */
+/**
+ * @brief LightControl 任务：等 wifi_manager 就绪 → 灯控组播通道 + 灯控模块
+ *
+ * 灯控通道（239.0.0.2:8889）由 App 经 wifi_manager 打开并传入；上行 ack/status
+ * 经 ui_on_light_event 通知 UI 刷新灯图标。
+ */
+static void App_LightControl_Task(void *arg)
+{
+    (void)arg;
+    wifi_mcast_cfg_t    mc   = {0};
+    light_control_cfg_t lcfg = {0};
+    esp_err_t           err;
 
-	/* 第六阶段：wifi_manager 连接 + UDP 组播收发测试（SSID: HW666） */
-	// Wifi_Mcast_Test();
+    ESP_LOGI(TAG, "[LightControl] boot: waiting for wifi ready ...");
+    App_Wait_Bits(APP_EVT_WIFI_READY, APP_DEP_WAIT_MS, "wifi ready");
 
-	/* 第七阶段：LightControl 灯控模块回环测试 */
-	// Light_Control_Test();
+    if (s_app.wifi == NULL || !wifi_manager_is_connected(s_app.wifi))
+    {
+        ESP_LOGE(TAG, "[LightControl] wifi not ready, skip");
+        xEventGroupSetBits(s_app.evt, APP_EVT_LIGHT_FAILED);
+        vTaskDelete(NULL);
+        return;
+    }
 
-	/* 第八阶段：UI 模块联调测试（LVGL 9.6 自持 UI_Task，全占位模式） */
-	// UI_Test();
+    mc.group         = APP_LIGHT_MCAST_GROUP;
+    mc.port          = APP_LIGHT_MCAST_PORT;
+    mc.rx_enable     = true;
+    mc.rx_fifo_bytes = 4096;
+    err = wifi_manager_mcast_open(s_app.wifi, &mc, &s_app.light_chan);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "[LightControl] mcast_open failed: %s", esp_err_to_name(err));
+        xEventGroupSetBits(s_app.evt, APP_EVT_LIGHT_FAILED);
+        vTaskDelete(NULL);
+        return;
+    }
 
-	/* 第九阶段：sync_protocol 同步播放模块自环测试（音频/控制组播自环 + 本地功放）。
-	 * 测试函数自带大栈缓冲，按惯例单独起任务（16KB 栈，避开 main_task 3.5KB 限制） */
-	// xTaskCreatePinnedToCore(Sync_Protocol_Test, "sync_test", 16384, NULL, 5, NULL, 0);
-	
-	/* 第十一阶段：MusicPlay 播放测试（测试任务栈 8192→4096，省内部 DRAM） */
-	xTaskCreatePinnedToCore(MusicPlay_Test, "music_play_test", 4096, NULL, 5, NULL, 0);
+    lcfg.chan     = s_app.light_chan;
+    lcfg.on_event = ui_on_light_event;
+    s_app.light = light_control_create(&lcfg);
+    if (s_app.light == NULL)
+    {
+        ESP_LOGE(TAG, "[LightControl] light_control_create failed");
+        xEventGroupSetBits(s_app.evt, APP_EVT_LIGHT_FAILED);
+        vTaskDelete(NULL);
+        return;
+    }
 
-	while(1)
-	{
-		vTaskDelay(pdMS_TO_TICKS(1000));
-	}
+    ESP_LOGI(TAG, "[LightControl] boot done");
+    xEventGroupSetBits(s_app.evt, APP_EVT_LIGHT_READY);
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief UI 任务：等各模块句柄就绪 → ui_init（LCD / 触摸屏 / LVGL）
+ *
+ * 未就绪的句柄保持 NULL，UI 按"占位"降级显示；ui_init 内部自建 UI_Task。
+ */
+static void App_UI_Task(void *arg)
+{
+    (void)arg;
+    ui_cfg_t  ucfg = {0};
+    esp_err_t err;
+
+    ESP_LOGI(TAG, "[UI] boot: waiting for module handles ...");
+    /* 逐个等 READY|FAILED：某模块挂了立刻继续，UI 按占位降级显示；
+     * 若只等 READY 位，CallPhone 失败会空等满超时导致长时间黑屏 */
+    App_Wait_Bits(APP_EVT_MUSIC_READY | APP_EVT_MUSIC_FAILED,
+                  APP_DEP_WAIT_MS, "music_play ready");
+    App_Wait_Bits(APP_EVT_CALL_READY | APP_EVT_CALL_FAILED,
+                  APP_DEP_WAIT_MS, "call_phone ready");
+    App_Wait_Bits(APP_EVT_LIGHT_READY | APP_EVT_LIGHT_FAILED,
+                  APP_DEP_WAIT_MS, "light_control ready");
+
+    ucfg.wifi       = s_app.wifi;
+    ucfg.light      = s_app.light;
+    ucfg.call_phone = s_app.call;
+    ucfg.music      = s_app.music;
+
+    App_Log_Heap("before ui_init");
+    err = ui_init(&ucfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "[UI] ui_init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+    App_Log_Heap("after ui_init");
+    ESP_LOGI(TAG, "[UI] boot done");
+    /* UI 任务常驻：进入主题/页面构建 + LVGL 渲染循环（不再返回） */
+    ui_run();
+}
+
+/* ======================== 应用入口 ======================== */
+
+void app_main(void)
+{
+    esp_err_t      err;
+    node_role_cfg_t nr = {0};
+
+    SystemStart();
+    StartAndStop_Init();
+
+    /* 1. NVS：node_role / wifi_manager / ota_manager 的持久化基础 */
+    err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    if (esp_psram_is_initialized())
+    {
+        ESP_LOGI(TAG, "PSRAM ready, size=%u bytes", (unsigned)esp_psram_get_size());
+    }
+    else
+    {
+        ESP_LOGW(TAG, "PSRAM not initialized");
+    }
+
+    /* 2. node_role：wifi_manager 启动时经 node_role_get() 读取 WiFi 凭据 */
+    ESP_ERROR_CHECK(node_role_init(NULL));
+
+    /* 3. 就绪事件组：各模块 boot 任务与依赖方同步用 */
+    s_app.evt = xEventGroupCreate();
+    if (s_app.evt == NULL)
+    {
+        ESP_LOGE(TAG, "event group create failed");
+        return;
+    }
+
+    App_Log_Heap("boot start");
+
+    /* 4. WiFi：连接热点并等待拿到 IP */
+    App_Wifi_Start();
+    App_Log_Heap("after wifi");
+
+    /* 5. OTA：有新固件则升级重启，否则继续 */
+    App_Ota_Check();
+    App_Log_Heap("after ota");
+
+    /* 6. 麦克风（RX）与功放（TX）：物理音频链路 */
+    if (Microphone_Init() != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Microphone_Init failed (语音唤醒不可用)");
+    }
+    if (Amplifier_Init() != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Amplifier_Init failed (无音频输出)");
+    }
+    if (node_role_get(&nr) == ESP_OK)
+    {
+        Amplifier_Set_Volume(nr.volume);   /* MusicPlay create 时还会再同步一次 */
+    }
+    App_Log_Heap("after mic/amp");
+
+    /* 7. HFP 下行立体声扩展缓冲：非 DMA，放 PSRAM（内部 RAM 留给栈/DMA） */
+    s_hfpDnStereoBuf = (int16_t *)heap_caps_malloc(
+        APP_HFP_DN_STEREO_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_hfpDnStereoBuf == NULL)
+    {
+        s_hfpDnStereoBuf = (int16_t *)heap_caps_malloc(
+            APP_HFP_DN_STEREO_SAMPLES * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (s_hfpDnStereoBuf == NULL)
+    {
+        ESP_LOGW(TAG, "HFP stereo expand buffer alloc failed (通话下行无声)");
+    }
+
+    /*
+     * 8. 创建功能任务：UI 任务最先建 —— 它的栈最大，必须趁内部堆还没被
+     *    WiFi/BT/其它任务切碎时把这块连续内存占住（创建后立即阻塞等各模块
+     *    就绪，不参与启动期 CPU 竞争）。其余模块仍严格串行：前一个 boot
+     *    任务跑完并退出后再建下一个；依赖 MusicPlay（建蓝牙）→ CallPhone
+     *    （等蓝牙）→ LightControl（等 WiFi）。
+     */
+    (void)App_Boot_Task_Create(App_UI_Task, "UI_Task",
+                               APP_UI_TASK_STACK, APP_UI_TASK_PRIO, 1, 0);
+
+    (void)App_Boot_Task_Create(App_MusicPlay_Task, "mp_boot",
+                               APP_MUSIC_TASK_STACK, APP_BOOT_TASK_PRIO, 1,
+                               APP_EVT_MUSIC_FAILED);
+    App_Wait_Bits(APP_EVT_MUSIC_READY | APP_EVT_MUSIC_FAILED,
+                  APP_DEP_WAIT_MS, "music_play ready");
+    vTaskDelay(pdMS_TO_TICKS(50));   /* 让 IDLE 回收 mp_boot 栈，再建下一个 */
+    App_Log_Heap("after mp_boot");
+
+    (void)App_Boot_Task_Create(App_CallPhone_Task, "cp_boot",
+                               APP_CALL_TASK_STACK, APP_BOOT_TASK_PRIO, 1,
+                               APP_EVT_CALL_FAILED);
+    App_Wait_Bits(APP_EVT_CALL_READY | APP_EVT_CALL_FAILED,
+                  APP_DEP_WAIT_MS, "call_phone ready");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    App_Log_Heap("after cp_boot");
+
+    (void)App_Boot_Task_Create(App_LightControl_Task, "lc_boot",
+                               APP_LIGHT_TASK_STACK, APP_BOOT_TASK_PRIO, 0,
+                               APP_EVT_LIGHT_FAILED);
+    App_Wait_Bits(APP_EVT_LIGHT_READY | APP_EVT_LIGHT_FAILED,
+                  APP_DEP_WAIT_MS, "light_control ready");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    App_Log_Heap("after lc_boot");
+
+    ESP_LOGI(TAG, "all boot tasks dispatched");
+
+    /* 9. 新固件确认运行正常：取消自动回滚（仅 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 时生效） */
+    if (OTA_Update_MarkAppValid() == ESP_OK)
+    {
+        ESP_LOGI(TAG, "app marked valid (rollback cancelled)");
+    }
+
+    /* app_main 返回后 IDF 主任务自删，回收其约 4KB 内部栈（内部 RAM 紧张时可观） */
 }

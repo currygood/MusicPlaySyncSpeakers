@@ -54,10 +54,9 @@ static const char *TAG = "AUDIO_DECODER";
 /** 解码任务优先级（设计任务表：10） */
 #define AUDIO_DECODER_TASK_PRIO     10
 
-/** 解码任务栈大小（帧解码 scratch —— mp3dec_scratch_t 约 15.5KB —— 已由
- * open() 预分配至堆并 PSRAM 优先，不在任务栈上；栈上只剩单帧 PCM 4.6KB
- * 与调用深度，8KB 足够。原 32KB 是 scratch 落栈时的取值） */
-#define AUDIO_DECODER_TASK_STACK    8192
+/** 解码任务栈大小：单帧 PCM 与帧解码 scratch 都已移到堆（PSRAM 优先），
+ * 栈上只剩调用深度，4KB 足够（内部 RAM 紧张，见十三A记录） */
+#define AUDIO_DECODER_TASK_STACK    4096
 
 /** 命令队列深度：同一时刻实际只有 1 条有效命令，留余量便于组合 */
 #define AUDIO_DECODER_CMD_QUEUE_LEN 4
@@ -97,6 +96,7 @@ struct audio_decoder_s
     /* ---- 流式解码状态（minimp3 基础 API + 自建滑动窗口） ---- */
     mp3dec_t              mp3;          /* 解码器核心状态（约 7KB，随结构体在内部 DRAM） */
     mp3dec_scratch_t     *scratch;      /* 帧解码 scratch（约 15.5KB，PSRAM 优先，不占任务栈） */
+    mp3d_sample_t        *pcm;          /* 单帧 PCM 输出（4.6KB，PSRAM 优先，不占任务栈） */
     uint8_t              *in_buf;       /* 输入缓冲（8KB，PSRAM 优先，失败回退内部） */
     size_t                in_fill;      /* 缓冲内有效字节数 */
     size_t                in_consumed;  /* 已消费偏移（滑动窗口起点） */
@@ -316,6 +316,10 @@ static void Audio_Decoder_Discard(struct audio_decoder_s *dec)
     {
         free(dec->scratch);
     }
+    if (dec->pcm != NULL)
+    {
+        free(dec->pcm);
+    }
     if (dec->path != NULL)
     {
         free(dec->path);
@@ -331,8 +335,8 @@ static void Audio_Decoder_Task(void *arg)
     bool quit = false;
     uint32_t decode_frames = 0;  /* 诊断：累计解码帧数 */
     int64_t  diag_last_us  = 0;  /* 诊断：上次心跳时间戳 */
-    /* 单帧 PCM 缓冲：minimp3 单帧最多 1152 采样/声道 × 2 声道（46 字节×2304） */
-    mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+    /* 单帧 PCM 缓冲已在 open() 分配到堆（PSRAM 优先），不再占任务栈 */
+    mp3d_sample_t *pcm = dec->pcm;
 
     /* open() 期间的首帧探测：帧解码 scratch（约 15.5KB）已在堆（PSRAM 优先），
      * 但解码任务栈上仍有单帧 PCM 4.6KB，主栈（默认 3584B）放不下，
@@ -629,6 +633,23 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     if (dec->scratch == NULL)
     {
         ESP_LOGE(TAG, "open: scratch alloc failed");
+        Audio_Decoder_Discard(dec);
+        return NULL;
+    }
+    /* 单帧 PCM 输出（minimp3 单帧最多 1152 采样/声道 × 2 声道 ≈ 4.6KB）：
+     * 移出任务栈省内部 RAM；PSRAM 优先，失败回退内部。 */
+    dec->pcm = (mp3d_sample_t *)heap_caps_malloc(
+        MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(mp3d_sample_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (dec->pcm == NULL)
+    {
+        dec->pcm = (mp3d_sample_t *)heap_caps_malloc(
+            MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(mp3d_sample_t),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (dec->pcm == NULL)
+    {
+        ESP_LOGE(TAG, "open: pcm buffer alloc failed");
         Audio_Decoder_Discard(dec);
         return NULL;
     }

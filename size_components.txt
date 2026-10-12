@@ -1,0 +1,2007 @@
+Executing action: size-components
+Running cmake in directory F:\EmbeddedProject\MusicPlaySyncSpeakers\Play_Master\build
+Executing "cmake -G Ninja -B F:\EmbeddedProject\MusicPlaySyncSpeakers\Play_Master\build -DPYTHON_DEPS_CHECKED=1 -DPYTHON=F:\esp_tool\python_env\idf6.0_py3.11_env\Scripts\python.exe -DESP_PLATFORM=1 -DCCACHE_ENABLE=True F:\EmbeddedProject\MusicPlaySyncSpeakers\Play_Master"...
+-- Component directory F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/mqtt does not contain a CMakeLists.txt file. No component will be added
+-- Minimal build - ON
+-- Building ESP-IDF components for target esp32
+NOTICE: 
+
+Following dependencies have new versions available:
+
+Dependency "espressif/dl_fft": "0.7.0" -> "0.8.0"
+
+Dependency "espressif/esp-dl": "3.3.11" -> "3.3.13"
+
+Dependency "espressif/esp-sr": "2.5.3" -> "2.6.0"
+
+Dependency "lvgl/lvgl": "9.6.0" -> "9.6.0~1"
+
+Consider running "idf.py update-dependencies" to update your lock file.
+
+NOTICE: Processing 8 dependencies:
+
+NOTICE: [1/8] espressif/cjson (1.7.19~2)
+
+NOTICE: [2/8] espressif/dl_fft (0.7.0)
+
+NOTICE: [3/8] espressif/esp-dl (3.3.11)
+
+NOTICE: [4/8] espressif/esp-dsp (1.8.0)
+
+NOTICE: [5/8] espressif/esp-sr (2.5.3)
+
+NOTICE: [6/8] espressif/esp_new_jpeg (1.0.2)
+
+NOTICE: [7/8] lvgl/lvgl (9.6.0)
+
+NOTICE: [8/8] idf (6.0.1)
+
+CMake Warning at F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/tools/cmake/build.cmake:695 (message):
+Call Stack (most recent call first):
+  F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/tools/cmake/project.cmake:773 (idf_build_process)
+  CMakeLists.txt:13 (project)
+
+
+-- CONFIG_ESP32P4_SELECTS_REV_LESS_V3 is 
+-- IDF_VERSION_MAJOR is 6
+-- IDF_VERSION_MINOR is 0
+-- IDF_VERSION_PATCH is 1
+-- TARGET_LIB_PATH is set to: esp32
+-- ESP-TEE is currently supported only on the esp32c6;esp32h2;esp32c5;esp32c61 SoCs
+-- KCONFIG_REPORT_VERBOSITY not set, using default
+-- Project sdkconfig file F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig
+info: Default value for ESP_WIFI_STATIC_TX_BUFFER_NUM in sdkconfig is 8 but it is 16 according to Kconfig.
+
+Using default value from sdkconfig (8).
+
+Configuration Report                                                            
+
++------------------------------------------------------------------------------+
+
+|  Parser Version: 1                                                           |
+
+|  Verbosity: default                                                          |
+
+|  Defaults policy: sdkconfig                                                  |
+
+|  Status: Finished with notifications                                         |
+
+|                                                                              |
+
+| Default Value Mismatch                                                       |
+
+| +--------------------------------------------------------------------------+ |
+
+| | Using sdkconfig default values                                        |  | |
+
+| | Config symbols with different default value between sdkconfig and     |  | |
+
+| | Kconfig                                                               |  | |
+
+| | ESP_WIFI_STATIC_TX_BUFFER_NUM: Kconfig default value: 16, sdkconfig   |  | |
+
+| | default value: 8                                                      |  | |
+
+| +--------------------------------------------------------------------------+ |
+
+| Disabled Symbols/Choices With User-Set Value                                 |
+
+| +--------------------------------------------------------------------------+ |
+
+| | * ESP_INTR_IN_IRAM (defined at                                           | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hw_support/Kcon�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * LIBC_MISC_IN_IRAM (defined at                                          | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_libc/Kconfig:45) | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_ROM_PRINT_IN_IRAM (defined at                                      | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/Kconfig:3)   | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_CONSOLE_UART_BAUDRATE (defined at                                  | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_stdio/Kconfig:1�� | |
+
+| | with user-set value 115200 from                                          | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_SYSTEM_IN_IRAM (defined at                                         | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_system/Kconfig:�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_TIMER_IN_IRAM (defined at                                          | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_timer/Kconfig:3) | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * LOG_IN_IRAM (defined at                                                | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/log/Kconfig:55) with | |
+
+| | user-set value y from                                                    | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * SPI_FLASH_PLACE_FUNCTIONS_IN_IRAM (defined at                          | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/spi_flash/Kconfig:1�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| +--------------------------------------------------------------------------+ |
+
++------------------------------------------------------------------------------+
+
+CMake Warning at F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/tools/cmake/project.cmake:786 (message):
+  Missing kconfig option.  Re-run the build process...
+Call Stack (most recent call first):
+  CMakeLists.txt:13 (project)
+
+
+NOTICE: Skipping optional dependency: espressif/freetype
+
+NOTICE: Skipping optional dependency: espressif/libjpeg-turbo
+
+NOTICE: Skipping optional dependency: espressif/libpng
+
+NOTICE: Skipping optional dependency: espressif/lz4
+
+NOTICE: 
+
+Following dependencies have new versions available:
+
+Dependency "espressif/dl_fft": "0.7.0" -> "0.8.0"
+
+Dependency "espressif/esp-dl": "3.3.11" -> "3.3.13"
+
+Dependency "espressif/esp-sr": "2.5.3" -> "2.6.0"
+
+Dependency "lvgl/lvgl": "9.6.0" -> "9.6.0~1"
+
+Consider running "idf.py update-dependencies" to update your lock file.
+
+NOTICE: Processing 8 dependencies:
+
+NOTICE: [1/8] espressif/cjson (1.7.19~2)
+
+NOTICE: [2/8] espressif/dl_fft (0.7.0)
+
+NOTICE: [3/8] espressif/esp-dl (3.3.11)
+
+NOTICE: [4/8] espressif/esp-dsp (1.8.0)
+
+NOTICE: [5/8] espressif/esp-sr (2.5.3)
+
+NOTICE: [6/8] espressif/esp_new_jpeg (1.0.2)
+
+NOTICE: [7/8] lvgl/lvgl (9.6.0)
+
+NOTICE: [8/8] idf (6.0.1)
+
+-- CONFIG_ESP32P4_SELECTS_REV_LESS_V3 is 
+-- IDF_VERSION_MAJOR is 6
+-- IDF_VERSION_MINOR is 0
+-- IDF_VERSION_PATCH is 1
+-- TARGET_LIB_PATH is set to: esp32
+-- ESP-TEE is currently supported only on the esp32c6;esp32h2;esp32c5;esp32c61 SoCs
+NOTICE: Skipping optional dependency: espressif/freetype
+
+NOTICE: Skipping optional dependency: espressif/libjpeg-turbo
+
+NOTICE: Skipping optional dependency: espressif/libpng
+
+NOTICE: Skipping optional dependency: espressif/lz4
+
+-- KCONFIG_REPORT_VERBOSITY not set, using default
+-- Project sdkconfig file F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig
+info: Default value for ESP_WIFI_STATIC_TX_BUFFER_NUM in sdkconfig is 8 but it is 16 according to Kconfig.
+
+Using default value from sdkconfig (8).
+
+Configuration Report                                                            
+
++------------------------------------------------------------------------------+
+
+|  Parser Version: 1                                                           |
+
+|  Verbosity: default                                                          |
+
+|  Defaults policy: sdkconfig                                                  |
+
+|  Status: Finished with notifications                                         |
+
+|                                                                              |
+
+| Default Value Mismatch                                                       |
+
+| +--------------------------------------------------------------------------+ |
+
+| | Using sdkconfig default values                                        |  | |
+
+| | Config symbols with different default value between sdkconfig and     |  | |
+
+| | Kconfig                                                               |  | |
+
+| | ESP_WIFI_STATIC_TX_BUFFER_NUM: Kconfig default value: 16, sdkconfig   |  | |
+
+| | default value: 8                                                      |  | |
+
+| +--------------------------------------------------------------------------+ |
+
+| Disabled Symbols/Choices With User-Set Value                                 |
+
+| +--------------------------------------------------------------------------+ |
+
+| | * ESP_INTR_IN_IRAM (defined at                                           | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hw_support/Kcon�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * LIBC_MISC_IN_IRAM (defined at                                          | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_libc/Kconfig:45) | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_ROM_PRINT_IN_IRAM (defined at                                      | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/Kconfig:3)   | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_CONSOLE_UART_BAUDRATE (defined at                                  | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_stdio/Kconfig:1�� | |
+
+| | with user-set value 115200 from                                          | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_SYSTEM_IN_IRAM (defined at                                         | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_system/Kconfig:�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_TIMER_IN_IRAM (defined at                                          | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_timer/Kconfig:3) | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * LOG_IN_IRAM (defined at                                                | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/log/Kconfig:55) with | |
+
+| | user-set value y from                                                    | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * SPI_FLASH_PLACE_FUNCTIONS_IN_IRAM (defined at                          | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/spi_flash/Kconfig:1�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| +--------------------------------------------------------------------------+ |
+
++------------------------------------------------------------------------------+
+
+-- Compiler supported targets: xtensa-esp-elf
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- App "Play_Master" version: 989fe64-dirty
+-- Setting up mbedtls configuration
+-- Linkage type is PUBLIC
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_system/ld/esp32/memory.ld.in
+--   -> Preprocessing .in script: F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_system/ld/esp32/memory.ld.in
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_system/ld/esp32/sections.ld.in
+--   -> Preprocessing .in script: F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_system/ld/esp32/sections.ld.in
+--   -> Applying ldgen processing: F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/build/esp-idf/esp_system/ld/sections.ld.in
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/esp32/ld/esp32.rom.ld
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/esp32/ld/esp32.rom.api.ld
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/esp32/ld/esp32.rom.libgcc.ld
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/soc/esp32/ld/esp32.peripherals.ld
+-- CONFIG_ESP32P4_SELECTS_REV_LESS_V3 is 
+-- IDF_VERSION_MAJOR is 6
+-- IDF_VERSION_MINOR is 0
+-- IDF_VERSION_PATCH is 1
+-- TARGET_LIB_PATH is set to: esp32
+-- Components: App app_update bootloader bootloader_support bsp bt cxx driver efuse esp-tls esp_app_format esp_blockdev esp_bootloader_format esp_coex esp_common esp_driver_dma esp_driver_gpio esp_driver_i2c esp_driver_i2s esp_driver_jpeg esp_driver_ppa esp_driver_sd_intf esp_driver_sdmmc esp_driver_sdspi esp_driver_spi esp_driver_uart esp_driver_usb_serial_jtag esp_event esp_gdbstub esp_hal_ana_conv esp_hal_clock esp_hal_dma esp_hal_gpio esp_hal_gpspi esp_hal_i2c esp_hal_i2s esp_hal_jpeg esp_hal_mspi esp_hal_pmu esp_hal_ppa esp_hal_rtc_timer esp_hal_sd esp_hal_security esp_hal_timg esp_hal_touch_sens esp_hal_twai esp_hal_uart esp_hal_usb esp_hal_wdt esp_http_client esp_https_ota esp_hw_support esp_libc esp_mm esp_netif esp_netif_stack esp_partition esp_phy esp_pm esp_psram esp_ringbuf esp_rom esp_security esp_stdio esp_system esp_timer esp_usb_cdc_rom_console esp_wifi espcoredump espressif__cjson espressif__dl_fft espressif__esp-dl espressif__esp-dsp espressif__esp-sr espressif__esp_new_jpeg esptool_py fatfs freertos hal heap http_parser log lvgl__lvgl lwip main mbedtls middlewares msystem nvs_flash nvs_sec_provider partition_table pthread sdmmc soc spi_flash spiffs tcp_transport vfs wear_levelling wpa_supplicant xtensa
+-- Component paths: F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/components/App F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/app_update F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/bootloader F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/bootloader_support F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/components/bsp F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/bt F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/cxx F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/driver F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/efuse F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp-tls F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_app_format F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_blockdev F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_bootloader_format F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_coex F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_common F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_dma F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_gpio F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_i2c F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_i2s F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_jpeg F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_ppa F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_sd_intf F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_sdmmc F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_sdspi F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_spi F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_uart F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_usb_serial_jtag F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_event F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_gdbstub F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_ana_conv F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_clock F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_dma F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_gpio F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_gpspi F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_i2c F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_i2s F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_jpeg F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_mspi F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_pmu F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_ppa F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_rtc_timer F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_sd F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_security F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_timg F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_touch_sens F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_twai F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_uart F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_usb F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_wdt F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_http_client F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_https_ota F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hw_support F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_libc F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_mm F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_netif F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_netif_stack F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_partition F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_phy F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_pm F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_psram F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_ringbuf F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_security F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_stdio F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_system F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_timer F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_usb_cdc_rom_console F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_wifi F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/espcoredump F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/managed_components/espressif__cjson F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/managed_components/espressif__dl_fft F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/managed_components/espressif__esp-dl F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/managed_components/espressif__esp-dsp F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/managed_components/espressif__esp-sr F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/managed_components/espressif__esp_new_jpeg F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esptool_py F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/fatfs F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/freertos F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/hal F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/heap F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/http_parser F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/log F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/managed_components/lvgl__lvgl F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/lwip F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/main F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/mbedtls F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/components/middlewares F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/components/msystem F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/nvs_flash F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/nvs_sec_provider F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/partition_table F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/pthread F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/sdmmc F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/soc F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/spi_flash F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/spiffs F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/tcp_transport F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/vfs F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/wear_levelling F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/wpa_supplicant F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/xtensa
+-- Configuring done (59.9s)
+-- Generating done (5.7s)
+-- Build files have been written to: F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/build
+Running ninja in directory F:\EmbeddedProject\MusicPlaySyncSpeakers\Play_Master\build
+Executing "ninja all"...
+[1/9] Move and Pack models...
+
+
+
+
+ESP-SR Models Report
+
+
+
+
+
+  Models loaded from esp-sr:
+
+
+    - wn9s_nihaoxiaozhi    (122.84 KB)
+
+
+
+
+
+  Recommended Partition Size: 124K
+
+
+
+
+
+
+
+
+[2/9] C:\WINDOWS\system32\cmd.exe /C "cd /D F:\EmbeddedProject\MusicPlaySyncSpeakers\Play_Master\build\esp-idf\main && F:\esp_tool\python_env\idf6.0_py3.11_env\Scripts\python.exe F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/spiffs/spiffsgen.py 0x740000 F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/storage F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/build/storage.bin --page-size=256 --obj-name-len=32 --meta-len=4 --use-magic --use-magic-len"
+
+[3/9] Performing build step for 'bootloader'
+
+[0/1] Re-running CMake...
+
+-- Component directory F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/mqtt does not contain a CMakeLists.txt file. No component will be added
+-- Minimal build - OFF
+-- Building ESP-IDF components for target esp32
+-- ESP-TEE is currently supported only on the esp32c6;esp32h2;esp32c5;esp32c61 SoCs
+-- KCONFIG_REPORT_VERBOSITY not set, using default
+-- Project sdkconfig file F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig
+Configuration Report                                                            
+
++------------------------------------------------------------------------------+
+
+|  Parser Version: 1                                                           |
+
+|  Verbosity: default                                                          |
+
+|  Defaults policy: sdkconfig                                                  |
+
+|  Status: Finished with notifications                                         |
+
+|                                                                              |
+
+| Disabled Symbols/Choices With User-Set Value                                 |
+
+| +--------------------------------------------------------------------------+ |
+
+| | * ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND (defined at                         | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hw_support/Kcon�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_INTR_IN_IRAM (defined at                                           | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hw_support/Kcon�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * LIBC_MISC_IN_IRAM (defined at                                          | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_libc/Kconfig:45) | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_ROM_PRINT_IN_IRAM (defined at                                      | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/Kconfig:3)   | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_CONSOLE_UART_BAUDRATE (defined at                                  | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_stdio/Kconfig:1�� | |
+
+| | with user-set value 115200 from                                          | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * ESP_SYSTEM_IN_IRAM (defined at                                         | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_system/Kconfig:�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * FREERTOS_TASK_CREATE_ALLOW_EXT_MEM (defined at                         | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/freertos/Kconfig:57�� | |
+
+| | with user-set value n from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * LOG_IN_IRAM (defined at                                                | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/log/Kconfig:55) with | |
+
+| | user-set value y from                                                    | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * SPI_FLASH_PLACE_FUNCTIONS_IN_IRAM (defined at                          | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/spi_flash/Kconfig:1�� | |
+
+| | with user-set value y from                                               | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * <choice LIBC_STDOUT_LINE_ENDING> (defined at                           | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_libc/Kconfig:56) | |
+
+| | with user-set value LIBC_STDOUT_LINE_ENDING_CRLF from                    | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| | * <choice LIBC_STDIN_LINE_ENDING> (defined at                            | |
+
+| | F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_libc/Kconfig:81) | |
+
+| | with user-set value LIBC_STDIN_LINE_ENDING_CR from                       | |
+
+| | F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/sdkconfig           | |
+
+| +--------------------------------------------------------------------------+ |
+
++------------------------------------------------------------------------------+
+
+-- Compiler supported targets: xtensa-esp-elf
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/soc/esp32/ld/esp32.peripherals.ld
+-- Bootloader project name: "bootloader" version: 1
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/esp32/ld/esp32.rom.ld
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/esp32/ld/esp32.rom.api.ld
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/esp32/ld/esp32.rom.libgcc.ld
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom/esp32/ld/esp32.rom.libc-funcs.ld
+-- Components: bootloader bootloader_support efuse esp_app_format esp_blockdev esp_bootloader_format esp_common esp_hal_ana_conv esp_hal_clock esp_hal_dma esp_hal_gpio esp_hal_gpspi esp_hal_i2s esp_hal_mspi esp_hal_pmu esp_hal_rtc_timer esp_hal_security esp_hal_timg esp_hal_uart esp_hal_usb esp_hal_wdt esp_hw_support esp_libc esp_rom esp_security esp_stdio esp_system esptool_py freertos hal log main micro-ecc partition_table soc spi_flash xtensa
+-- Component paths: F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/bootloader F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/bootloader_support F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/efuse F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_app_format F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_blockdev F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_bootloader_format F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_common F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_ana_conv F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_clock F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_dma F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_gpio F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_gpspi F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_i2s F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_mspi F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_pmu F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_rtc_timer F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_security F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_timg F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_uart F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_usb F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hal_wdt F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_hw_support F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_libc F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_rom F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_security F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_stdio F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_system F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esptool_py F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/freertos F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/hal F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/log F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/bootloader/subproject/main F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/bootloader/subproject/components/micro-ecc F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/partition_table F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/soc F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/spi_flash F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/xtensa
+-- Adding linker script F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/bootloader/subproject/main/ld/esp32/bootloader.ld.in
+--   -> Preprocessing .in script: F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/bootloader/subproject/main/ld/esp32/bootloader.ld.in
+-- Configuring done (12.7s)
+-- Generating done (0.8s)
+-- Build files have been written to: F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/build/bootloader
+
+[1/2] C:\WINDOWS\system32\cmd.exe /C "cd /D F:\EmbeddedProject\MusicPlaySyncSpeakers\Play_Master\build\bootloader && F:\esp_tool\python_env\idf6.0_py3.11_env\Scripts\python.exe F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x1000 F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/build/bootloader/bootloader.bin"
+
+
+Bootloader binary size 0x6d00 bytes. 0x300 bytes (3%) free.
+
+
+
+[4/9] No install step for 'bootloader'
+
+[5/9] Completed 'bootloader'
+
+[6/9] Generating esp-idf/esp_system/ld/sections.ld
+
+info: Default value for ESP_WIFI_STATIC_TX_BUFFER_NUM in sdkconfig is 8 but it is 16 according to Kconfig.
+
+
+Using default value from sdkconfig (8).
+
+
+[7/9] Linking CXX executable Play_Master.elf
+
+[8/9] Generating binary image from built executable
+
+esptool v5.3.dev3
+
+
+Creating ESP32 image...
+
+
+Merged 3 ELF sections.
+
+
+Successfully created ESP32 image.
+
+
+Generated F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/build/Play_Master.bin
+
+[9/9] C:\WINDOWS\system32\cmd.exe /C "cd /D F:\EmbeddedProject\MusicPlaySyncSpeakers\Play_Master\build && F:\esp_tool\python_env\idf6.0_py3.11_env\Scripts\python.exe F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/build/partition_table/partition-table.bin F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/build/Play_Master.bin"
+
+Play_Master.bin binary size 0x25f510 bytes. Smallest app partition is 0x400000 bytes. 0x1a0af0 bytes (41%) free.
+
+
+Running ninja in directory F:\EmbeddedProject\MusicPlaySyncSpeakers\Play_Master\build
+Executing "ninja size-components"...
+[0/1] C:\WINDOWS\system32\cmd.exe /C "cd /D F:\EmbeddedProject\MusicPlaySyncSpeakers\Play_Master\build && F:\esp_tool\tools\cmake\4.0.3\bin\cmake.exe -D IDF_SIZE_TOOL=F:/esp_tool/python_env/idf6.0_py3.11_env/Scripts/python.exe;-m;esp_idf_size -D IDF_SIZE_MODE=--archives -D MAP_FILE=F:/EmbeddedProject/MusicPlaySyncSpeakers/Play_Master/build/Play_Master.map -D OUTPUT_JSON= -P F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/tools/cmake/run_size_tool.cmake"
+
+                     Per-archive contributions to ELF file                      
+
++------------------------------------------------------------------------------+
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | . |    |
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | r |    |
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | t |    |
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | c |    |
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | _ |    |
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | s |    |
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | l |    |
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | o |    |
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | w |    |
+
+|    |    |    |    |    |   |    |   |    |   |    |   |    |   |    | _ |    |
+
+|    |    |    |    |    |   |    | . |    |   |    |   |    | . |    | r |    |
+
+|    |    |    |    |    |   |    | v |    |   |    |   |    | a |    | e |    |
+
+| Ar |    |    |    |    |   |    | e |    |   |    | . |    | p |    | s | .f |
+
+| ch | To |    |    |    |   |    | c | Fl | . | Fl | t |    | p |    | e | or |
+
+| iv | ta |    |    |    | I |    | t | as | t | as | d | .r | d | RT | r | ce |
+
+| e  |  l |    |    | .d | R | .t | o |  h | e |  h | a | od | e |  C | v | _s |
+
+| Fi | Si | DR | .b | at | A | ex | r | Co | x | Da | t | at | s | SL | e | lo |
+
+| le | ze | AM | ss |  a | M |  t | s | de | t | ta | a |  a | c | OW | d |  w |
+
+|----+----+----+----+----+---+----+---+----+---+----+---+----+---+----+---+----|
+
+| li | 38 | 42 | 37 | 47 | 1 | 16 | 0 | 32 | 3 | 20 | 0 | 20 | 0 |  0 | 0 |  0 |
+
+| bb | 74 | 08 | 33 | 45 | 6 | 83 |   | 27 | 2 | 99 |   | 99 |   |    |   |    |
+
+| t. | 98 |  0 |  5 |    | 8 |    |   | 37 | 2 |  8 |   |  8 |   |    |   |    |
+
+| a  |    |    |    |    | 3 |    |   |    | 7 |    |   |    |   |    |   |    |
+
+|    |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+|    |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| li | 35 | 59 | 51 | 80 | 0 |  0 | 0 | 32 | 3 | 27 | 0 | 27 | 0 |  0 | 0 |  0 |
+
+| bl | 04 |  6 |  6 |    |   |    |   | 22 | 2 | 58 |   | 58 |   |    |   |    |
+
+| vg | 30 |    |    |    |   |    |   | 53 | 2 |  1 |   |  1 |   |    |   |    |
+
+| l_ |    |    |    |    |   |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| _l |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| vg |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| l. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 19 | 46 | 42 |  4 | 0 |  0 | 0 | 20 | 2 | 17 | 0 | 17 | 0 |  0 | 0 |  0 |
+
+| bf | 54 |    |    |    |   |    |   | 03 | 0 | 53 |   | 53 |   |    |   |    |
+
+| at | 05 |    |    |    |   |    |   |  7 | 0 | 22 |   | 22 |   |    |   |    |
+
+| fs |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| li | 19 | 16 | 16 |  0 | 0 |  0 | 0 | 40 | 4 | 19 | 0 | 19 | 0 |  0 | 0 |  0 |
+
+| be | 31 |    |    |    |   |    |   |  4 | 0 | 27 |   | 27 |   |    |   |    |
+
+| sp | 22 |    |    |    |   |    |   |    | 4 | 02 |   | 02 |   |    |   |    |
+
+| _s |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| td |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| io |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 15 | 94 | 86 | 86 | 0 |  0 | 0 | 13 | 1 | 13 | 0 | 13 | 0 |  0 | 0 |  0 |
+
+| bn | 72 | 97 | 37 |  0 |   |    |   | 41 | 3 | 60 |   | 60 |   |    |   |    |
+
+| et | 37 |    |    |    |   |    |   | 33 | 4 |  7 |   |  7 |   |    |   |    |
+
+| 80 |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| 21 |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| 1. |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 11 | 37 | 37 | 12 | 0 |  0 | 0 | 10 | 1 | 39 | 0 | 39 | 0 |  0 | 0 |  0 |
+
+| bl | 16 | 33 | 21 |    |   |    |   | 39 | 0 | 25 |   | 25 |   |    |   |    |
+
+| wi | 13 |    |    |    |   |    |   | 55 | 3 |    |   |    |   |    |   |    |
+
+| p. |    |    |    |    |   |    |   |    | 9 |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+|    |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| li | 98 | 39 | 31 | 81 | 0 |  0 | 0 | 21 | 2 | 76 | 0 | 76 | 0 |  0 | 0 |  0 |
+
+| bA | 22 |  6 |  5 |    |   |    |   | 15 | 1 | 68 |   | 68 |   |    |   |    |
+
+| pp |  7 |    |    |    |   |    |   |  1 | 1 |  0 |   |  0 |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+|    |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| li | 91 | 37 | 26 | 10 | 1 | 19 | 0 | 66 | 6 | 12 | 0 | 12 | 0 |  0 | 0 |  0 |
+
+| bb | 33 | 14 | 92 | 22 | 9 | 80 |   | 53 | 6 | 84 |   | 84 |   |    |   |    |
+
+| td |  9 |    |    |    | 8 |  8 |   |  3 | 5 |    |   |    |   |    |   |    |
+
+| m_ |    |    |    |    | 0 |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| ap |    |    |    |    | 8 |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| p. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 81 | 10 | 56 | 48 | 0 |  0 | 0 | 65 | 6 | 15 | 0 | 15 | 0 |  0 | 0 |  0 |
+
+| bm | 54 |  4 |    |    |   |    |   | 99 | 5 | 45 |   | 45 |   |    |   |    |
+
+| be |  4 |    |    |    |   |    |   |  0 | 9 |  0 |   |  0 |   |    |   |    |
+
+| d- |    |    |    |    |   |    |   |    | 9 |    |   |    |   |    |   |    |
+
+| bu |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| il |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ti |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| n. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 78 | 13 | 13 |  8 | 0 |  0 | 0 | 75 | 7 | 18 | 0 | 18 | 0 |  0 | 0 |  0 |
+
+| bw | 57 | 38 | 30 |    |   |    |   | 38 | 5 | 56 |   | 56 |   |    |   |    |
+
+| pa |  8 |    |    |    |   |    |   |  4 | 3 |    |   |    |   |    |   |    |
+
+| _s |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| up |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| pl |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ic |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| an |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| t. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 72 | 41 | 15 | 26 | 1 | 19 | 0 | 61 | 6 | 50 | 0 | 50 | 0 |  0 | 0 |  0 |
+
+| bp | 84 | 71 | 32 | 39 | 9 | 21 |   | 69 | 1 | 60 |   | 60 |   |    |   |    |
+
+| p. |  6 |    |    |    | 2 |    |   |  4 | 6 |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    | 1 |    |   |    | 9 |    |   |    |   |    |   |    |
+
+|    |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| li | 53 | 12 | 12 |  1 | 0 |  0 | 0 | 33 | 3 | 81 | 0 | 81 | 0 |  0 | 0 |  0 |
+
+| bm | 74 | 56 | 56 |    |   |    |   | 06 | 3 | 08 |   | 08 |   |    |   |    |
+
+| id |  1 |  6 |  5 |    |   |    |   |  7 | 0 |    |   |    |   |    |   |    |
+
+| dl |    |    |    |    |   |    |   |    | 6 |    |   |    |   |    |   |    |
+
+| ew |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| ar |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| es |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 46 | 23 | 20 | 24 | 0 |  0 | 0 | 44 | 4 | 13 | 0 | 13 | 0 |  0 | 0 |  0 |
+
+| bt | 27 |  3 |  9 |    |   |    |   | 65 | 4 | 80 |   | 80 |   |    |   |    |
+
+| fp |  1 |    |    |    |   |    |   |  8 | 6 |    |   |    |   |    |   |    |
+
+| sa |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| cr |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| yp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| to |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 44 | 12 | 64 | 58 | 9 | 91 | 0 | 34 | 3 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| bp | 95 | 25 |  1 |  4 | 1 | 06 |   | 62 | 4 |    |   |    |   |    |   |    |
+
+| hy |  2 |    |    |    | 0 |    |   |  1 | 6 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    | 6 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+|    |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| li | 43 | 13 | 12 | 12 | 5 | 58 | 0 | 39 | 3 | 36 | 4 | 36 | 0 |  0 | 0 |  0 |
+
+| bc | 44 |  2 |  0 |    | 8 |  1 |   | 07 | 9 | 53 |   | 49 |   |    |   |    |
+
+| .a |  2 |    |    |    | 1 |    |   |  6 | 0 |    |   |    |   |    |   |    |
+
+|    |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+|    |    |    |    |    |   |    |   |    | 6 |    |   |    |   |    |   |    |
+
+| li | 35 | 48 | 40 |  8 | 0 |  0 | 0 | 33 | 3 | 22 | 0 | 22 | 0 |  0 | 0 |  0 |
+
+| be | 63 |    |    |    |   |    |   | 30 | 3 | 79 |   | 79 |   |    |   |    |
+
+| sp |  6 |    |    |    |   |    |   |  9 | 3 |    |   |    |   |    |   |    |
+
+| _a |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| ud |    |    |    |    |   |    |   |    | 9 |    |   |    |   |    |   |    |
+
+| io |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _p |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ro |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ce |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ss |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| or |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 28 | 52 | 10 | 42 | 5 | 59 | 0 | 15 | 1 | 18 | 0 | 18 | 0 |  0 | 0 |  0 |
+
+| bf | 79 | 81 | 45 | 36 | 9 | 07 |   | 71 | 5 | 85 |   | 85 |   |    |   |    |
+
+| re |  1 |    |    |    | 0 |    |   |  8 | 7 |    |   |    |   |    |   |    |
+
+| er |    |    |    |    | 7 |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| to |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| s. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 25 | 59 |  0 | 59 | 0 |  0 | 0 | 19 | 1 | 40 | 0 | 40 | 0 |  0 | 0 |  0 |
+
+| bd | 87 | 36 |    | 36 |   |    |   | 54 | 9 |  0 |   |  0 |   |    |   |    |
+
+| l_ |  7 |    |    |    |   |    |   |  1 | 5 |    |   |    |   |    |   |    |
+
+| li |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| b. |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 25 | 72 | 72 |  0 | 0 |  0 | 0 | 24 | 2 | 81 | 0 | 81 | 0 |  0 | 0 |  0 |
+
+| bm | 30 |    |    |    |   |    |   | 41 | 4 |  8 |   |  8 |   |    |   |    |
+
+| be |  9 |    |    |    |   |    |   |  9 | 4 |    |   |    |   |    |   |    |
+
+| dt |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| ls |    |    |    |    |   |    |   |    | 9 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 23 | 12 | 12 |  0 | 0 |  0 | 0 | 23 | 2 | 41 | 0 | 41 | 0 |  0 | 0 |  0 |
+
+| bs | 96 |    |    |    |   |    |   | 53 | 3 |  9 |   |  9 |   |    |   |    |
+
+| pi |  1 |    |    |    |   |    |   |  0 | 5 |    |   |    |   |    |   |    |
+
+| ff |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| s. |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 23 | 61 | 10 | 51 | 1 | 10 | 0 | 11 | 1 | 13 | 0 | 13 | 0 | 64 | 2 | 40 |
+
+| be | 72 |  7 |  1 |  6 | 0 | 31 |   | 42 | 1 | 03 |   | 03 |   |    | 4 |    |
+
+| sp |  3 |    |    |    | 3 |  9 |   |  0 | 4 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    | 1 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| w_ |    |    |    |    | 9 |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| su |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| pp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| or |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| t. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 21 | 11 | 10 | 19 | 8 | 82 | 0 | 12 | 1 | 36 | 0 | 36 | 0 |  0 | 0 |  0 |
+
+| be | 05 |  9 |  0 |    | 2 | 21 |   | 35 | 2 |  0 |   |  0 |   |    |   |    |
+
+| sp |  7 |    |    |    | 2 |    |   |  7 | 3 |    |   |    |   |    |   |    |
+
+| _p |    |    |    |    | 1 |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| sr |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| am |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 19 | 68 | 24 | 67 | 9 | 97 | 0 | 14 | 1 | 11 | 0 | 11 | 0 |  0 | 0 |  0 |
+
+| bs | 24 | 11 |    | 87 | 7 | 88 |   | 60 | 4 | 82 |   | 82 |   |    |   |    |
+
+| pi |  1 |    |    |    | 8 |    |   |    | 6 |    |   |    |   |    |   |    |
+
+| _f |    |    |    |    | 8 |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| la |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| sh |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 19 |  0 |  0 |  0 | 0 |  0 | 0 | 18 | 1 | 27 | 0 | 27 | 0 |  0 | 0 |  0 |
+
+| bw | 01 |    |    |    |   |    |   | 74 | 8 |  9 |   |  9 |   |    |   |    |
+
+| ak |  9 |    |    |    |   |    |   |  0 | 7 |    |   |    |   |    |   |    |
+
+| en |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| et |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 16 | 24 | 24 |  0 | 0 |  0 | 0 | 15 | 1 | 25 | 0 | 25 | 0 |  0 | 0 |  0 |
+
+| bn | 18 |    |    |    |   |    |   | 90 | 5 |  6 |   |  6 |   |    |   |    |
+
+| vs |  3 |    |    |    |   |    |   |  3 | 9 |    |   |    |   |    |   |    |
+
+| _f |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| la |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| sh |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 15 |  0 |  0 |  0 | 0 |  0 | 0 | 14 | 1 | 73 | 0 | 73 | 0 |  0 | 0 |  0 |
+
+| bh | 34 |    |    |    |   |    |   | 61 | 4 |  4 |   |  4 |   |    |   |    |
+
+| tt |  6 |    |    |    |   |    |   |  2 | 6 |    |   |    |   |    |   |    |
+
+| p_ |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| pa |    |    |    |    |   |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| rs |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| er |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 14 |  0 |  0 |  0 | 2 | 25 | 0 |  0 | 0 | 14 | 0 | 14 | 0 |  0 | 0 |  0 |
+
+| be | 56 |    |    |    | 5 |  4 |   |    |   | 31 |   | 31 |   |    |   |    |
+
+| sp |  8 |    |    |    | 4 |    |   |    |   |  4 |   |  4 |   |    |   |    |
+
+| _r |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| om |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 14 |  1 |  0 |  1 | 0 |  0 | 0 | 13 | 1 | 10 | 0 | 10 | 0 |  0 | 0 |  0 |
+
+| be | 25 |    |    |    |   |    |   | 21 | 3 | 46 |   | 46 |   |    |   |    |
+
+| sp |  9 |    |    |    |   |    |   |  2 | 2 |    |   |    |   |    |   |    |
+
+| _a |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| ud |    |    |    |    |   |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| io |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _f |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ro |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| nt |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _e |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| nd |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 13 | 20 |  8 | 12 | 7 | 79 | 0 | 42 | 4 | 17 | 0 | 17 | 0 |  0 | 0 |  0 |
+
+| bh | 93 |    |    |    | 9 | 57 |   | 28 | 2 | 32 |   | 32 |   |    |   |    |
+
+| ea |  7 |    |    |    | 5 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| p. |    |    |    |    | 7 |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 12 | 80 | 30 | 50 | 4 | 44 | 0 | 65 | 6 | 48 | 0 | 48 | 0 |  0 | 0 |  0 |
+
+| be | 31 |  1 |  1 |  0 | 4 | 54 |   | 72 | 5 |  3 |   |  3 |   |    |   |    |
+
+| sp |  0 |    |    |    | 5 |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| _s |    |    |    |    | 4 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| ys |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| te |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| m. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 11 | 18 | 45 | 14 | 3 | 39 | 0 | 73 | 7 | 55 | 0 | 55 | 0 |  0 | 0 |  0 |
+
+| be | 97 |  8 |    |  3 | 9 | 03 |   | 28 | 3 |  6 |   |  6 |   |    |   |    |
+
+| sp |  5 |    |    |    | 0 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| _d |    |    |    |    | 3 |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| ri |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ve |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| r_ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| i. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 11 | 10 | 10 |  0 | 0 |  0 | 0 | 10 | 1 | 39 | 0 | 39 | 0 |  0 | 0 |  0 |
+
+| bm | 25 | 80 | 80 |    |   |    |   | 13 | 0 |    |   |    |   |    |   |    |
+
+| sy |  6 |    |    |    |   |    |   |  7 | 1 |    |   |    |   |    |   |    |
+
+| st |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| em |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 11 | 28 | 28 |  0 | 6 | 66 | 0 | 10 | 1 | 38 | 0 | 38 | 0 |  0 | 0 |  0 |
+
+| be | 12 |    |    |    | 6 |  3 |   | 05 | 0 |  0 |   |  0 |   |    |   |    |
+
+| sp |  6 |    |    |    | 3 |    |   |  5 | 0 |    |   |    |   |    |   |    |
+
+| _d |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| ri |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| ve |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| r_ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| i2 |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| c. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 10 | 24 |  0 | 24 | 0 |  0 | 0 | 10 | 1 | 44 | 0 | 44 | 0 |  0 | 0 |  0 |
+
+| be | 70 |    |    |    |   |    |   | 24 | 0 |  3 |   |  3 |   |    |   |    |
+
+| sp |  8 |    |    |    |   |    |   |  1 | 2 |    |   |    |   |    |   |    |
+
+| _d |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| ri |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| ve |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| r_ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| i2 |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| s. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 10 | 65 |  1 | 65 | 3 | 32 | 0 | 52 | 5 | 11 | 0 | 11 | 0 |  0 | 0 |  0 |
+
+| bc | 38 |  3 |    |  2 | 2 | 63 |   | 70 | 2 | 94 |   | 94 |   |    |   |    |
+
+| oe |  0 |    |    |    | 6 |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| xi |    |    |    |    | 3 |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| st |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 90 |  0 |  0 |  0 | 0 |  0 | 0 | 87 | 8 | 32 | 0 | 32 | 0 |  0 | 0 |  0 |
+
+| be | 62 |    |    |    |   |    |   | 39 | 7 |  3 |   |  3 |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    |   |    |   |    | 9 |    |   |    |   |    |   |    |
+
+| tt |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| p_ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| cl |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ie |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| nt |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 88 | 90 | 79 | 11 | 0 |  0 | 0 | 72 | 7 | 63 | 0 | 63 | 0 |  0 | 0 |  0 |
+
+| be | 31 |  8 |  6 |  2 |   |    |   | 84 | 2 |  9 |   |  9 |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| co |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| re |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| du |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| mp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 86 |  0 |  0 |  0 | 1 | 15 | 0 | 49 | 4 | 20 | 0 | 20 | 0 |  0 | 0 |  0 |
+
+| bc | 07 |    |    |    | 5 | 77 |   | 42 | 9 | 88 |   | 88 |   |    |   |    |
+
+| _s |    |    |    |    | 7 |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| pe |    |    |    |    | 7 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| ec |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| h_ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| fe |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| at |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ur |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| es |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 79 |  0 |  0 |  0 | 0 |  0 | 0 | 72 | 7 | 69 | 0 | 69 | 0 |  0 | 0 |  0 |
+
+| bm | 46 |    |    |    |   |    |   | 48 | 2 |  8 |   |  8 |   |    |   |    |
+
+| be |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| dx |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| 50 |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| 9. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 73 | 41 | 41 |  0 | 0 |  0 | 0 | 31 | 3 |  9 | 0 |  9 | 0 |  0 | 0 |  0 |
+
+| bm | 03 | 32 | 32 |    |   |    |   | 62 | 1 |    |   |    |   |    |   |    |
+
+| ai |    |    |    |    |   |    |   |    | 6 |    |   |    |   |    |   |    |
+
+| n. |    |    |    |    |   |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 70 | 33 | 29 |  4 | 0 |  0 | 0 | 68 | 6 | 16 | 0 | 16 | 0 |  0 | 0 |  0 |
+
+| be | 34 |    |    |    |   |    |   | 34 | 8 |  7 |   |  7 |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| _n |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| et |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| if |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 63 | 36 |  0 | 36 | 0 |  0 | 0 | 56 | 5 | 64 | 0 | 64 | 0 |  0 | 0 |  0 |
+
+| be | 29 |    |    |    |   |    |   | 44 | 6 |  9 |   |  9 |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| _d |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| ri |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ve |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| r_ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| gp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| io |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 61 | 23 | 44 | 19 | 0 |  0 | 0 | 58 | 5 | 13 | 0 | 13 | 0 |  0 | 0 |  0 |
+
+| bv | 76 |  6 |    |  2 |   |    |   | 01 | 8 |  9 |   |  9 |   |    |   |    |
+
+| fs |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| li | 60 |  4 |  4 |  0 | 0 |  0 | 0 | 59 | 5 | 92 | 0 | 92 | 0 |  0 | 0 |  0 |
+
+| be | 82 |    |    |    |   |    |   | 86 | 9 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| -t |    |    |    |    |   |    |   |    | 6 |    |   |    |   |    |   |    |
+
+| ls |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 60 | 86 | 54 | 32 | 2 | 28 | 0 | 22 | 2 | 15 | 1 | 13 | 0 |  0 | 0 |  0 |
+
+| be | 39 |  0 |  0 |  0 | 8 | 07 |   | 20 | 2 |  2 | 6 |  6 |   |    |   |    |
+
+| sp |    |    |    |    | 0 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| _l |    |    |    |    | 7 |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| ib |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| c. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 57 | 22 | 22 |  0 | 0 |  0 | 0 | 34 | 3 | 16 | 0 | 16 | 0 |  0 | 0 |  0 |
+
+| bb | 01 | 77 | 77 |    |   |    |   | 08 | 4 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| li | 55 | 53 | 47 | 48 | 3 | 35 | 0 | 39 | 3 | 79 | 0 | 79 | 0 |  0 | 0 |  0 |
+
+| be | 86 |  1 |    |  4 | 5 |  2 |   | 13 | 9 |  0 |   |  0 |   |    |   |    |
+
+| sp |    |    |    |    | 2 |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| _w |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| if |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| i. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 55 | 20 |  8 | 12 | 0 |  0 | 0 | 55 | 5 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| be | 48 |    |    |    |   |    |   | 28 | 5 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| re |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| ss |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| if |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| __ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| cj |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| so |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| n. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 52 | 20 | 12 | 76 | 1 | 14 | 0 | 33 | 3 | 29 | 0 | 29 | 0 |  0 | 0 |  0 |
+
+| be | 76 |  4 |  8 |    | 4 | 42 |   | 32 | 3 |  8 |   |  8 |   |    |   |    |
+
+| sp |    |    |    |    | 4 |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| _m |    |    |    |    | 2 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| m. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 49 |  8 |  4 |  4 | 1 | 10 | 0 | 38 | 3 | 88 | 0 | 88 | 0 |  0 | 0 |  0 |
+
+| bb | 73 |    |    |    | 0 | 39 |   | 38 | 8 |    |   |    |   |    |   |    |
+
+| oo |    |    |    |    | 3 |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| tl |    |    |    |    | 9 |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| oa |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| de |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| r_ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| su |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| pp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| or |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| t. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 43 |  8 |  8 |  0 | 0 |  0 | 0 | 43 | 4 |  4 | 0 |  4 | 0 |  0 | 0 |  0 |
+
+| be | 99 |    |    |    |   |    |   | 87 | 3 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| re |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| ss |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| if |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| __ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| dl |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _f |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ft |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 41 |  0 |  0 |  0 | 2 | 23 | 0 | 14 | 1 | 32 | 0 | 32 | 0 |  0 | 0 |  0 |
+
+| be | 45 |    |    |    | 3 | 63 |   | 54 | 4 |  8 |   |  8 |   |    |   |    |
+
+| sp |    |    |    |    | 6 |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| _r |    |    |    |    | 3 |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| in |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| gb |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| uf |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 40 |  0 |  0 |  0 | 0 |  0 | 0 | 38 | 3 | 13 | 0 | 13 | 0 |  0 | 0 |  0 |
+
+| bt | 20 |    |    |    |   |    |   | 90 | 8 |  0 |   |  0 |   |    |   |    |
+
+| cp |    |    |    |    |   |    |   |    | 9 |    |   |    |   |    |   |    |
+
+| _t |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| ra |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ns |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| po |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| rt |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 35 | 56 | 24 | 32 | 1 | 15 | 0 | 18 | 1 | 13 | 0 | 13 | 0 |  0 | 0 |  0 |
+
+| be | 56 |    |    |    | 5 | 38 |   | 31 | 8 |  1 |   |  1 |   |    |   |    |
+
+| sp |    |    |    |    | 3 |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| _t |    |    |    |    | 8 |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| im |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| er |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 35 | 12 | 12 |  0 | 0 |  0 | 0 | 34 | 3 | 96 | 0 | 96 | 0 |  0 | 0 |  0 |
+
+| ba | 47 |    |    |    |   |    |   | 39 | 4 |    |   |    |   |    |   |    |
+
+| pp |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| _u |    |    |    |    |   |    |   |    | 9 |    |   |    |   |    |   |    |
+
+| pd |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| at |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| e. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 35 | 36 | 32 | 32 | 0 |  0 | 0 | 28 | 2 | 34 | 0 | 34 | 0 |  0 | 0 |  0 |
+
+| be | 41 |  0 |    |  8 |   |    |   | 37 | 8 |  4 |   |  4 |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| _d |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| ri |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ve |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| r_ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ua |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| rt |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 35 |  4 |  4 |  0 | 0 |  0 | 0 | 33 | 3 | 14 | 0 | 14 | 0 |  0 | 0 |  0 |
+
+| be | 24 |    |    |    |   |    |   | 79 | 3 |  1 |   |  1 |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| _e |    |    |    |    |   |    |   |    | 9 |    |   |    |   |    |   |    |
+
+| ve |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| nt |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 34 | 10 |  0 | 10 | 2 | 18 | 4 | 12 | 1 | 36 | 0 | 36 | 0 |  0 | 0 |  0 |
+
+| bx | 60 | 44 |    | 44 | 2 | 33 | 2 |  0 | 2 |    |   |    |   |    |   |    |
+
+| te |    |    |    |    | 6 |    | 7 |    | 0 |    |   |    |   |    |   |    |
+
+| ns |    |    |    |    | 0 |    |   |    |   |    |   |    |   |    |   |    |
+
+| a. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 32 | 48 |  0 | 48 | 2 | 28 | 0 | 24 | 2 | 96 | 0 | 96 | 0 |  0 | 0 |  0 |
+
+| be | 74 |    |    |    | 8 | 89 |   |  1 | 4 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    | 8 |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    | 9 |    |   |    |   |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _g |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ps |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| pi |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 32 |  0 |  0 |  0 | 0 |  0 | 0 | 32 | 3 | 40 | 0 | 40 | 0 |  0 | 0 |  0 |
+
+| be | 68 |    |    |    |   |    |   | 28 | 2 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| tt |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ps |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _o |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ta |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 31 | 24 | 24 |  0 | 0 |  0 | 0 | 30 | 3 | 49 | 0 | 49 | 0 |  0 | 0 |  0 |
+
+| bh | 44 |    |    |    |   |    |   | 71 | 0 |    |   |    |   |    |   |    |
+
+| uf |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| zi |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| p. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 29 |  8 |  8 |  0 | 0 |  0 | 0 | 27 | 2 | 16 | 0 | 16 | 0 |  0 | 0 |  0 |
+
+| be | 21 |    |    |    |   |    |   | 45 | 7 |  8 |   |  8 |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| _p |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| ar |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ti |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ti |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| on |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 29 | 36 |  0 | 36 | 2 | 23 | 0 | 52 | 5 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| be | 08 |    |    |    | 3 | 50 |   |  2 | 2 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    | 5 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    | 0 |    |   |    |   |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _m |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| i. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 28 | 53 | 36 | 17 | 2 | 28 | 0 | 22 | 2 | 25 | 0 | 25 | 0 |  0 | 0 |  0 |
+
+| be | 05 |    |    |    | 8 |  3 |   | 10 | 2 |  9 |   |  9 |   |    |   |    |
+
+| sp |    |    |    |    | 3 |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| _p |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| hy |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 26 | 24 |  9 | 23 | 2 | 21 | 0 | 23 | 2 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| bh | 69 |  5 |    |  6 | 1 | 91 |   |  3 | 3 |    |   |    |   |    |   |    |
+
+| al |    |    |    |    | 9 |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    | 1 |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 20 |  4 |  4 |  0 | 2 | 20 | 0 |  0 | 0 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| br | 16 |    |    |    | 0 | 12 |   |    |   |    |   |    |   |    |   |    |
+
+| tc |    |    |    |    | 1 |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    | 2 |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 19 | 28 | 27 |  8 | 4 | 49 | 0 | 11 | 1 | 48 | 0 | 48 | 0 |  0 | 0 |  0 |
+
+| bl | 56 |  4 |  6 |    | 9 |  6 |   | 28 | 1 |    |   |    |   |    |   |    |
+
+| og |    |    |    |    | 6 |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| li | 17 |  0 |  0 |  0 | 0 |  0 | 0 | 51 | 5 | 16 | 0 | 16 | 0 |  0 | 0 |  0 |
+
+| be | 05 |    |    |    |   |    |   |    | 1 | 54 |   | 54 |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _c |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| om |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| mo |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| n. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 17 |  0 |  0 |  0 | 0 |  0 | 0 | 16 | 1 | 26 | 0 | 26 | 0 |  0 | 0 |  0 |
+
+| be | 00 |    |    |    |   |    |   | 74 | 6 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _i |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| 2s |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 16 | 64 |  4 | 60 | 1 | 10 | 0 | 13 | 1 | 18 | 0 | 18 | 0 |  0 | 0 |  0 |
+
+| be | 29 |    |    |    | 0 |    |   | 74 | 3 |  1 |   |  1 |   |    |   |    |
+
+| fu |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| se |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 16 | 40 |  0 | 40 | 0 |  0 | 0 | 55 | 5 | 10 | 0 | 10 | 0 |  0 | 0 |  0 |
+
+| be | 05 |    |    |    |   |    |   |  7 | 5 | 08 |   | 08 |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _g |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| pi |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| o. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 15 | 21 | 17 |  4 | 0 |  0 | 0 | 13 | 1 | 19 | 0 | 19 | 0 |  0 | 0 |  0 |
+
+| bs | 41 |    |    |    |   |    |   | 21 | 3 |  9 |   |  9 |   |    |   |    |
+
+| td |    |    |    |    |   |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| c+ |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| +. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 14 |  0 |  0 |  0 | 1 | 14 | 0 |  0 | 0 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| be | 56 |    |    |    | 4 | 56 |   |    |   |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    | 5 |    |   |    |   |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    | 6 |    |   |    |   |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _w |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| dt |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 12 | 20 |  4 | 16 | 0 |  0 | 0 | 11 | 1 | 10 | 0 | 10 | 0 |  0 | 0 |  0 |
+
+| bp | 82 |    |    |    |   |    |   | 60 | 1 |  2 |   |  2 |   |    |   |    |
+
+| th |    |    |    |    |   |    |   |    | 6 |    |   |    |   |    |   |    |
+
+| re |    |    |    |    |   |    |   |    | 0 |    |   |    |   |    |   |    |
+
+| ad |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 12 | 16 | 12 |  4 | 0 |  0 | 0 | 11 | 1 | 18 | 0 | 18 | 0 |  0 | 0 |  0 |
+
+| be | 06 |    |    |    |   |    |   | 72 | 1 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| re |    |    |    |    |   |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| ss |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| if |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| __ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| es |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| p- |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| sr |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 11 |  0 |  0 |  0 | 0 |  0 | 0 | 11 | 1 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| be | 13 |    |    |    |   |    |   | 13 | 1 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 1 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    |   |    |   |    | 3 |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _s |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ec |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ur |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| it |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| y. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 11 |  0 |  0 |  0 | 0 |  0 | 0 | 10 | 1 | 53 | 0 | 53 | 0 |  0 | 0 |  0 |
+
+| be | 11 |    |    |    |   |    |   | 58 | 0 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _i |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| 2c |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 89 |  0 |  0 |  0 | 0 |  0 | 0 | 89 | 8 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| be |  6 |    |    |    |   |    |   |  6 | 9 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 6 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _c |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| lo |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ck |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 83 | 96 |  0 | 96 | 1 | 17 | 0 | 55 | 5 |  8 | 0 |  8 | 0 |  0 | 0 |  0 |
+
+| be |  0 |    |    |    | 7 |  1 |   |  5 | 5 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    | 1 |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| _c |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| oe |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| x. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 69 | 10 | 10 |  0 | 0 |  0 | 0 | 42 | 4 | 26 | 0 |  8 | 2 |  0 | 0 |  0 |
+
+| be |  9 |    |    |    |   |    |   |  5 | 2 |  4 |   |    | 5 |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 5 |    |   |    | 6 |    |   |    |
+
+| _a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| pp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _f |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| or |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ma |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| t. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 57 | 40 |  0 | 40 | 3 | 33 | 0 | 50 | 5 | 45 | 0 | 45 | 0 |  0 | 0 |  0 |
+
+| bs |  9 |    |    |    | 3 |    |   |    | 0 |  6 |   |  6 |   |    |   |    |
+
+| oc |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 50 |  4 |  4 |  0 | 0 |  0 | 0 | 49 | 4 |  8 | 0 |  8 | 0 |  0 | 0 |  0 |
+
+| be |  8 |    |    |    |   |    |   |  6 | 9 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 6 |    |   |    |   |    |   |    |
+
+| _s |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ec |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ur |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| it |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| y. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 47 |  0 |  0 |  0 | 4 | 44 | 0 |  0 | 0 | 32 | 0 | 32 | 0 |  0 | 0 |  0 |
+
+| bx |  5 |    |    |    | 4 |  3 |   |    |   |    |   |    |   |    |   |    |
+
+| t_ |    |    |    |    | 3 |    |   |    |   |    |   |    |   |    |   |    |
+
+| ha |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| l. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 32 |  9 |  9 |  0 | 0 |  0 | 0 | 27 | 2 | 43 | 0 | 43 | 0 |  0 | 0 |  0 |
+
+| bc |  7 |    |    |    |   |    |   |  5 | 7 |    |   |    |   |    |   |    |
+
+| or |    |    |    |    |   |    |   |    | 5 |    |   |    |   |    |   |    |
+
+| e. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 20 |  0 |  0 |  0 | 0 |  0 | 0 | 20 | 2 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| be |  7 |    |    |    |   |    |   |  7 | 0 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _p |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| mu |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 18 |  0 |  0 |  0 | 0 |  0 | 0 | 16 | 1 | 21 | 0 | 21 | 0 |  0 | 0 |  0 |
+
+| be |  9 |    |    |    |   |    |   |  8 | 6 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    | 8 |    |   |    |   |    |   |    |
+
+| _h |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| al |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _u |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ar |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| t. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 18 |  0 |  0 |  0 | 0 |  0 | 0 | 18 | 1 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| bg |  7 |    |    |    |   |    |   |  7 | 8 |    |   |    |   |    |   |    |
+
+| cc |    |    |    |    |   |    |   |    | 7 |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 52 |  0 |  0 |  0 | 0 |  0 | 0 | 52 | 5 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| bc |    |    |    |    |   |    |   |    | 2 |    |   |    |   |    |   |    |
+
+| xx |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li | 34 |  0 |  0 |  0 | 0 |  0 | 0 | 34 | 3 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| be |    |    |    |    |   |    |   |    | 4 |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| re |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ss |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| if |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| __ |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| es |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| p- |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ds |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| p. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li |  7 |  0 |  0 |  0 | 0 |  0 | 0 |  7 | 7 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| bn |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| sn |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| et |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| .a |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li |  7 |  0 |  0 |  0 | 0 |  0 | 0 |  7 | 7 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| bv |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ad |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ne |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| t. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li |  5 |  0 |  0 |  0 | 0 |  0 | 0 |  5 | 5 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| bn |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| vs |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _s |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ec |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| _p |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| ro |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| vi |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| de |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| r. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| li |  3 |  3 |  0 |  3 | 0 |  0 | 0 |  0 | 0 |  0 | 0 |  0 | 0 |  0 | 0 |  0 |
+
+| be |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| sp |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| no |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| w. |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
+| a  |    |    |    |    |   |    |   |    |   |    |   |    |   |    |   |    |
+
++------------------------------------------------------------------------------+
+

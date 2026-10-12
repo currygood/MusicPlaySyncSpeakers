@@ -56,7 +56,7 @@
 
 /** SyncLocalPlay_Task：优先级/栈/核（任务表） */
 #define SYNC_PLAY_TASK_PRIO  (10)
-#define SYNC_PLAY_TASK_STACK (6144)
+#define SYNC_PLAY_TASK_STACK (4096)
 #define SYNC_PLAY_TASK_CORE  (1)
 
 /** 每帧最大采样数（44.1k×15ms=661.5，取 700 余量；帧长在 661/662 交替） */

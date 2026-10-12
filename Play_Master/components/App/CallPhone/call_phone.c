@@ -31,6 +31,7 @@
 #include "call_phone.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -81,10 +82,10 @@
 /** 命令队列长度（START/STOP/HANGUP/DESTROY） */
 #define CP_CMD_QUEUE_LEN          8
 
-/** 任务名 / 优先级 / 栈 / 核：与架构设计 6 任务表一致（CallPhone_Task, 8, 8192, Core1） */
+/** 任务名 / 优先级 / 栈 / 核：栈由 8192 收到 6144（内部 RAM 紧张，见十三A记录） */
 #define CP_TASK_NAME              "CallPhone_Task"
 #define CP_TASK_PRIO              8
-#define CP_TASK_STACK             8192
+#define CP_TASK_STACK             6144
 #define CP_TASK_CORE              1
 
 /** esp-sr 模型分区标签（构建时由 esp-sr 组件把 srmodels.bin 烧进该分区） */
@@ -585,7 +586,8 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
                  (unsigned long)cfg->sample_rate, CP_MIC_SAMPLE_RATE);
     }
 
-    cp = calloc(1, sizeof(*cp));
+    /* 句柄 / 队列 / 信号量放 PSRAM：内部 DRAM 留给任务栈与 DMA（见调试笔记） */
+    cp = heap_caps_calloc(1, sizeof(*cp), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (cp == NULL)
     {
         ESP_LOGE(TAG, "create: calloc failed");
@@ -596,9 +598,9 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     cp->lane = -1;   /* 首次读取时按能量自动选择 I2S 槽位 */
 
     /* ---- 同步原语 ---- */
-    cp->lock = xSemaphoreCreateMutex();
-    cp->destroy_done = xSemaphoreCreateBinary();
-    cp->cmd_q = xQueueCreate(CP_CMD_QUEUE_LEN, sizeof(msg));
+    cp->lock = xSemaphoreCreateMutexWithCaps(MALLOC_CAP_SPIRAM);
+    cp->destroy_done = xSemaphoreCreateBinaryWithCaps(MALLOC_CAP_SPIRAM);
+    cp->cmd_q = xQueueCreateWithCaps(CP_CMD_QUEUE_LEN, sizeof(msg), MALLOC_CAP_SPIRAM);
     if (cp->lock == NULL || cp->destroy_done == NULL || cp->cmd_q == NULL)
     {
         ESP_LOGE(TAG, "create: sync primitives failed");
@@ -638,6 +640,9 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     afe_cfg->ns_init  = false;
     afe_cfg->vad_init = false;
     afe_cfg->agc_init = false;
+    /* AFE/wakenet 的大块内存走 PSRAM：内部 DRAM 必须留给任务栈与 DMA，
+     * 否则随后 xTaskCreatePinnedToCore 会因内部堆见底而失败 */
+    afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
     afe_cfg = afe_config_check(afe_cfg);
     if (afe_cfg == NULL)
@@ -706,17 +711,17 @@ fail:
         CallPhone_Deinit(cp);
         if (cp->cmd_q != NULL)
         {
-            vQueueDelete(cp->cmd_q);
+            vQueueDeleteWithCaps(cp->cmd_q);
         }
         if (cp->lock != NULL)
         {
-            vSemaphoreDelete(cp->lock);
+            vSemaphoreDeleteWithCaps(cp->lock);
         }
         if (cp->destroy_done != NULL)
         {
-            vSemaphoreDelete(cp->destroy_done);
+            vSemaphoreDeleteWithCaps(cp->destroy_done);
         }
-        free(cp);
+        heap_caps_free(cp);
     }
     ESP_LOGE(TAG, "create failed");
     return NULL;
@@ -748,10 +753,10 @@ esp_err_t call_phone_destroy(call_phone_handle_t cp)
         return ESP_ERR_TIMEOUT;
     }
 
-    vQueueDelete(cp->cmd_q);
-    vSemaphoreDelete(cp->lock);
-    vSemaphoreDelete(cp->destroy_done);
-    free(cp);
+    vQueueDeleteWithCaps(cp->cmd_q);
+    vSemaphoreDeleteWithCaps(cp->lock);
+    vSemaphoreDeleteWithCaps(cp->destroy_done);
+    heap_caps_free(cp);
     ESP_LOGI(TAG, "destroy done");
     return ESP_OK;
 }

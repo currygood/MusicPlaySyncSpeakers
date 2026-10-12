@@ -32,6 +32,9 @@ esp_err_t I2c_Read_Reg(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8_t 
 // 读 FIFO 或多字节
 esp_err_t I2c_Read_Bytes(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8_t *buffer, size_t count);
 
+// 复位 I2C 控制器状态（用于 SDA/SCL 被从设备拉低后的软件恢复）
+esp_err_t I2c_Reset_Bus(i2c_master_bus_handle_t bus_handle);
+
 // 删除设备
 esp_err_t I2c_Remove_Device(i2c_master_dev_handle_t dev_handle);
 

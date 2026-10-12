@@ -22,6 +22,7 @@
 #include "i2s_driver.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
@@ -41,6 +42,9 @@
 
 /** 读取任务每次从物理层搬运的采样数（32-bit 采样） */
 #define MIC_RX_CHUNK_SAMPLES   512
+
+/** 读取任务采集缓冲字节数（512 × 4B = 2KB） */
+#define MIC_RX_CHUNK_BYTES     (MIC_RX_CHUNK_SAMPLES * 4)
 
 /** 读取任务物理读取的阻塞上限（用于及时响应销毁请求，单位 ms） */
 #define MIC_RX_READ_TIMEOUT_MS 100
@@ -64,7 +68,10 @@ static const i2s_bus_cfg_t Mic_BusCfg = {
     .slot_mask      = I2S_STD_SLOT_RIGHT,
     .slot_ws_pol    = true,     /* INMP441 时序需要反转 LRCK */
     .slot_bit_shift = false,
-    .dma_desc_num   = 8,
+    /* DMA 缓冲总字节 = dma_desc_num × dma_frame_num × 8B（32bit × 2 slot）。
+     * 原 8×256×8 = 16KB 内部 RAM → 改 4×256×8 = 8KB（省 8KB）；
+     * 4×256 帧 ≈ 23ms @44.1kHz，读取任务（prio 10）+ 16KB PSRAM FIFO 足够吸收抖动。 */
+    .dma_desc_num   = 4,
     .dma_frame_num  = 256,
     .tx_auto_clear  = false,
 };
@@ -77,8 +84,13 @@ static StreamBufferHandle_t Mic_Fifo   = NULL;
 static TaskHandle_t         Mic_RxTask = NULL;
 static volatile bool        Mic_RxStop = false;
 
-/** 读取任务采集缓冲（2KB） */
-static uint8_t Mic_RxChunk[MIC_RX_CHUNK_SAMPLES * 4];
+/**
+ * 读取任务采集缓冲（2KB）
+ *
+ * 它是 i2s_channel_read() 的 CPU 拷贝目标，不是 DMA 描述符/缓冲，
+ * 因此放 PSRAM（内部 DRAM 紧张，见 note/MusicPlay调试笔记.md）。
+ */
+static uint8_t *Mic_RxChunk = NULL;
 
 /* ======================== INMP 硬件控制 ============================================= */
 
@@ -159,7 +171,7 @@ static void Mic_Rx_Task(void *arg)
     {
         size_t bytes_read = 0;
         esp_err_t ret = i2s_bus_phy_read(Mic_Phy, Mic_RxChunk,
-                                         sizeof(Mic_RxChunk), &bytes_read,
+                                         MIC_RX_CHUNK_BYTES, &bytes_read,
                                          MIC_RX_READ_TIMEOUT_MS);
         if (ret != ESP_OK)
         {
@@ -209,11 +221,31 @@ esp_err_t Microphone_Init(void)
     Inmp441_Sd_Pulldown_Enable();
     Inmp441_Enable();
 
-    /* 4. 创建 FIFO 并启动读取任务 */
+    /* 4. 采集缓冲（PSRAM 优先，省内部 DRAM）+ FIFO + 读取任务 */
+    if (Mic_RxChunk == NULL)
+    {
+        Mic_RxChunk = (uint8_t *)heap_caps_malloc(MIC_RX_CHUNK_BYTES,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (Mic_RxChunk == NULL)
+        {
+            Mic_RxChunk = (uint8_t *)heap_caps_malloc(MIC_RX_CHUNK_BYTES,
+                                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (Mic_RxChunk == NULL)
+        {
+            ESP_LOGE(TAG, "rx chunk alloc failed");
+            i2s_bus_phy_destroy(Mic_Phy);
+            Mic_Phy = NULL;
+            return ESP_FAIL;
+        }
+    }
+
     Mic_Fifo = xStreamBufferCreate(MICROPHONE_FIFO_BYTES, 1);
     if (Mic_Fifo == NULL)
     {
         ESP_LOGE(TAG, "fifo create failed");
+        heap_caps_free(Mic_RxChunk);
+        Mic_RxChunk = NULL;
         i2s_bus_phy_destroy(Mic_Phy);
         Mic_Phy = NULL;
         return ESP_FAIL;
@@ -249,6 +281,11 @@ esp_err_t Microphone_Deinit(void)
     {
         vStreamBufferDelete(Mic_Fifo);
         Mic_Fifo = NULL;
+    }
+    if (Mic_RxChunk != NULL)
+    {
+        heap_caps_free(Mic_RxChunk);
+        Mic_RxChunk = NULL;
     }
     if (Mic_Phy != NULL)
     {

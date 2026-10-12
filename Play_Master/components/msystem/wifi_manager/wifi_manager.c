@@ -39,6 +39,7 @@
 #include "freertos/task.h"
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
@@ -505,8 +506,14 @@ static void wifi_mgr_reopen_all_mcast(wifi_manager_handle_t h)
 static void wifi_mcast_rx_task(void *arg)
 {
     wifi_manager_handle_t h = arg;
-    /* 任务栈为 4096（任务表），收包缓冲改走堆 */
-    uint8_t *buf = malloc(WIFI_MCAST_RX_BUF_BYTES);
+    /* 任务栈为 4096（任务表），收包缓冲改走堆；recvfrom 是 CPU 拷贝，非 DMA，
+     * 因此优先 PSRAM（每条 rx 通道 4KB，内部 DRAM 留给栈/DMA） */
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(WIFI_MCAST_RX_BUF_BYTES,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL)
+    {
+        buf = (uint8_t *)malloc(WIFI_MCAST_RX_BUF_BYTES);   /* 回退内部 RAM */
+    }
 
     if (buf == NULL)
     {

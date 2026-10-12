@@ -50,7 +50,7 @@ extern "C" {
 
 /** 本地固件版本号兜底值（仅当自动读取运行固件版本失败时使用） */
 #ifndef OTA_LOCAL_VERSION
-#define OTA_LOCAL_VERSION "1.0.0"
+#define OTA_LOCAL_VERSION "0.1.0"
 #endif
 
 /** /ota/check 请求超时时间（毫秒） */

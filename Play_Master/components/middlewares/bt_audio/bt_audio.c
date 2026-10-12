@@ -165,8 +165,31 @@ struct bt_audio_s
     bool                track_info_valid;
 };
 
-/** 单实例 */
-static struct bt_audio_s s_bt_audio;
+/**
+ * 单实例（内部 DRAM 紧张：整个上下文 ~3.9KB 放 PSRAM）
+ *
+ * 上下文只在任务上下文（BTC / bt_audio_task）访问，不做 ISR/DMA，因此可以放
+ * PSRAM。首次访问时惰性分配（PSRAM 优先，失败回退内部 RAM），并用宏别名保持
+ * 既有 `s_bt_audio.xxx` 代码不变。
+ */
+static struct bt_audio_s *s_bt_audio_ptr = NULL;
+
+static struct bt_audio_s *bt_audio_ctx(void)
+{
+    if (s_bt_audio_ptr == NULL)
+    {
+        s_bt_audio_ptr = (struct bt_audio_s *)heap_caps_calloc(
+            1, sizeof(struct bt_audio_s), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_bt_audio_ptr == NULL)
+        {
+            s_bt_audio_ptr = (struct bt_audio_s *)heap_caps_calloc(
+                1, sizeof(struct bt_audio_s), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+    }
+    return s_bt_audio_ptr;
+}
+
+#define s_bt_audio (*bt_audio_ctx())
 
 /** 蓝牙栈（控制器 + Bluedroid + A2DP 注册）是否已初始化 */
 static bool s_stack_ready = false;
@@ -608,16 +631,18 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
         if (param->volume_control.type == ESP_HF_VOLUME_CONTROL_TARGET_SPK)
         {
             /* 归一化：HFP +VGS 音量刻度为 0~15，而 AVRCP 绝对音量为 0~100，
-             * 统一转成 0~100 再下发，避免把（如 1/15）直接当 1% 用。 */
+             * 统一转成 0~100，仅用于日志/调试。 */
             uint32_t v015 = (uint32_t)param->volume_control.volume;
             if (v015 > 15) { v015 = 15; }
             uint8_t v100 = (uint8_t)((v015 * 100) / 15);
 
-            memset(&evt, 0, sizeof(evt));
-            evt.id = BT_AUDIO_EVT_VOLUME_CHANGED;
-            evt.data.volume = v100;
-            bt_audio_post_event(&evt);
-            ESP_LOGI(TAG, "HFP volume set to %u (VGS 0~15 -> 0~100)", v100);
+            /* 关键：AG 上报的 +VGS 不作为本机音量下发（不投事件、不改功放、不落 NVS）。
+             * 手机的通话/SCO 音量流与媒体音量流是两个独立刻度，语音助手或通话
+             * 期间 AG 常上报 +VGS=1（归一化后 6%）；若直接跟随，功放会被压到几乎
+             * 无声，而用户按的是媒体音量键、怎么调都恢复不了（第十阶段问题复现）。
+             * HFP 下行（语音助手/通话）响度统一由本机音量决定，这里只记录。 */
+            ESP_LOGI(TAG, "HFP +VGS=%u (0~15) -> %u%% (recorded only, local volume kept)",
+                     (unsigned)v015, (unsigned)v100);
         }
         break;
     }
@@ -741,10 +766,24 @@ static void bt_audio_avrc_set_playback(bt_audio_play_state_t st)
     bt_audio_post_event(&evt);
 }
 
-/** 更新本地音量并投递事件（协议栈上下文） */
-static void bt_audio_avrc_set_volume_local(uint8_t vol100)
+/**
+ * 更新本地音量并投递事件（协议栈上下文）
+ *
+ * 只用于 AVRCP 绝对音量（媒体音量，0~127），与 HFP +VGS 通话音量是两个独立
+ * 刻度，这里不做混用：AVRCP 跟随手机媒体音量是设计行为，HFP +VGS 只记录。
+ *
+ * @param avrc_raw AVRCP 绝对音量原始值 0~127
+ */
+static void bt_audio_avrc_set_volume_local(uint8_t avrc_raw)
 {
     bt_audio_event_t evt;
+    uint8_t vol100;
+
+    if (avrc_raw > 127)
+    {
+        avrc_raw = 127;
+    }
+    vol100 = BT_VOL_AVRC_TO_LOCAL(avrc_raw);
 
     BT_AUDIO_LOCK();
     s_bt_audio.volume = vol100;
@@ -754,6 +793,9 @@ static void bt_audio_avrc_set_volume_local(uint8_t vol100)
     evt.id = BT_AUDIO_EVT_VOLUME_CHANGED;
     evt.data.volume = vol100;
     bt_audio_post_event(&evt);
+
+    ESP_LOGI(TAG, "AVRCP abs vol %u (0~127) -> %u%% (media volume, applied)",
+             (unsigned)avrc_raw, (unsigned)vol100);
 }
 
 /** 定长安全拷贝（UTF-8 元数据，超长截断并补 NUL） */
@@ -934,7 +976,7 @@ static void bt_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
 
         case ESP_AVRC_RN_VOLUME_CHANGE:
             bt_audio_avrc_set_volume_local(
-                BT_VOL_AVRC_TO_LOCAL(param->change_ntf.event_parameter.volume));
+                (uint8_t)param->change_ntf.event_parameter.volume);
             if (esp_avrc_rn_evt_bit_mask_operation(
                     ESP_AVRC_BIT_MASK_OP_TEST, &s_bt_audio.avrc_peer_rn_cap,
                     ESP_AVRC_RN_VOLUME_CHANGE))
@@ -973,8 +1015,7 @@ static void bt_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
 
     case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
         s_bt_audio.avrc_abs_vol_ok = true;
-        bt_audio_avrc_set_volume_local(
-            BT_VOL_AVRC_TO_LOCAL(param->set_volume_rsp.volume));
+        bt_audio_avrc_set_volume_local((uint8_t)param->set_volume_rsp.volume);
         break;
 
     case ESP_AVRC_CT_REMOTE_FEATURES_EVT:
@@ -1020,8 +1061,7 @@ static void bt_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *
 
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
         /* 手机调节音量：同步本地音量并上报 APP */
-        bt_audio_avrc_set_volume_local(
-            BT_VOL_AVRC_TO_LOCAL(param->set_abs_vol.volume));
+        bt_audio_avrc_set_volume_local((uint8_t)param->set_abs_vol.volume);
         break;
 
     case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:

@@ -1,0 +1,39 @@
+# ============================================================================
+# Play_Slave（ESP32-S3 从节点）工程默认配置
+#
+# 背景：sdkconfig 被 .gitignore 忽略，不会随仓库分发。本文件用于在任何一台
+#       新机器上重建出正确的 sdkconfig。缺失它会让工程退回 IDF 默认值，导致：
+#         - SPIRAM 未开启 → esp_psram 组件只编译桩文件 → 链接期
+#           `undefined reference to esp_psram_is_initialized / esp_psram_get_size`
+#         - Flash 容量退回 2MB、分区表退回 SINGLE_APP → 与 partitions.csv 不符
+#
+# 用法：改动本文件后需删除 sdkconfig 再重新构建才会生效。
+# ============================================================================
+
+# ---------- 目标芯片 ----------
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---------- Flash：ESP32-S3-N16R8 = 16MB ----------
+# 必须与 partitions.csv 匹配；partitions.csv 末尾到 0x1000000，即 16MB。
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# ---------- PSRAM：N16R8 = 8MB Octal(OPI) SPI PSRAM ----------
+# 必须开启，否则 main/app_main.c 的 esp_psram_is_initialized() /
+# esp_psram_get_size() 无法链接。若模组实为 Quad PSRAM（N8R2 等），
+# 需把 SPIRAM_MODE_OCT 换成 SPIRAM_MODE_QUAD。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# 内部 DRAM 是本项目最紧张的资源（见 note/MusicPlay调试笔记.md），
+# 大缓冲优先落 PSRAM，WiFi/lwIP 动态缓冲也放 PSRAM。
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# ---------- 分区表：使用工程自带的双备份 OTA 布局 ----------
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---------- CPU：N16R8 双核 240MHz ----------
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y

@@ -16,6 +16,7 @@ file(GLOB_RECURSE SOURCES "*.c")
 idf_component_register(
     SRCS ${SOURCES}
     INCLUDE_DIRS ${MID_INCLUDE_DIRS}
-    # Middlewares 的传感器通常需要调用 BSP 层的底层通信逻辑
-    REQUIRES bsp freertos
+    # bsp：底层通信（i2s_driver）；mysystem：wifi_manager 组播通道句柄；
+    # esp_timer：同步协议的时间基准（esp_timer_get_time）
+    REQUIRES bsp freertos mysystem esp_timer
 )

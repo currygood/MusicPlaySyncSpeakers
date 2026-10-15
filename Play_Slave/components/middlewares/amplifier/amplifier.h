@@ -100,4 +100,18 @@ esp_err_t Amplifier_Set_Volume(uint8_t volume);
  */
 uint8_t Amplifier_Get_Volume(void);
 
+/**
+ * @brief 动态设置 I2S 采样率（同步播放的漂移校正用）
+ *
+ * 与 Amplifier_Play_Buffer() 共用同一把写锁，保证不会在重配时钟时插进去写。
+ *
+ * @warning 底层 i2s_bus_phy_set_sample_rate() 内部是 disable → reconfig → enable，
+ *          **会把 DMA 里尚未播放的音频全部丢弃**（本工程 DMA 深度 8×256 帧 ≈ 46ms）。
+ *          因此调用频率必须很低，且调用方要接受一次可闻的空窗风险。
+ *
+ * @param sample_rate 目标采样率（Hz），如 44100 / 44060 / 44140
+ * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数非法；ESP_ERR_INVALID_STATE 未初始化
+ */
+esp_err_t Amplifier_Set_Sample_Rate(uint32_t sample_rate);
+
 #endif

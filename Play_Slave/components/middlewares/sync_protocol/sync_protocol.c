@@ -100,8 +100,25 @@
 /** 到点前最后这段时间忙等，保证出声精度（对齐主节点 sync_play_task） */
 #define SP_PLAY_PRECISE_US          (2000)
 
-/** 落后主节点超过这么多帧就重锚游标（重连/长抖动后追不回来的场景） */
-#define SP_REANCHOR_LEAD            (8)
+/**
+ * 重锚门限：读游标落后写游标这么**多槽**才重锚（重连/长抖动后追不回来的场景）。
+ *
+ * ⚠️ 这里绝不能用一个拍脑袋的小常数（曾经是 8）。sp_anchor_locked() 是把
+ * 游标放在「最新包往前 D/frame_ms 帧」处 —— 也就是说**锚定动作本身**
+ * 就把 lead 定成了 delay_ms/frame_ms（D=200、帧 15ms 时是 13 帧）。
+ * 门限一旦比它小，sp_play_next_locked() 每次进来都会立刻判定「落后太多」
+ * → 重锚 → return false，而重锚又把 lead 设回同一个值 ——
+ * **死循环，一帧都出不了队**。串口上表现为 state=PLAYING、jb 满、
+ * under=0ms、完全没有声音。
+ *
+ * 正确的门限是「缓冲装不下」：lead >= jb_slots 时新到的包会被
+ * sp_in_window_locked() 判为超前而全部丢弃，此时才是真的追不回来了。
+ *
+ * 必须窄化回 int16_t 再比较：jb_slots 是 uint32_t，若让它参与比较，
+ * lead 为负（读游标跑到写游标前面 = 真空载）时会被提升成无符号的巨大
+ * 正数，把「该补静音」错判成「落后太多」。
+ */
+#define SP_REANCHOR_LEAD            ((int16_t)(s_slave.jb_slots))
 /** 连续补静音超过这么多帧（33×15ms≈500ms）→ 回 PREPARING 重新灌缓冲 */
 #define SP_UNDERRUN_RESYNC_FRAMES   (33)
 /** 音频流静默判定（与《项目文档》一致：500ms 无包） */
@@ -205,6 +222,8 @@ typedef struct {
     int64_t  last_written_t_tx; /**< 最近写出的帧的 t_tx（漂移测量用） */
     bool     has_last_written;
     uint32_t rx_pkts;
+    uint32_t ping_sent;         /**< 累计发出的 PING 数 */
+    uint32_t pong_recv;         /**< 累计 t1 匹配成功的 PONG 数 */
     uint32_t lost_pkts;         /**< 确认丢包补静音的帧数 */
     uint32_t late_pkts;         /**< 迟到丢弃的包数 */
     uint32_t dropped_pkts;      /**< 写 I2S 失败丢弃的帧数 */
@@ -383,6 +402,8 @@ static void sp_snapshot(sync_protocol_slave_status_t *st)
     st->sync_error_us   = s_slave.drift_error_us;
     st->cur_sample_rate = s_slave.cur_sample_rate;
     st->rx_pkts         = s_slave.rx_pkts;
+    st->ping_sent       = s_slave.ping_sent;
+    st->pong_recv       = s_slave.pong_recv;
     st->lost_pkts       = s_slave.lost_pkts;
     st->late_pkts       = s_slave.late_pkts;
     st->underrun_ms     = s_slave.underrun_ms;
@@ -663,6 +684,10 @@ static void sp_send_ping(void)
         return;
     }
 
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_slave.ping_sent++;
+    xSemaphoreGive(s_lock);
+
     s_ping_outstanding = true;
     s_ping_deadline_us = sp_now_us() + SP_PONG_WAIT_US;
 }
@@ -676,6 +701,16 @@ static void sp_handle_pong(const sync_pong_payload_t *pong)
     int64_t rtt;
     int64_t off;
     bool    matched = false;
+    uint64_t pend_new = 0;      /* 诊断用：未决表里最新的 t1 */
+    int      pend_n   = 0;      /* 诊断用：未决表里还有几个 */
+
+    /* 诊断计数：只要 PONG 上了线就计，不管是回给谁的。
+     * 和 ping_sent 对照就能一眼分开两类故障：
+     *   ping 在涨、pong 恒 0 → PONG 根本没回来（主节点没收到 PING / 组播被过滤）
+     *   ping 和 pong 一起涨、lock 仍为 0 → PONG 回来了但被下面的过滤条件丢了 */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_slave.pong_recv++;
+    xSemaphoreGive(s_lock);
 
     /* 回显匹配：组播回环会让我们收到自己的 PING，多从机场景下还会收到
      * 别人的 PONG —— 只有 t1 与某个未决 PING 完全相等的才是回给自己的 */
@@ -688,12 +723,28 @@ static void sp_handle_pong(const sync_pong_payload_t *pong)
             matched = true;
             break;
         }
+        /* 只有走到「没匹配上」这条支路时这两个值才被打印出去。
+         * matched 时提前 break，统计不全也无所谓。 */
+        if (s_slave.pend_used[i])
+        {
+            pend_n++;
+            if (s_slave.pend_t1[i] > pend_new)
+            {
+                pend_new = s_slave.pend_t1[i];
+            }
+        }
     }
     xSemaphoreGive(s_lock);
 
     if (!matched)
     {
-        ESP_LOGD(TAG, "PONG t1=%" PRIu64 " 无匹配未决 PING，丢弃", pong->t1_us);
+        /* 升到 WARN：这条以前是 LOGD，默认级别下完全看不见，
+         * 串口上只剩一个「lock=0」的结论，查不出原因。
+         * 带上未决表的状态，好一眼分开两种故障：
+         *   未决 0 个      → PONG 回来得太晚，登记已经过期/被顶掉
+         *   未决有、t1 都对不上 → PONG 是回给别人的（多从机/串了别的板子） */
+        ESP_LOGW(TAG, "PONG t1=%" PRIu64 " 无匹配未决 PING，丢弃（未决 %d 个，最新 t1=%" PRIu64 "）",
+                 pong->t1_us, pend_n, pend_new);
         return;
     }
     s_ping_outstanding = false;
@@ -707,7 +758,11 @@ static void sp_handle_pong(const sync_pong_payload_t *pong)
 
     if (rtt < 0 || rtt > SP_CLOCK_RTT_MAX_US)
     {
-        ESP_LOGD(TAG, "PONG rtt=%" PRId64 "us 超范围，丢弃", rtt);
+        /* 同样升到 WARN，并把四个时间戳原样打出来。rtt 为负几乎必然是
+         * 两边时间基不同尺（或 t2/t3 取反了），看数字就能直接断定。 */
+        ESP_LOGW(TAG, "PONG rtt=%" PRId64 "us 超范围，丢弃"
+                      "（t1=%" PRIu64 " t2=%" PRIu64 " t3=%" PRIu64 " t4=%" PRId64 "）",
+                 rtt, pong->t1_us, pong->t2_us, pong->t3_us, t4);
         return;
     }
 
@@ -842,9 +897,15 @@ static void sp_handle_basic_cmd(uint8_t cmd, uint8_t param)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         /* 恢复出队：重锚游标，避免把暂停期间积压的旧帧一股脑倒出来 */
         sp_anchor_locked();
-        /* 缓冲是空的（刚换流/刚断过）→ 回 PREPARING 重新灌 D，别空转补静音 */
-        s_slave.state = s_slave.cursor_valid ? SYNC_STATE_PLAYING
-                                             : SYNC_STATE_PREPARING;
+        /* 只有「游标锚得住」且「时钟已锁」才直接进 PLAYING；否则一律回
+         * PREPARING，交给播放任务那道门（clock_locked && 缓冲 ≥ D）再放行。
+         * 少了 clock_locked 这一条，时钟没锁时 state 也会变成 PLAYING，
+         * 而 θ=0 会把出声时刻算成几十分钟之后 ——
+         * 串口上就是「state=2 lock=0，而且没声音」。
+         * 缓冲是空的（刚换流/刚断过）同样回 PREPARING 重新灌 D，别空转补静音 */
+        s_slave.state = (s_slave.cursor_valid && s_slave.clock_locked)
+                            ? SYNC_STATE_PLAYING
+                            : SYNC_STATE_PREPARING;
         sync_protocol_state_t next = s_slave.state;
         xSemaphoreGive(s_lock);
         ESP_LOGI(TAG, "cmd PLAY -> state %d", (int)next);
@@ -881,6 +942,10 @@ static void sp_handle_basic_cmd(uint8_t cmd, uint8_t param)
         s_slave.win_cnt       = 0;
         s_slave.win_idx       = 0;
         s_slave.jump_cnt      = 0;
+        /* 缓冲已清空、时钟估计已作废，必须退回 PREPARING 重新走一遍
+         * 「锁钟 + 灌 D」的准入流程；停在 PLAYING 的话游标锚不回来，
+         * 播放任务会永远空转，再也出不了声。 */
+        s_slave.state         = SYNC_STATE_PREPARING;
         xSemaphoreGive(s_lock);
         s_ping_outstanding = false;
         ESP_LOGW(TAG, "cmd RESET: buffer/clock estimate cleared, re-probing");
@@ -891,6 +956,16 @@ static void sp_handle_basic_cmd(uint8_t cmd, uint8_t param)
         break;
     }
 }
+
+/**
+ * 控制通道各 type/cmd 的累计接收计数（诊断用）
+ *
+ * 全部控制报文都由 SyncHeartbeat_Task 串行解析，所以这里不需要加锁。
+ * 作用是把「主节点→从节点」这个方向按报文类型摊开：只要 PING/PONG 之外
+ * 还有 START/HEARTBEAT 在涨，就说明组播通路本身是通的，问题只出在
+ * PING→PONG 这一问一答上。
+ */
+static uint32_t s_ctrl_rx_cnt[256];
 
 /** 解析并派发一个控制通道报文 */
 static void sp_dispatch_ctrl(const uint8_t *buf, size_t len)
@@ -906,6 +981,8 @@ static void sp_dispatch_ctrl(const uint8_t *buf, size_t len)
     {
         return;
     }
+
+    s_ctrl_rx_cnt[buf[2]]++;
 
     /* 基础帧与扩展帧都从 {u16 magic; u8 x; ...} 开始，靠 x 的取值区分：
      * 基础帧 x = cmd ∈ [0x01, 0x06]，扩展帧 x = type ∈ {0x12,0x13,0x20,0x21}，
@@ -1146,14 +1223,30 @@ static void sp_maybe_log_status(void)
     sp_snapshot(&st);
 
     ESP_LOGI(TAG,
-             "[status] state=%d stream=%u lock=%d rx=%lu lost=%lu late=%lu under=%lums "
+             "[status] state=%d stream=%u lock=%d rx=%lu ping=%lu pong=%lu "
+             "lost=%lu late=%lu under=%lums "
              "jb=%lu/%lu offset=%+" PRId64 "us nd=%" PRId64 "us err=%+" PRId64 "us rate=%lu",
              (int)st.state, st.stream_id, (int)st.clock_locked,
-             (unsigned long)st.rx_pkts, (unsigned long)st.lost_pkts,
-             (unsigned long)st.late_pkts, (unsigned long)st.underrun_ms,
+             (unsigned long)st.rx_pkts, (unsigned long)st.ping_sent,
+             (unsigned long)st.pong_recv,
+             (unsigned long)st.lost_pkts, (unsigned long)st.late_pkts,
+             (unsigned long)st.underrun_ms,
              (unsigned long)st.jitter_used, (unsigned long)st.jitter_cap,
              st.offset_us, st.net_delay_us, st.sync_error_us,
              (unsigned long)st.cur_sample_rate);
+
+    /* 诊断：控制通道按报文类型的累计收包数。
+     *   PING 在涨 = 收到了自己发出去的回环副本（组播回环是开着的）
+     *   START / HB 在涨 = 主节点→从节点方向通着
+     *   PONG 在涨而 lock 恒 0 = PONG 回来了但没被采纳，看上面两条 WARN */
+    ESP_LOGI(TAG, "[ctrl] PING=%lu PONG=%lu START=%lu HB=%lu PLAY=%lu PAUSE=%lu RESET=%lu",
+             (unsigned long)s_ctrl_rx_cnt[SYNC_MSG_PING],
+             (unsigned long)s_ctrl_rx_cnt[SYNC_MSG_PONG],
+             (unsigned long)s_ctrl_rx_cnt[SYNC_MSG_START],
+             (unsigned long)s_ctrl_rx_cnt[SYNC_MSG_HEARTBEAT],
+             (unsigned long)s_ctrl_rx_cnt[SYNC_CMD_PLAY],
+             (unsigned long)s_ctrl_rx_cnt[SYNC_CMD_PAUSE],
+             (unsigned long)s_ctrl_rx_cnt[SYNC_CMD_RESET]);
 }
 
 /** 长时间收不到音频包 → 每秒记一次（I2S 由播放任务补静音，无需单独动作） */
@@ -1307,12 +1400,21 @@ static bool sp_play_next_locked(uint16_t *out_samples, int64_t *out_play_at,
     {
         return false;
     }
+    /* 时钟没锁 → θ 无意义 → 算出来的出声时刻是垃圾。θ=0 时
+     * sp_master_to_local_locked() 会把主节点的开机时长当成本地时间，
+     * play_at 直接被甩到几十分钟之后，sp_sleep_until() 一觉睡死，
+     * 而且全程不打一行日志。这里宁可不播，等时钟锁上再说。 */
+    if (!s_slave.clock_locked)
+    {
+        return false;
+    }
 
     lead = sp_seq_diff(s_slave.newest_seq, s_slave.next_seq);
 
-    /* 落后太多（断网重连 / 长抖动之后）→ 把游标重锚到最新包前面 lead 帧处。
-     * 不这样做的话，读游标会以每帧 15ms 的速度永远追不上已经跑到前面的流。 */
-    if (lead > SP_REANCHOR_LEAD)
+    /* 落后到「新到的包会被窗口整批拒绝」才重锚 —— 门限的含义见
+     * SP_REANCHOR_LEAD 的定义，它必须严格大于锚定动作自己产生的 lead，
+     * 否则重锚与出队判定互相打架，形成死循环。 */
+    if (lead >= SP_REANCHOR_LEAD)
     {
         sp_anchor_locked();
         return false;

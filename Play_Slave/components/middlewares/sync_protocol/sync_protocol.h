@@ -165,6 +165,8 @@ typedef struct {
     uint32_t underrun_ms;       /* 累计欠载静音时长（ms） */
     uint32_t jitter_used;       /* 当前缓冲包数 */
     uint32_t jitter_cap;        /* 缓冲容量（槽数） */
+    uint32_t ping_sent;         /* 累计发出的 PING 数 */
+    uint32_t pong_recv;         /* 累计 t1 匹配成功的 PONG 数 */
 } sync_protocol_slave_status_t;
 
 /* ======================== 事件回调 ================================================ */

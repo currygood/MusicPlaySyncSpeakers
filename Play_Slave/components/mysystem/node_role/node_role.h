@@ -79,8 +79,23 @@ typedef struct {
  *  要留结束符，超了会被静默截断）。
  *
  *  配网 UI 接入后，这里的值会被 node_role_set() 写进 NVS 的凭据覆盖。 */
-#define NODE_ROLE_DEFAULT_SSID          "败家之眼"
+#define NODE_ROLE_DEFAULT_SSID          "败家之眼666"
 #define NODE_ROLE_DEFAULT_PASSWORD      "Tgs200410"
+
+/** ⭐ WiFi 凭据从哪来 —— 开发期开关
+ *
+ *   1 = 用上面那两个宏写死的值  ← 当前（改了立刻生效，**不用擦 NVS**）
+ *   0 = 用 NVS 里存的那份（配网 UI 写进去的，掉电保持）
+ *
+ *  开启时 NVS 里的凭据被**完全忽略**（不读也不用），但**不会被改写** ——
+ *  所以随时把开关拨回 0 重新编译，之前配网存下的 SSID/密码原样回来。
+ *
+ *  作用点在 node_role_get()：所有读取者（wifi_manager、app_main 日志）
+ *  拿到的都是开关生效之后的值，看这一个接口就够，不必到处改。
+ *
+ *  与 NVS 缓存的关系：开关拨到 1 之后，**不需要 erase-flash** ——
+ *  NVS 里存的是什么都不影响结果。这也是它相对于"改宏 + 擦 NVS"的价值。 */
+#define NODE_ROLE_WIFI_FROM_CODE        (1)
 
 /** 默认 OTA 服务器地址（不带协议头，ota_manager 使用前自行补全） */
 #define NODE_ROLE_DEFAULT_OTA_URL       "192.168.4.16:5000/ota/check"

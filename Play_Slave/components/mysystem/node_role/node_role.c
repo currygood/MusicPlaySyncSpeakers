@@ -67,6 +67,24 @@ static void node_role_fill_defaults(node_role_cfg_t *cfg)
     cfg->play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
 }
 
+/** WiFi 凭据来源开关（NODE_ROLE_WIFI_FROM_CODE）：开启时用代码宏覆盖 ssid/password。
+ *
+ *  刻意只作用在「读」这一个边界（node_role_get），**绝不碰 NVS**：
+ *    - node_role_set() 照常把配网结果写进 NVS，只是开关开着时读不出来；
+ *    - 所以把宏拨回 0 重新编译，NVS 里那份配置原样恢复，不会被污染。
+ *  反过来如果在这里顺手把 NVS 也改了，关掉开关后就再也找不回配网的值。 */
+static void node_role_apply_wifi_switch(node_role_cfg_t *cfg)
+{
+#if NODE_ROLE_WIFI_FROM_CODE
+    snprintf(cfg->wifi_ssid,     sizeof(cfg->wifi_ssid),
+             "%s", NODE_ROLE_DEFAULT_SSID);
+    snprintf(cfg->wifi_password, sizeof(cfg->wifi_password),
+             "%s", NODE_ROLE_DEFAULT_PASSWORD);
+#else
+    (void)cfg;   /* 开关关闭时不做事，加这一句免掉 unused parameter 告警 */
+#endif
+}
+
 /** 初始化 NVS 分区（esp_wifi 与本模块共同依赖，与 bt_audio 一致） */
 static esp_err_t node_role_nvs_init(void)
 {
@@ -197,6 +215,17 @@ esp_err_t node_role_init(const node_role_cfg_t *defaults)
     memcpy(&s_cache, &cached, sizeof(s_cache));
     xSemaphoreGive(s_lock);
 
+    /* 5. 把凭据来源明确打出来。这一行是专门治"改了宏却没生效"的：
+     *    一眼就能看出设备到底在用哪份 SSID，不用再去猜 NVS 里存了什么。 */
+#if NODE_ROLE_WIFI_FROM_CODE
+    ESP_LOGI(TAG, "WiFi 凭据来源 = 代码宏（NODE_ROLE_WIFI_FROM_CODE=1），"
+                  "ssid=\"%s\"，NVS 里的值被忽略",
+             NODE_ROLE_DEFAULT_SSID);
+#else
+    ESP_LOGI(TAG, "WiFi 凭据来源 = NVS（NODE_ROLE_WIFI_FROM_CODE=0），ssid=\"%s\"",
+             cached.wifi_ssid);
+#endif
+
     return ESP_OK;
 }
 
@@ -214,6 +243,10 @@ esp_err_t node_role_get(node_role_cfg_t *out)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     memcpy(out, &s_cache, sizeof(*out));
     xSemaphoreGive(s_lock);
+
+    /* WiFi 凭据来源开关在这里统一生效：开了就用代码宏的值覆盖刚拷出来的副本，
+     * s_cache 和 NVS 都不动。放在"读"的边界上，所有调用方自动受益。 */
+    node_role_apply_wifi_switch(out);
 
     return ESP_OK;
 }
@@ -252,6 +285,18 @@ esp_err_t node_role_set(const node_role_cfg_t *cfg)
     {
         ESP_LOGI(TAG, "cfg saved (role=%u ssid=\"%s\")",
                  (unsigned)s_cache.role, s_cache.wifi_ssid);
+
+#if NODE_ROLE_WIFI_FROM_CODE
+        /* 开关开着时，配网结果存得进去但读不出来。不提醒的话，将来接上配网 UI
+         * 会表现成"配了网却不生效"，很难查。 */
+        if (strcmp(cfg->wifi_ssid, NODE_ROLE_DEFAULT_SSID) != 0)
+        {
+            ESP_LOGW(TAG, "NODE_ROLE_WIFI_FROM_CODE=1：本次保存的 ssid=\"%s\" "
+                          "已写入 NVS，但读取时会被代码宏 \"%s\" 覆盖，不会生效；"
+                          "要让配网结果生效，请把该宏改成 0 重新编译",
+                     cfg->wifi_ssid, NODE_ROLE_DEFAULT_SSID);
+        }
+#endif
     }
     else
     {

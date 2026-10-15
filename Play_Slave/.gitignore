@@ -5,6 +5,7 @@
 
 # Directory metadata
 .directory
+.vscode
 
 # Temporary files
 *~

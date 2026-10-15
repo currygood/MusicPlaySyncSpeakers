@@ -4,7 +4,8 @@
  *
  * 模块职责（对应分层设计 3.4.2）：
  *   - STA 连接、断线自动重连；启动时凭据经 node_role_get() 读取（NVS
- *     未配置时回退到本文件头默认宏兜底，正式环境由触摸屏配网写入）；
+ *     未配置时回退到 node_role.h 的 NODE_ROLE_DEFAULT_SSID 兜底，
+ *     正式环境由触摸屏配网写入）；本模块**不定义**也不该定义凭据宏；
  *   - 配网：UI 触摸屏输入 SSID / 密码，先经 node_role_set() 持久化，再调
  *     wifi_manager_set_sta() 发起连接；本模块不直接写 NVS；
  *   - 统一持有 UDP 组播 socket：音频同步（数据 + 控制）、灯控等组播通道均由
@@ -29,10 +30,13 @@
 #include "esp_err.h"
 
 /* ======================== 开发期兜底凭据 ======================== */
-/** 兜底 SSID：node_role NVS 未配网（ssid 为空）时使用，与 node_role 内置默认一致 */
-#define WIFI_MANAGER_DEFAULT_SSID        "败家之眼"
-/** 兜底密码：同上 */
-#define WIFI_MANAGER_DEFAULT_PASSWORD    "Tgs200410"
+/** 本模块不定义凭据。要改要连的 WiFi，去 node_role.h 的 NODE_ROLE_DEFAULT_SSID。
+ *
+ *  这里原本有一份值相同的重复宏（WIFI_MANAGER_DEFAULT_SSID / _PASSWORD），
+ *  是**死代码**：node_role_init() 一定会把默认值填进配置，所以
+ *  wifi_manager.c 里读 node_role_get() 的那个分支永远成立，永远轮不到这里。
+ *  留着只会让人改错文件 —— 改了毫无效果，还以为是别的地方出了问题。
+ *  现已删除，兜底分支直接引用 NODE_ROLE_DEFAULT_SSID。 */
 
 /* ======================== 句柄与状态 ======================== */
 

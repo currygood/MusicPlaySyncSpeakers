@@ -671,9 +671,12 @@ static esp_err_t wifi_mgr_apply_config(wifi_manager_handle_t h)
     }
     else
     {
-        /* NVS 未配网（node_role 未初始化/为空）：兜底默认凭据 */
-        ssid     = WIFI_MANAGER_DEFAULT_SSID;
-        password = WIFI_MANAGER_DEFAULT_PASSWORD;
+        /* 兜底：node_role 尚未初始化（正常流程不会走到这里，app_main 里
+         * node_role_init() 一定在 wifi_manager_start() 之前）。
+         * 直接用 node_role.h 那份唯一的默认值，不要再在本模块另立一份
+         * ——以前 wifi_manager.h 里有一份重复宏，改它没有任何效果。 */
+        ssid     = NODE_ROLE_DEFAULT_SSID;
+        password = NODE_ROLE_DEFAULT_PASSWORD;
         snprintf(h->ssid,     sizeof(h->ssid),     "%s", ssid);
         snprintf(h->password, sizeof(h->password), "%s", password);
     }

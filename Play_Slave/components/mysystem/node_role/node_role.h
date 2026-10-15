@@ -60,7 +60,25 @@ typedef struct {
 
 /* ======================== 默认参数（内置默认，配网 UI 接入前） =========== */
 
-/** 默认 WiFi SSID/密码（开发期测试凭据，配网后由 node_role_set 覆盖） */
+/** ⭐ 要连的 WiFi —— 就改这两行，全工程唯一的开关
+ *
+ *  改这里会同时影响主从两个节点吗？不会：Play_Master / Play_Slave 各自
+ *  有一份 node_role.h，**两边都要改**，否则连不到同一个网络。
+ *  （之前 wifi_manager.h 里还有一份同名重复宏，是死代码，已删除 —— 见该文件。）
+ *
+ *  ⚠️ 改完必须擦掉 NVS 才生效！
+ *     node_role_init() 在首次开机时已把当时的值写进了 NVS，之后每次开机都是
+ *     从 NVS 读回来的，这两个宏只在「NVS 里压根没有配置」时才用得上。
+ *     不擦就改，串口日志里打出来的 ssid 仍然是旧名字：
+ *         idf.py -p <PORT> erase-flash
+ *         idf.py -p <PORT> flash
+ *     （另一条路是把 NODE_ROLE_CFG_VERSION 加 1 触发重建，但那会把音量、
+ *       组播地址等整份配置一起重置掉，开发期不推荐。）
+ *
+ *  长度上限：SSID ≤ 31 字符、密码 ≤ 63 字符（驱动结构体 ssid[32]/password[64]
+ *  要留结束符，超了会被静默截断）。
+ *
+ *  配网 UI 接入后，这里的值会被 node_role_set() 写进 NVS 的凭据覆盖。 */
 #define NODE_ROLE_DEFAULT_SSID          "败家之眼"
 #define NODE_ROLE_DEFAULT_PASSWORD      "Tgs200410"
 

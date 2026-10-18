@@ -24,6 +24,7 @@
 #include "call_phone.h"      /* call_phone_handle_t */
 #include "music_play.h"      /* music_play_handle_t / music_event_t（事件接线入口） */
 #include "wifi_manager.h"    /* wifi_manager_handle_t */
+#include "OTA_Update.h"      /* ota_update_event_info_t（OTA 事件接线入口） */
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,6 +78,15 @@ void ui_on_light_event(const light_event_t *evt, void *user_ctx);
  * 调用上下文：MusicPlay_Task。内部仅入队，由 UI_Task 刷新播放页，禁止阻塞。
  */
 void ui_on_music_event(const music_event_t *evt, void *user_ctx);
+
+/**
+ * @brief OTA 事件接线入口（OTA 回调注册后由 ota_sync_task 上下文调用）
+ *
+ * 调用上下文：ota_sync_task（优先级 5）。内部仅入队，由 UI_Task 刷新设置页状态，
+ * 禁止阻塞。注意：此函数仅负责将事件转发到 UI_Task 消费；停止其他业务任务等
+ * 重操作应由注册在 OTA 模块上的上层回调完成（见 scr_settings.c::ota_ui_evt_cb）。
+ */
+void ui_on_ota_event(const ota_update_event_info_t *info);
 
 #ifdef __cplusplus
 }

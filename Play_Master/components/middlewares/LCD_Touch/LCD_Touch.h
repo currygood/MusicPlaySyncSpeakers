@@ -1,6 +1,9 @@
 #ifndef __LCD_TOUCH_H__
 #define __LCD_TOUCH_H__
 
+/* ======================== 是否打开 LCD/触摸模块调试打印 ======================== */
+#define LCD_TOUCH_DEBUG_LOGS    (false)
+
 #include <stdint.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
@@ -29,6 +32,10 @@
 
 #define LCD_WIDTH				320
 #define LCD_HEIGHT				240
+
+/** LCD SPI2 时钟（Hz）：ILI9341 写周期典型下限 100ns（约 10MHz），
+ *  实板短走线取 15MHz 提升刷屏吞吐；若个别屏出现花屏/错位退回 10MHz */
+#define LCD_TOUCH_SPI_FREQ_HZ	(15 * 1000 * 1000)
 
 
 #define LCD_TOUCH_FT6336G_DEV_ADDR                0x38		// FT6636的I2C地址

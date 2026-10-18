@@ -19,6 +19,9 @@
 #ifndef MICROPHONE_H
 #define MICROPHONE_H
 
+/* ======================== 是否打开麦克风模块调试打印 ======================== */
+#define MICROPHONE_DEBUG_LOGS    (false)
+
 #include "esp_err.h"
 #include <stdint.h>
 #include <stddef.h>

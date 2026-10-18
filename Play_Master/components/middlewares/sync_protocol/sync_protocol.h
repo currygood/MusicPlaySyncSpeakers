@@ -24,6 +24,9 @@
 #ifndef SYNC_PROTOCOL_H
 #define SYNC_PROTOCOL_H
 
+/* ======================== 是否打开同步协议模块调试打印 ======================== */
+#define SYNC_PROTOCOL_DEBUG_LOGS    (1)
+
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "wifi_manager.h"

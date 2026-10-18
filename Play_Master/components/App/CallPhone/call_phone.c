@@ -49,7 +49,16 @@
 
 /* ======================== 模块常量定义 ================================================== */
 
+#if CALL_PHONE_DEBUG_LOGS
 #define TAG "CallPhone"
+#define CALL_PHONE_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define CALL_PHONE_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define CALL_PHONE_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define CALL_PHONE_LOGE(...) do { } while (0)
+#define CALL_PHONE_LOGW(...) do { } while (0)
+#define CALL_PHONE_LOGI(...) do { } while (0)
+#endif
 
 /** 麦克风固定采样率（Hz）：44.1kHz，全链路统一 */
 #define CP_MIC_SAMPLE_RATE        44100
@@ -150,7 +159,7 @@ static int16_t *CallPhone_AllocSamples(size_t samples)
         buf = malloc(samples * sizeof(int16_t));
         if (buf != NULL)
         {
-            ESP_LOGW(TAG, "buffer %u samples on internal heap", (unsigned)samples);
+            CALL_PHONE_LOGW( "buffer %u samples on internal heap", (unsigned)samples);
         }
     }
     return buf;
@@ -345,7 +354,7 @@ static void CallPhone_Listening(call_phone_handle_t cp)
         if (++cp->lane_log_cnt >= CP_LANE_LOG_INTERVAL)
         {
             cp->lane_log_cnt = 0;
-            /* ESP_LOGI(TAG, "mic: lanes avg0=%d avg1=%d (use lane %d), feed16k avg=%lld peak=%d",
+            /* CALL_PHONE_LOGI( "mic: lanes avg0=%d avg1=%d (use lane %d), feed16k avg=%lld peak=%d",
              *          (int)lane_avg0, (int)lane_avg1, (int)cp->lane,
              *          (long long)(favg / (int64_t)n), (int)fpeak);
              * 统计日志项多，默认注释；排查评音/电平时可恢复 */
@@ -358,7 +367,7 @@ static void CallPhone_Listening(call_phone_handle_t cp)
     afe_fetch_result_t *res = cp->afe_if->fetch(cp->afe_data);
     if (res != NULL && res->wakeup_state == WAKENET_DETECTED)
     {
-        ESP_LOGI(TAG, "wake word '%s' detected (index %d)",
+        CALL_PHONE_LOGI( "wake word '%s' detected (index %d)",
                  CP_WAKE_WORD_STRING, res->wake_word_index);
 
         CallPhone_State_Set(cp, CALL_PHONE_STATE_CONNECTING);
@@ -368,7 +377,7 @@ static void CallPhone_Listening(call_phone_handle_t cp)
         /* 请求手机语音助手（AT+BVRA=1）；SLC 未连接会失败，忽略本次唤醒 */
         if (bt_audio_hfp_start_voice(cp->audio) != ESP_OK)
         {
-            ESP_LOGW(TAG, "start voice failed (HFP not connected?), back to listening");
+            CALL_PHONE_LOGW( "start voice failed (HFP not connected?), back to listening");
             CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
         }
     }
@@ -383,13 +392,13 @@ static void CallPhone_Connecting(call_phone_handle_t cp)
         Microphone_Flush();
         cp->rs_pos = 0;
         CallPhone_State_Set(cp, CALL_PHONE_STATE_STREAMING);
-        ESP_LOGI(TAG, "HFP SCO open, mic uplink started");
+        CALL_PHONE_LOGI( "HFP SCO open, mic uplink started");
         return;
     }
 
     if ((int32_t)(xTaskGetTickCount() - cp->sco_deadline) >= 0)
     {
-        ESP_LOGW(TAG, "SCO open timeout (%d ms), back to listening", CP_SCO_TIMEOUT_MS);
+        CALL_PHONE_LOGW( "SCO open timeout (%d ms), back to listening", CP_SCO_TIMEOUT_MS);
         bt_audio_hfp_stop_voice(cp->audio);  /* 取消语音请求，避免残留 SCO */
         CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
         return;
@@ -415,7 +424,7 @@ static void CallPhone_Streaming(call_phone_handle_t cp)
             ret = bt_audio_hfp_send_pcm(cp->audio, cp->up_buf, frames, 5);
             if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT)
             {
-                ESP_LOGW(TAG, "hfp_send_pcm: %s", esp_err_to_name(ret));
+                CALL_PHONE_LOGW( "hfp_send_pcm: %s", esp_err_to_name(ret));
             }
             /* ESP_ERR_TIMEOUT：bt_audio 上行 FIFO 满，直接丢帧（SCO 侧由静音填充兜底） */
         }
@@ -423,7 +432,7 @@ static void CallPhone_Streaming(call_phone_handle_t cp)
 
     if (!bt_audio_hfp_is_audio_open(cp->audio))
     {
-        ESP_LOGW(TAG, "SCO closed by phone, back to listening");
+        CALL_PHONE_LOGW( "SCO closed by phone, back to listening");
         cp->rs_pos = 0;
         CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
     }
@@ -479,7 +488,7 @@ static bool CallPhone_HandleCmd(call_phone_handle_t cp,
         {
             cp->rs_pos = 0;
             CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
-            ESP_LOGI(TAG, "start listening, wake word '%s'", CP_WAKE_WORD_STRING);
+            CALL_PHONE_LOGI( "start listening, wake word '%s'", CP_WAKE_WORD_STRING);
         }
         break;
 
@@ -487,7 +496,7 @@ static bool CallPhone_HandleCmd(call_phone_handle_t cp,
         if (CallPhone_State_Get(cp) == CALL_PHONE_STATE_LISTENING)
         {
             CallPhone_State_Set(cp, CALL_PHONE_STATE_IDLE);
-            ESP_LOGI(TAG, "stop listening");
+            CALL_PHONE_LOGI( "stop listening");
         }
         break;
 
@@ -498,7 +507,7 @@ static bool CallPhone_HandleCmd(call_phone_handle_t cp,
         if (state == CALL_PHONE_STATE_CONNECTING || state == CALL_PHONE_STATE_STREAMING)
         {
             bt_audio_hfp_stop_voice(cp->audio);
-            ESP_LOGI(TAG, "hangup done, back to listening");
+            CALL_PHONE_LOGI( "hangup done, back to listening");
         }
         cp->rs_pos = 0;
         CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
@@ -528,7 +537,7 @@ static void CallPhone_Task(void *arg)
     call_phone_handle_t  cp = (call_phone_handle_t)arg;
     call_phone_cmd_msg_t msg;
 
-    ESP_LOGI(TAG, "task started: mic=%d Hz -> afe=%d Hz, feed chunk=%d",
+    CALL_PHONE_LOGI( "task started: mic=%d Hz -> afe=%d Hz, feed chunk=%d",
              CP_MIC_SAMPLE_RATE, cp->afe_rate, cp->feed_chunk);
 
     for (;;)
@@ -577,12 +586,12 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     /* 参数检查：采样率固定 44.1k；audio 句柄必须有效 */
     if (cfg == NULL || cfg->audio == NULL)
     {
-        ESP_LOGE(TAG, "create: invalid cfg (audio required)");
+        CALL_PHONE_LOGE( "create: invalid cfg (audio required)");
         return NULL;
     }
     if (cfg->sample_rate != 0 && cfg->sample_rate != CP_MIC_SAMPLE_RATE)
     {
-        ESP_LOGW(TAG, "sample_rate %lu forced to %d (全链路固定)",
+        CALL_PHONE_LOGW( "sample_rate %lu forced to %d (全链路固定)",
                  (unsigned long)cfg->sample_rate, CP_MIC_SAMPLE_RATE);
     }
 
@@ -590,7 +599,7 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     cp = heap_caps_calloc(1, sizeof(*cp), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (cp == NULL)
     {
-        ESP_LOGE(TAG, "create: calloc failed");
+        CALL_PHONE_LOGE( "create: calloc failed");
         return NULL;
     }
     cp->audio = cfg->audio;
@@ -603,7 +612,7 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     cp->cmd_q = xQueueCreateWithCaps(CP_CMD_QUEUE_LEN, sizeof(msg), MALLOC_CAP_SPIRAM);
     if (cp->lock == NULL || cp->destroy_done == NULL || cp->cmd_q == NULL)
     {
-        ESP_LOGE(TAG, "create: sync primitives failed");
+        CALL_PHONE_LOGE( "create: sync primitives failed");
         goto fail;
     }
 
@@ -611,7 +620,7 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     cp->models = esp_srmodel_init(CP_MODEL_PARTITION);
     if (cp->models == NULL)
     {
-        ESP_LOGE(TAG, "esp_srmodel_init(%s) failed: 请确认 partitions.csv 含 model 分区",
+        CALL_PHONE_LOGE( "esp_srmodel_init(%s) failed: 请确认 partitions.csv 含 model 分区",
                  CP_MODEL_PARTITION);
         goto fail;
     }
@@ -620,16 +629,16 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     model_name = esp_srmodel_filter(cp->models, ESP_WN_PREFIX, CP_WAKE_MODEL_KEYWORD);
     if (model_name == NULL)
     {
-        ESP_LOGE(TAG, "wake model '%s' not found in model partition", CP_WAKE_MODEL_KEYWORD);
+        CALL_PHONE_LOGE( "wake model '%s' not found in model partition", CP_WAKE_MODEL_KEYWORD);
         goto fail;
     }
-    ESP_LOGI(TAG, "wake model: %s", model_name);
+    CALL_PHONE_LOGI( "wake model: %s", model_name);
 
     /* ---- 步骤 3：AFE 配置（单麦 "M"，仅启用唤醒检测，同参考写法） ---- */
     afe_cfg = afe_config_init("M", cp->models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
     if (afe_cfg == NULL)
     {
-        ESP_LOGE(TAG, "afe_config_init failed");
+        CALL_PHONE_LOGE( "afe_config_init failed");
         goto fail;
     }
     afe_cfg->wakenet_init = true;
@@ -647,7 +656,7 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     afe_cfg = afe_config_check(afe_cfg);
     if (afe_cfg == NULL)
     {
-        ESP_LOGE(TAG, "afe_config_check failed");
+        CALL_PHONE_LOGE( "afe_config_check failed");
         goto fail;
     }
 
@@ -655,13 +664,13 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     cp->afe_if = esp_afe_handle_from_config(afe_cfg);
     if (cp->afe_if == NULL)
     {
-        ESP_LOGE(TAG, "esp_afe_handle_from_config failed");
+        CALL_PHONE_LOGE( "esp_afe_handle_from_config failed");
         goto fail;
     }
     cp->afe_data = cp->afe_if->create_from_config(afe_cfg);
     if (cp->afe_data == NULL)
     {
-        ESP_LOGE(TAG, "create_from_config failed");
+        CALL_PHONE_LOGE( "create_from_config failed");
         goto fail;
     }
     afe_config_free(afe_cfg);
@@ -672,7 +681,7 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     cp->feed_chunk = cp->afe_if->get_feed_chunksize(cp->afe_data);
     if (cp->afe_rate != CP_AFE_RATE)
     {
-        ESP_LOGW(TAG, "unexpected afe rate %d (expect %d)", cp->afe_rate, CP_AFE_RATE);
+        CALL_PHONE_LOGW( "unexpected afe rate %d (expect %d)", cp->afe_rate, CP_AFE_RATE);
     }
     cp->rs_step = ((uint64_t)CP_MIC_SAMPLE_RATE << 16) / (uint32_t)cp->afe_rate;
     /* 单帧 44.1k 单声道需求，再 ×2 存储 I2S L/R 槽位对 */
@@ -685,7 +694,7 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     cp->up_buf   = CallPhone_AllocSamples(CP_UP_PAIR_SAMPLES);
     if (cp->rs_in == NULL || cp->feed_buf == NULL || cp->up_buf == NULL)
     {
-        ESP_LOGE(TAG, "create: buffer alloc failed");
+        CALL_PHONE_LOGE( "create: buffer alloc failed");
         goto fail;
     }
 
@@ -693,11 +702,11 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     if (xTaskCreatePinnedToCore(CallPhone_Task, CP_TASK_NAME, CP_TASK_STACK, cp,
                                 CP_TASK_PRIO, &cp->task, CP_TASK_CORE) != pdPASS)
     {
-        ESP_LOGE(TAG, "xTaskCreatePinnedToCore failed");
+        CALL_PHONE_LOGE( "xTaskCreatePinnedToCore failed");
         goto fail;
     }
 
-    ESP_LOGI(TAG, "created: feed=%d samples@%d Hz",
+    CALL_PHONE_LOGI( "created: feed=%d samples@%d Hz",
              cp->feed_chunk, cp->afe_rate);
     return cp;
 
@@ -723,7 +732,7 @@ fail:
         }
         heap_caps_free(cp);
     }
-    ESP_LOGE(TAG, "create failed");
+    CALL_PHONE_LOGE( "create failed");
     return NULL;
 }
 
@@ -744,12 +753,12 @@ esp_err_t call_phone_destroy(call_phone_handle_t cp)
     msg.cmd = CP_CMD_DESTROY;
     if (xQueueSend(cp->cmd_q, &msg, pdMS_TO_TICKS(100)) != pdTRUE)
     {
-        ESP_LOGE(TAG, "destroy: queue send timeout");
+        CALL_PHONE_LOGE( "destroy: queue send timeout");
         return ESP_ERR_TIMEOUT;
     }
     if (xSemaphoreTake(cp->destroy_done, pdMS_TO_TICKS(3000)) != pdTRUE)
     {
-        ESP_LOGE(TAG, "destroy: task exit timeout");
+        CALL_PHONE_LOGE( "destroy: task exit timeout");
         return ESP_ERR_TIMEOUT;
     }
 
@@ -757,7 +766,7 @@ esp_err_t call_phone_destroy(call_phone_handle_t cp)
     vSemaphoreDeleteWithCaps(cp->lock);
     vSemaphoreDeleteWithCaps(cp->destroy_done);
     heap_caps_free(cp);
-    ESP_LOGI(TAG, "destroy done");
+    CALL_PHONE_LOGI( "destroy done");
     return ESP_OK;
 }
 

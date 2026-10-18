@@ -46,7 +46,16 @@
 
 /* ======================== 模块常量 =============================================== */
 
+#if AUDIO_DECODER_DEBUG_LOGS
 static const char *TAG = "AUDIO_DECODER";
+#define AUDIO_DECODER_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define AUDIO_DECODER_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define AUDIO_DECODER_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define AUDIO_DECODER_LOGE(...) do { } while (0)
+#define AUDIO_DECODER_LOGW(...) do { } while (0)
+#define AUDIO_DECODER_LOGI(...) do { } while (0)
+#endif
 
 /** 解码任务运行核：实时音频侧（设计任务表：Core 1） */
 #define AUDIO_DECODER_TASK_CORE     1
@@ -335,6 +344,8 @@ static void Audio_Decoder_Task(void *arg)
     bool quit = false;
     uint32_t decode_frames = 0;  /* 诊断：累计解码帧数 */
     int64_t  diag_last_us  = 0;  /* 诊断：上次心跳时间戳 */
+    int64_t  diag_work_us  = 0;  /* 诊断：本秒内解码+回调累计耗时（判定被抢占程度） */
+    int64_t  diag_read_us  = 0;  /* 诊断：本秒内 SD 续读累计耗时（判定卡读/总线争用） */
     /* 单帧 PCM 缓冲已在 open() 分配到堆（PSRAM 优先），不再占任务栈 */
     mp3d_sample_t *pcm = dec->pcm;
 
@@ -391,13 +402,15 @@ static void Audio_Decoder_Task(void *arg)
             if (!dec->in_eof &&
                 (dec->in_fill - dec->in_consumed) < AUDIO_DECODER_IN_REFILL_MIN)
             {
+                int64_t t_read = esp_timer_get_time();
                 Audio_Decoder_Refill(dec);
+                diag_read_us += esp_timer_get_time() - t_read;
             }
 
             size_t avail = dec->in_fill - dec->in_consumed;
             if (avail == 0)
             {
-                ESP_LOGI(TAG, "EOF: %s", dec->path);
+                AUDIO_DECODER_LOGI("EOF: %s", dec->path);
                 if (dec->cfg.on_event != NULL)
                 {
                     dec->cfg.on_event(AUDIO_DECODER_EVT_EOF, &dec->info,
@@ -431,21 +444,27 @@ static void Audio_Decoder_Task(void *arg)
                 }
                 decode_frames++;
 
-                /* 速率节流：解码+回调总耗时不低于"本帧音频时长"。有 I2S 回写时
-                 * 写阻塞已天然限速，这里主要保护"无回写/受限"场景（测试/静音），
-                 * 避免解码循环满速占满 CPU，与 PSRAM/Flash 缓存争用触发 TG1WDT。 */
+                /* 节流上限放宽到 ~4x 实时：定速交给下游背压（sync 环形缓冲在
+                 * 播放态阻塞 ≤30ms），被抢占/读卡抖动后能追回来，不会再出现
+                 * "每秒欠 9%" 的慢性欠载（卡顿根因）。仅在全速解码场景
+                 * （测试/静音，无背压）限制 CPU 占用，且任何"有余量"的帧至少
+                 * 让出 1 tick，避免解码循环独占同核 CPU 饿死低优先级任务。 */
                 int64_t elapsed_us = esp_timer_get_time() - t0;
                 int64_t frame_us   = (int64_t)samples * 1000000LL / (int64_t)fi.hz;
                 int64_t remain_us  = frame_us - elapsed_us;
-                if (remain_us > 1000)
+                diag_work_us += elapsed_us;
+                if (remain_us > 0)
                 {
-                    vTaskDelay(pdMS_TO_TICKS((uint32_t)(remain_us / 1000)));
+                    uint32_t sleep_ms = (remain_us > 20000)
+                                            ? (uint32_t)((remain_us - 20000) / 1000)
+                                            : 1u;
+                    vTaskDelay(pdMS_TO_TICKS(sleep_ms));
                 }
             }
             else if (dec->in_eof)
             {
                 /* 剩余字节不足以再构成完整帧（尾部标签/数据）→ 正常结束 */
-                ESP_LOGI(TAG, "EOF: %s (tail %u bytes)", dec->path,
+                AUDIO_DECODER_LOGI("EOF: %s (tail %u bytes)", dec->path,
                          (unsigned)avail);
                 if (dec->cfg.on_event != NULL)
                 {
@@ -473,11 +492,15 @@ static void Audio_Decoder_Task(void *arg)
                             ((uint64_t)dec->info.sample_rate * dec->info.channels));
                 }
                 diag_last_us = esp_timer_get_time();
-                ESP_LOGI(TAG, "diag: frames=%lu pos=%lu/%lums heap=%u stack=%u",
+                AUDIO_DECODER_LOGI("diag: frames=%lu pos=%lu/%lums work=%lums read=%lums heap=%u stack=%u",
                          (unsigned long)decode_frames, (unsigned long)pos_ms,
                          (unsigned long)dec->info.duration_ms,
+                         (unsigned long)(diag_work_us / 1000),
+                         (unsigned long)(diag_read_us / 1000),
                          (unsigned int)esp_get_free_heap_size(),
                          (unsigned int)uxTaskGetStackHighWaterMark(NULL));
+                diag_work_us = 0;
+                diag_read_us = 0;
             }
         }
 
@@ -501,11 +524,11 @@ esp_err_t audio_decoder_init(void)
         s_reg_lock = xSemaphoreCreateMutex();
         if (s_reg_lock == NULL)
         {
-            ESP_LOGE(TAG, "create registry mutex failed");
+            AUDIO_DECODER_LOGE("create registry mutex failed");
             return ESP_ERR_NO_MEM;
         }
     }
-    ESP_LOGI(TAG, "audio_decoder initialized");
+    AUDIO_DECODER_LOGI("audio_decoder initialized");
     return ESP_OK;
 }
 
@@ -513,7 +536,7 @@ esp_err_t audio_decoder_deinit(void)
 {
     if (s_reg_lock == NULL)
     {
-        ESP_LOGW(TAG, "deinit: not initialized");
+        AUDIO_DECODER_LOGW("deinit: not initialized");
         return ESP_OK;
     }
 
@@ -538,7 +561,7 @@ esp_err_t audio_decoder_deinit(void)
         vSemaphoreDelete(s_reg_lock);
         s_reg_lock = NULL;
     }
-    ESP_LOGI(TAG, "audio_decoder deinitialized");
+    AUDIO_DECODER_LOGI("audio_decoder deinitialized");
     return ESP_OK;
 }
 
@@ -554,24 +577,24 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
 
     if (path == NULL || cfg == NULL || cfg->on_pcm == NULL)
     {
-        ESP_LOGE(TAG, "open: invalid arg (path/cfg/on_pcm)");
+        AUDIO_DECODER_LOGE("open: invalid arg (path/cfg/on_pcm)");
         return NULL;
     }
     if (!SD_Card_Is_Mounted())
     {
-        ESP_LOGE(TAG, "open: SD card not mounted, call SD_Card_Init first");
+        AUDIO_DECODER_LOGE("open: SD card not mounted, call SD_Card_Init first");
         return NULL;
     }
     if (s_reg_lock == NULL)
     {
-        ESP_LOGE(TAG, "open: call audio_decoder_init() first");
+        AUDIO_DECODER_LOGE("open: call audio_decoder_init() first");
         return NULL;
     }
 
     file = SD_Card_Open(path, "rb");
     if (file == NULL)
     {
-        ESP_LOGE(TAG, "open: cannot open %s", path);
+        AUDIO_DECODER_LOGE("open: cannot open %s", path);
         return NULL;
     }
 
@@ -580,7 +603,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
         SD_Card_Tell(file, &fsize) != ESP_OK ||
         SD_Card_Seek(file, 0, SEEK_SET) != ESP_OK)
     {
-        ESP_LOGE(TAG, "open: query file size failed: %s", path);
+        AUDIO_DECODER_LOGE("open: query file size failed: %s", path);
         SD_Card_Close(file);
         return NULL;
     }
@@ -588,7 +611,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     dec = (struct audio_decoder_s *)calloc(1, sizeof(*dec));
     if (dec == NULL)
     {
-        ESP_LOGE(TAG, "open: no memory");
+        AUDIO_DECODER_LOGE("open: no memory");
         SD_Card_Close(file);
         return NULL;
     }
@@ -598,7 +621,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     dec->path      = strdup(path);
     if (dec->path == NULL)
     {
-        ESP_LOGE(TAG, "open: strdup failed");
+        AUDIO_DECODER_LOGE("open: strdup failed");
         Audio_Decoder_Discard(dec);
         return NULL;
     }
@@ -615,7 +638,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     }
     if (dec->in_buf == NULL)
     {
-        ESP_LOGE(TAG, "open: input buffer alloc failed");
+        AUDIO_DECODER_LOGE("open: input buffer alloc failed");
         Audio_Decoder_Discard(dec);
         return NULL;
     }
@@ -632,7 +655,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     }
     if (dec->scratch == NULL)
     {
-        ESP_LOGE(TAG, "open: scratch alloc failed");
+        AUDIO_DECODER_LOGE("open: scratch alloc failed");
         Audio_Decoder_Discard(dec);
         return NULL;
     }
@@ -649,7 +672,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     }
     if (dec->pcm == NULL)
     {
-        ESP_LOGE(TAG, "open: pcm buffer alloc failed");
+        AUDIO_DECODER_LOGE("open: pcm buffer alloc failed");
         Audio_Decoder_Discard(dec);
         return NULL;
     }
@@ -662,7 +685,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     dec->probe_done = xSemaphoreCreateBinary();
     if (dec->probe_done == NULL)
     {
-        ESP_LOGE(TAG, "open: probe semaphore create failed");
+        AUDIO_DECODER_LOGE("open: probe semaphore create failed");
         Audio_Decoder_Discard(dec);
         return NULL;
     }
@@ -672,7 +695,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
                               sizeof(audio_decoder_cmd_t));
     if (dec->cmd_q == NULL)
     {
-        ESP_LOGE(TAG, "open: queue create failed");
+        AUDIO_DECODER_LOGE("open: queue create failed");
         Audio_Decoder_Discard(dec);
         return NULL;
     }
@@ -686,7 +709,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
                                  AUDIO_DECODER_TASK_CORE);
     if (rc != pdPASS)
     {
-        ESP_LOGE(TAG, "open: task create failed: %s", path);
+        AUDIO_DECODER_LOGE("open: task create failed: %s", path);
         Audio_Decoder_Unregister(dec);
         vQueueDelete(dec->cmd_q);
         Audio_Decoder_Discard(dec);
@@ -697,7 +720,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     if (xSemaphoreTake(dec->probe_done,
                        pdMS_TO_TICKS(AUDIO_DECODER_PROBE_TIMEOUT_MS)) != pdTRUE)
     {
-        ESP_LOGE(TAG, "open: first-frame probe timeout: %s", path);
+        AUDIO_DECODER_LOGE("open: first-frame probe timeout: %s", path);
         vTaskDelete(dec->task);
         dec->task = NULL;
         Audio_Decoder_Unregister(dec);
@@ -707,7 +730,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     }
     if (!dec->probe_ok)
     {
-        ESP_LOGE(TAG, "open: not a mp3 file: %s", path);
+        AUDIO_DECODER_LOGE("open: not a mp3 file: %s", path);
         vTaskDelete(dec->task);
         dec->task = NULL;
         Audio_Decoder_Unregister(dec);
@@ -728,7 +751,7 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
                                            dec->info.bitrate_bps);
     }
 
-    ESP_LOGI(TAG, "open %s : %luHz/%uch bitrate=%lubps duration=%lums",
+    AUDIO_DECODER_LOGI("open %s : %luHz/%uch bitrate=%lubps duration=%lums",
              path, (unsigned long)dec->info.sample_rate, dec->info.channels,
              (unsigned long)dec->info.bitrate_bps,
              (unsigned long)dec->info.duration_ms);
@@ -765,7 +788,7 @@ esp_err_t audio_decoder_close(audio_decoder_handle_t dec)
     }
     if (d->task != NULL)
     {
-        ESP_LOGW(TAG, "close: task not exit in %dms, force delete",
+        AUDIO_DECODER_LOGW("close: task not exit in %dms, force delete",
                  AUDIO_DECODER_CLOSE_WAIT_MS);
         vTaskDelete(d->task);
         d->task = NULL;
@@ -791,7 +814,7 @@ esp_err_t audio_decoder_close(audio_decoder_handle_t dec)
     }
     free(d->path);
     free(d);
-    ESP_LOGI(TAG, "closed handle");
+    AUDIO_DECODER_LOGI("closed handle");
     return ESP_OK;
 }
 
@@ -815,7 +838,7 @@ esp_err_t audio_decoder_play(audio_decoder_handle_t dec)
 
     if (xQueueSend(d->cmd_q, &cmd, pdMS_TO_TICKS(100)) != pdTRUE)
     {
-        ESP_LOGW(TAG, "play: command queue full");
+        AUDIO_DECODER_LOGW("play: command queue full");
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
@@ -832,7 +855,7 @@ esp_err_t audio_decoder_pause(audio_decoder_handle_t dec)
     }
     if (xQueueSend(d->cmd_q, &cmd, pdMS_TO_TICKS(100)) != pdTRUE)
     {
-        ESP_LOGW(TAG, "pause: command queue full");
+        AUDIO_DECODER_LOGW("pause: command queue full");
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
@@ -849,7 +872,7 @@ esp_err_t audio_decoder_stop(audio_decoder_handle_t dec)
     }
     if (xQueueSend(d->cmd_q, &cmd, pdMS_TO_TICKS(100)) != pdTRUE)
     {
-        ESP_LOGW(TAG, "stop: command queue full");
+        AUDIO_DECODER_LOGW("stop: command queue full");
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;

@@ -35,16 +35,18 @@ static void statusbar_timer_cb(lv_timer_t *timer)
 
     for (i = 0; i < s_instCnt; i++)
     {
-        /* WiFi：IDLE/ERROR 灰，连接中/断开重连 琥珀，已连接 绿 */
+        /* WiFi：IDLE/ERROR 灰+OFF图标，连接中/断开重连 琥珀+OFF图标，已连接 绿+WIFI图标 */
         if (cfg->wifi != NULL)
         {
             wifi_state_t st = WIFI_STATE_IDLE;
             if (wifi_manager_get_state(cfg->wifi, &st) == ESP_OK)
             {
                 lv_color_t color = UI_COLOR_DISABLED;
+                const char *icon = UI_ICON_WIFI_OFF;
                 if (st == WIFI_STATE_CONNECTED)
                 {
                     color = UI_COLOR_OK;
+                    icon = UI_ICON_WIFI;
                 }
                 else if (st == WIFI_STATE_CONNECTING ||
                          st == WIFI_STATE_DISCONNECTED)
@@ -52,6 +54,7 @@ static void statusbar_timer_cb(lv_timer_t *timer)
                     color = UI_COLOR_ACCENT;
                 }
                 lv_obj_set_style_text_color(s_insts[i].lblWifi, color, 0);
+                lv_label_set_text(s_insts[i].lblWifi, icon);
             }
         }
 

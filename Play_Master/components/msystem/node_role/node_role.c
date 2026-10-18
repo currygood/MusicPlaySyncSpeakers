@@ -28,7 +28,16 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
+#if NODE_ROLE_DEBUG_LOGS
 #define TAG "node_role"
+#define NODE_ROLE_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define NODE_ROLE_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define NODE_ROLE_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define NODE_ROLE_LOGE(...) do { } while (0)
+#define NODE_ROLE_LOGW(...) do { } while (0)
+#define NODE_ROLE_LOGI(...) do { } while (0)
+#endif
 
 /* ======================== 默认参数 ======================== */
 
@@ -95,7 +104,7 @@ esp_err_t node_role_init(const node_role_cfg_t *defaults)
         s_lock = xSemaphoreCreateMutex();
         if (s_lock == NULL)
         {
-            ESP_LOGE(TAG, "mutex create failed");
+            NODE_ROLE_LOGE( "mutex create failed");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -115,7 +124,7 @@ esp_err_t node_role_init(const node_role_cfg_t *defaults)
     err = node_role_nvs_init();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "nvs_flash_init failed: %s", esp_err_to_name(err));
+        NODE_ROLE_LOGE( "nvs_flash_init failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -123,7 +132,7 @@ esp_err_t node_role_init(const node_role_cfg_t *defaults)
     err = nvs_open(NODE_ROLE_NVS_NAMESPACE, NVS_READWRITE, &nv);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "nvs_open(%s) failed: %s",
+        NODE_ROLE_LOGE( "nvs_open(%s) failed: %s",
                  NODE_ROLE_NVS_NAMESPACE, esp_err_to_name(err));
         return err;
     }
@@ -137,7 +146,7 @@ esp_err_t node_role_init(const node_role_cfg_t *defaults)
             err = nvs_get_blob(nv, NODE_ROLE_NVS_KEY, &cached, &len);
             if (err != ESP_OK)
             {
-                ESP_LOGW(TAG, "cfg read failed (%s), rebuild defaults",
+                NODE_ROLE_LOGW( "cfg read failed (%s), rebuild defaults",
                          esp_err_to_name(err));
                 node_role_fill_defaults(&cached);
                 cached.version = NODE_ROLE_CFG_VERSION;
@@ -145,7 +154,7 @@ esp_err_t node_role_init(const node_role_cfg_t *defaults)
             }
             else if (cached.version != NODE_ROLE_CFG_VERSION)
             {
-                ESP_LOGW(TAG, "cfg version %u != %u, rebuild with defaults",
+                NODE_ROLE_LOGW( "cfg version %u != %u, rebuild with defaults",
                          (unsigned)cached.version, (unsigned)NODE_ROLE_CFG_VERSION);
                 node_role_fill_defaults(&cached);
                 cached.version = NODE_ROLE_CFG_VERSION;
@@ -154,7 +163,7 @@ esp_err_t node_role_init(const node_role_cfg_t *defaults)
         }
         else
         {
-            ESP_LOGW(TAG, "cfg len %u != %u, rebuild with defaults",
+            NODE_ROLE_LOGW( "cfg len %u != %u, rebuild with defaults",
                      (unsigned)len, (unsigned)sizeof(cached));
             node_role_fill_defaults(&cached);
             cached.version = NODE_ROLE_CFG_VERSION;
@@ -163,12 +172,12 @@ esp_err_t node_role_init(const node_role_cfg_t *defaults)
     }
     else if (err == ESP_ERR_NVS_NOT_FOUND)
     {
-        ESP_LOGI(TAG, "first boot, write defaults to NVS");
+        NODE_ROLE_LOGI( "first boot, write defaults to NVS");
         should_write = true;
     }
     else
     {
-        ESP_LOGW(TAG, "cfg probe failed: %s, rebuild with defaults",
+        NODE_ROLE_LOGW( "cfg probe failed: %s, rebuild with defaults",
                  esp_err_to_name(err));
         should_write = true;
     }
@@ -182,11 +191,11 @@ esp_err_t node_role_init(const node_role_cfg_t *defaults)
         }
         if (err != ESP_OK)
         {
-            ESP_LOGE(TAG, "write defaults failed: %s", esp_err_to_name(err));
+            NODE_ROLE_LOGE( "write defaults failed: %s", esp_err_to_name(err));
             nvs_close(nv);
             return err;
         }
-        ESP_LOGI(TAG, "cfg initialized (role=%u ssid=\"%s\")",
+        NODE_ROLE_LOGI( "cfg initialized (role=%u ssid=\"%s\")",
                  (unsigned)cached.role, cached.wifi_ssid);
     }
 
@@ -250,12 +259,12 @@ esp_err_t node_role_set(const node_role_cfg_t *cfg)
 
     if (err == ESP_OK)
     {
-        ESP_LOGI(TAG, "cfg saved (role=%u ssid=\"%s\")",
+        NODE_ROLE_LOGI( "cfg saved (role=%u ssid=\"%s\")",
                  (unsigned)s_cache.role, s_cache.wifi_ssid);
     }
     else
     {
-        ESP_LOGE(TAG, "cfg save failed: %s", esp_err_to_name(err));
+        NODE_ROLE_LOGE( "cfg save failed: %s", esp_err_to_name(err));
     }
 
     return err;
@@ -278,4 +287,3 @@ bool node_role_is_master(void)
 {
     return (node_role_get_role() == NODE_ROLE_MASTER);
 }
-

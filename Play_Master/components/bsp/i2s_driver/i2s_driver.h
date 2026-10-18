@@ -50,6 +50,9 @@
 #ifndef __I2S_DRIVER_H__
 #define __I2S_DRIVER_H__
 
+/* ======================== 是否打开 I2S 调试打印 ======================== */
+#define I2S_DRIVER_DEBUG_LOGS    (false)
+
 #include "driver/i2s_std.h"
 #include "esp_err.h"
 #include <stdbool.h>

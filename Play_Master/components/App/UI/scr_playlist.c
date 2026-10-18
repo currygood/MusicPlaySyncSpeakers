@@ -22,8 +22,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-static const char *TAG = "UI";
-
 #define PLAYLIST_HEADER_H  44                    /* 头部高度（返回键 + 标题） */
 #define PLAYLIST_ROW_H     30                    /* 单行高（含 2px 行距） */
 #define PLAYLIST_PAD       2                     /* 列表容器内边距 */
@@ -37,7 +35,7 @@ static lv_obj_t *s_body;       /* 滚动列表容器（flex 纵向） */
 static void back_click_cb(lv_event_t *e)
 {
     (void)e;
-    ESP_LOGI(TAG, "playlist: back -> player");
+    UI_LOGI( "playlist: back -> player");
     ui_nav_goto(UI_PAGE_PLAYER);
 }
 
@@ -51,7 +49,7 @@ static void row_click_cb(lv_event_t *e)
     {
         return;
     }
-    ESP_LOGI(TAG, "playlist: select track %u", (unsigned)index);
+    UI_LOGI( "playlist: select track %u", (unsigned)index);
     music_play_select_track(cfg->music, index);
     ui_nav_goto(UI_PAGE_PLAYER);
 }

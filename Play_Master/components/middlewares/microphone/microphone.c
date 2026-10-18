@@ -32,6 +32,16 @@
 
 #define TAG "MICROPHONE"  /* 日志标签 */
 
+#if MICROPHONE_DEBUG_LOGS
+#define MICROPHONE_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define MICROPHONE_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define MICROPHONE_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define MICROPHONE_LOGE(...) do { } while (0)
+#define MICROPHONE_LOGW(...) do { } while (0)
+#define MICROPHONE_LOGI(...) do { } while (0)
+#endif
+
 /* ======================== 硬件引脚与格式配置 ===================================== */
 
 /** INMP441 SD（DOUT）数据引脚 */
@@ -105,7 +115,7 @@ static void Inmp441_Sd_Pulldown_Enable(void)
 {
     /* GPIO34 为输入专用脚，不支持上下拉时返回错误（需外部下拉） */
     esp_err_t err = gpio_set_pull_mode(INMP441_SD_GPIO, GPIO_PULLDOWN_ONLY);
-    ESP_LOGW(TAG, "SD pin GPIO%d pull-down: %s", INMP441_SD_GPIO, esp_err_to_name(err));
+    MICROPHONE_LOGW("SD pin GPIO%d pull-down: %s", INMP441_SD_GPIO, esp_err_to_name(err));
 }
 
 /**
@@ -117,7 +127,7 @@ static void Inmp441_Sd_Pulldown_Enable(void)
 static void Inmp441_Enable(void)
 {
 #if (INMP441_CHIPEN_GPIO >= 0)
-    ESP_LOGI(TAG, "Enabling INMP441 via GPIO%d...", INMP441_CHIPEN_GPIO);
+    MICROPHONE_LOGI("Enabling INMP441 via GPIO%d...", INMP441_CHIPEN_GPIO);
     gpio_config_t chipen_cfg = {
         .pin_bit_mask = (1ULL << INMP441_CHIPEN_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -129,7 +139,7 @@ static void Inmp441_Enable(void)
     gpio_set_level(INMP441_CHIPEN_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(300));   /* 首通：2^18 SCK ≈ 256ms，留余量 */
 #else
-    ESP_LOGI(TAG, "INMP441 CHIPEN=VDD, waiting standby recovery...");
+    MICROPHONE_LOGI("INMP441 CHIPEN=VDD, waiting standby recovery...");
     vTaskDelay(pdMS_TO_TICKS(100));
 #endif
 }
@@ -165,7 +175,7 @@ static void Mic_Fifo_Push(const uint8_t *data, size_t len)
 static void Mic_Rx_Task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "RX task started");
+    MICROPHONE_LOGI("RX task started");
 
     while (!Mic_RxStop)
     {
@@ -179,7 +189,7 @@ static void Mic_Rx_Task(void *arg)
             {
                 continue; /* 没有新数据，回去检查销毁标志 */
             }
-            ESP_LOGE(TAG, "phy read failed: %s", esp_err_to_name(ret));
+            MICROPHONE_LOGE("phy read failed: %s", esp_err_to_name(ret));
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -191,7 +201,7 @@ static void Mic_Rx_Task(void *arg)
     }
 
     Mic_RxTask = NULL;
-    ESP_LOGI(TAG, "RX task exit");
+    MICROPHONE_LOGI("RX task exit");
     vTaskDelete(NULL);
 }
 
@@ -201,7 +211,7 @@ esp_err_t Microphone_Init(void)
 {
     if (Mic_Phy != NULL)
     {
-        ESP_LOGW(TAG, "already initialized");
+        MICROPHONE_LOGW("already initialized");
         return ESP_OK;
     }
 
@@ -212,7 +222,7 @@ esp_err_t Microphone_Init(void)
     esp_err_t ret = i2s_bus_phy_create(I2S_NUM_0, false, &Mic_PinCfg, &Mic_BusCfg, &Mic_Phy);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "i2s phy create failed: %s", esp_err_to_name(ret));
+        MICROPHONE_LOGE("i2s phy create failed: %s", esp_err_to_name(ret));
         Mic_Phy = NULL;
         return ESP_FAIL;
     }
@@ -233,7 +243,7 @@ esp_err_t Microphone_Init(void)
         }
         if (Mic_RxChunk == NULL)
         {
-            ESP_LOGE(TAG, "rx chunk alloc failed");
+            MICROPHONE_LOGE("rx chunk alloc failed");
             i2s_bus_phy_destroy(Mic_Phy);
             Mic_Phy = NULL;
             return ESP_FAIL;
@@ -243,7 +253,7 @@ esp_err_t Microphone_Init(void)
     Mic_Fifo = xStreamBufferCreate(MICROPHONE_FIFO_BYTES, 1);
     if (Mic_Fifo == NULL)
     {
-        ESP_LOGE(TAG, "fifo create failed");
+        MICROPHONE_LOGE("fifo create failed");
         heap_caps_free(Mic_RxChunk);
         Mic_RxChunk = NULL;
         i2s_bus_phy_destroy(Mic_Phy);
@@ -255,7 +265,7 @@ esp_err_t Microphone_Init(void)
     BaseType_t created = xTaskCreate(Mic_Rx_Task, "MIC-RX", 2048, NULL, 10, &Mic_RxTask);
     if (created != pdPASS)
     {
-        ESP_LOGE(TAG, "rx task create failed");
+        MICROPHONE_LOGE("rx task create failed");
         vStreamBufferDelete(Mic_Fifo);
         Mic_Fifo = NULL;
         i2s_bus_phy_destroy(Mic_Phy);
@@ -263,7 +273,7 @@ esp_err_t Microphone_Init(void)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "INMP441 microphone initialized, sample_rate=%d", MICROPHONE_SAMPLE_RATE);
+    MICROPHONE_LOGI("INMP441 microphone initialized, sample_rate=%d", MICROPHONE_SAMPLE_RATE);
     return ESP_OK;
 }
 
@@ -292,7 +302,7 @@ esp_err_t Microphone_Deinit(void)
         i2s_bus_phy_destroy(Mic_Phy);
         Mic_Phy = NULL;
     }
-    ESP_LOGI(TAG, "INMP441 microphone deinitialized");
+    MICROPHONE_LOGI("INMP441 microphone deinitialized");
     return ESP_OK;
 }
 
@@ -301,12 +311,12 @@ esp_err_t Microphone_Read_Raw(uint8_t *buffer, size_t size, size_t *bytes_read, 
 {
     if (buffer == NULL || size == 0)
     {
-        ESP_LOGE(TAG, "Invalid buffer parameters");
+        MICROPHONE_LOGE("Invalid buffer parameters");
         return ESP_ERR_INVALID_ARG;
     }
     if (Mic_Fifo == NULL)
     {
-        ESP_LOGE(TAG, "microphone not initialized");
+        MICROPHONE_LOGE("microphone not initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -324,12 +334,12 @@ esp_err_t Microphone_Read_Pcm16(int16_t *pcmBuffer, size_t sampleCount, size_t *
 {
     if (pcmBuffer == NULL || sampleCount == 0)
     {
-        ESP_LOGE(TAG, "Invalid PCM buffer parameters");
+        MICROPHONE_LOGE("Invalid PCM buffer parameters");
         return ESP_ERR_INVALID_ARG;
     }
     if (Mic_Fifo == NULL)
     {
-        ESP_LOGE(TAG, "microphone not initialized");
+        MICROPHONE_LOGE("microphone not initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -382,7 +392,7 @@ esp_err_t Microphone_Flush(void)
 {
     if (Mic_Fifo == NULL)
     {
-        ESP_LOGE(TAG, "microphone not initialized");
+        MICROPHONE_LOGE("microphone not initialized");
         return ESP_ERR_INVALID_STATE;
     }
     uint8_t tmp[256];

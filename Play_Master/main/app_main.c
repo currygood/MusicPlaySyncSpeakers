@@ -34,6 +34,8 @@
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "esp_clk_tree.h"
 #include "nvs_flash.h"
 
 #include "StartAndStop.h"
@@ -79,8 +81,12 @@ static const char *TAG = "AppMain";
 /** WiFi 等待 IP 超时（轮询 100ms x 200 = 20s） */
 #define APP_WIFI_WAIT_TRIES     200
 
-/** 各 boot 任务栈/优先级（mp/cp/lc 创建完即退出；UI 任务常驻，见下） */
-#define APP_BOOT_TASK_PRIO      5
+/** 各 boot 任务栈/优先级（mp/cp/lc 创建完即退出；UI 任务常驻，见下）
+ *
+ *  boot 任务必须高于解码(10)/同步(11)：解码节流在"恰好追平"时余量 <1ms
+ *  不再 vTaskDelay（连续不让步），prio 5 的 boot 任务会被饿死——实测表现
+ *  为 CallPhone 60s 内既不就绪也不失败，UI 只能陪等满 60s 超时后才出屏 */
+#define APP_BOOT_TASK_PRIO      11
 #define APP_MUSIC_TASK_STACK    4096
 #define APP_CALL_TASK_STACK     4096
 #define APP_LIGHT_TASK_STACK    3072
@@ -91,6 +97,13 @@ static const char *TAG = "AppMain";
 
 /** 依赖等待超时（ms）：上游异常时避免永久挂起 */
 #define APP_DEP_WAIT_MS         60000
+
+/** 非关键依赖等待超时（ms）：UI 最多只等这么久，超时按占位降级先出屏
+ *  （call_phone / light_control 晚到不影响显示与本地/蓝牙播放控制） */
+#define APP_OPT_WAIT_MS         10000
+
+/** 蓝牙就绪等待（ms）：BT 起不来时快速失败，不拖累 CallPhone 的依赖方 */
+#define APP_BT_WAIT_MS          15000
 
 /* ======================== 全局运行上下文 ======================== */
 
@@ -148,11 +161,20 @@ static void App_Log_Heap(const char *stage)
  */
 static EventBits_t App_Wait_Bits(EventBits_t bits, uint32_t timeout_ms, const char *what)
 {
+    int64_t     t0  = esp_timer_get_time();
     EventBits_t got = xEventGroupWaitBits(s_app.evt, bits, pdFALSE, pdFALSE,
                                           pdMS_TO_TICKS(timeout_ms));
+    uint32_t    elapsed_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
     if ((got & bits) == 0)
     {
-        ESP_LOGW(TAG, "wait %s timeout (%u ms)", what, (unsigned)timeout_ms);
+        ESP_LOGW(TAG, "wait %s timeout after %u ms (%u ms budget)",
+                 what, (unsigned)elapsed_ms, (unsigned)timeout_ms);
+    }
+    else
+    {
+        /* 就绪耗时打点：启动期瓶颈定位（哪个模块/哪段等待拖慢了 UI） */
+        ESP_LOGI(TAG, "wait %s ok in %u ms (bits=0x%lx)", what,
+                 (unsigned)elapsed_ms, (unsigned long)(got & bits));
     }
     return got;
 }
@@ -214,7 +236,9 @@ static void App_Wifi_Evt_Cb(const wifi_mgr_event_t *evt, void *ctx)
 /** 初始化 wifi_manager 并等待拿到 IP（凭据由 wifi_manager 经 node_role 读取） */
 static void App_Wifi_Start(void)
 {
-    wifi_manager_cfg_t cfg = {0};   /* 默认：10s 连接超时 / 3s 重连 / 无限重连 */
+    wifi_manager_cfg_t cfg = {
+        .max_retries = 3,   /* 连接失败 3 次后放弃，等用户通过 UI 配网 */
+    };
     esp_err_t          err;
 
     s_app.wifi = wifi_manager_create(&cfg);
@@ -489,7 +513,7 @@ static void App_CallPhone_Task(void *arg)
 
     ESP_LOGI(TAG, "[CallPhone] boot: waiting for bluetooth ready ...");
     bits = App_Wait_Bits(APP_EVT_BT_READY | APP_EVT_BT_FAILED,
-                         APP_DEP_WAIT_MS, "bluetooth ready");
+                         APP_BT_WAIT_MS, "bluetooth ready");
 
     if (s_app.bt == NULL || (bits & APP_EVT_BT_READY) == 0)
     {
@@ -594,9 +618,9 @@ static void App_UI_Task(void *arg)
     App_Wait_Bits(APP_EVT_MUSIC_READY | APP_EVT_MUSIC_FAILED,
                   APP_DEP_WAIT_MS, "music_play ready");
     App_Wait_Bits(APP_EVT_CALL_READY | APP_EVT_CALL_FAILED,
-                  APP_DEP_WAIT_MS, "call_phone ready");
+                  APP_OPT_WAIT_MS, "call_phone ready");
     App_Wait_Bits(APP_EVT_LIGHT_READY | APP_EVT_LIGHT_FAILED,
-                  APP_DEP_WAIT_MS, "light_control ready");
+                  APP_OPT_WAIT_MS, "light_control ready");
 
     ucfg.wifi       = s_app.wifi;
     ucfg.light      = s_app.light;
@@ -643,6 +667,20 @@ void app_main(void)
     else
     {
         ESP_LOGW(TAG, "PSRAM not initialized");
+    }
+
+    /* CPU / Flash 频率打点：解码吞吐（MP3 ~1x@160MHz）与 UI 流畅度直接相关 */
+    {
+        uint32_t cpu_hz = 0;
+        if (esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_CPU,
+                                         ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED,
+                                         &cpu_hz) != ESP_OK)
+        {
+            cpu_hz = 0;
+        }
+        ESP_LOGI(TAG, "clk: cpu=%u MHz flash=%s psram=%d MHz",
+                 (unsigned)(cpu_hz / 1000000), CONFIG_ESPTOOLPY_FLASHFREQ,
+                 CONFIG_SPIRAM_SPEED);
     }
 
     /* 2. node_role：wifi_manager 启动时经 node_role_get() 读取 WiFi 凭据 */
@@ -737,4 +775,6 @@ void app_main(void)
     }
 
     /* app_main 返回后 IDF 主任务自删，回收其约 4KB 内部栈（内部 RAM 紧张时可观） */
+	vTaskDelete(NULL);
+	return;
 }

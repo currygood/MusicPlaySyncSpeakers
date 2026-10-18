@@ -45,7 +45,30 @@
 
 /* ======================== 模块常量 ================================================== */
 
+#if LIGHT_CONTROL_DEBUG_LOGS
 #define TAG "LightControl"
+#define LIGHT_CONTROL_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define LIGHT_CONTROL_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define LIGHT_CONTROL_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define LIGHT_CONTROL_LOGE(...) do { } while (0)
+#define LIGHT_CONTROL_LOGW(...) do { } while (0)
+#define LIGHT_CONTROL_LOGI(...) do { } while (0)
+#endif
+
+/**
+ * 灯控 JSON 协议版本（主控 ↔ 灯控节点）：
+ *   - 所有下行（on/off）与上行（ack/status）报文统一携带 "version" 整数字段；
+ *   - 本端只接受 version <= LC_PROTOCOL_VERSION 的报文：
+ *       version == 本端        ：正常处理；
+ *       version <  本端        ：兼容处理（旧字段语义未变）；
+ *       缺省（对端旧固件）     ：按 v1 兼容处理；
+ *       version >  本端        ：明确判定不兼容，发 LIGHT_EVT_INCOMPATIBLE，
+ *                               不解析、不执行任何指令。
+ *   - 版本不一致时（OTA 只升了一台），旧固件据此明确报“不兼容”，而不是对
+ *     语义跑偏的指令照常执行。
+ */
+#define LC_PROTOCOL_VERSION      1u
 
 /** 灯名最大有效长度（设计 3.3.3：data.light[16]，含结束符） */
 #define LC_LIGHT_NAME_LEN        16
@@ -130,7 +153,8 @@ static light_entry_t *Light_Find_Entry(light_control_handle_t h, const char *nam
 }
 
 static void Light_Fire_Event(light_control_handle_t h, light_event_id_t id,
-                             const char *name, bool ok, light_state_t state)
+                             const char *name, bool ok, light_state_t state,
+                             uint32_t peer_version)
 {
     light_event_t evt;
 
@@ -141,8 +165,9 @@ static void Light_Fire_Event(light_control_handle_t h, light_event_id_t id,
     memset(&evt, 0, sizeof(evt));
     evt.id = id;
     snprintf(evt.data.light, sizeof(evt.data.light), "%s", name);
-    evt.data.ok    = ok;
-    evt.data.state = state;
+    evt.data.ok           = ok;
+    evt.data.state        = state;
+    evt.data.peer_version = peer_version;
     h->on_event(&evt, h->event_ctx);
 }
 
@@ -156,25 +181,53 @@ static void Light_Send_Cmd(light_control_handle_t h, const light_queue_msg_t *ms
     root = cJSON_CreateObject();
     if (root == NULL)
     {
-        ESP_LOGE(TAG, "send: cJSON_CreateObject failed");
+        LIGHT_CONTROL_LOGE( "send: cJSON_CreateObject failed");
         return;
     }
     cJSON_AddStringToObject(root, "cmd", cmd_str);
     cJSON_AddStringToObject(root, "light", msg->light);
+    /* 协议版本：对端（灯控节点）据此判断是否兼容；缺省视为 v1 */
+    cJSON_AddNumberToObject(root, "version", LC_PROTOCOL_VERSION);
     json = cJSON_PrintUnformatted(root);
     if (json == NULL)
     {
-        ESP_LOGE(TAG, "send: cJSON_PrintUnformatted failed");
+        LIGHT_CONTROL_LOGE( "send: cJSON_PrintUnformatted failed");
         cJSON_Delete(root);
         return;
     }
 
     ret = wifi_manager_mcast_send(h->chan, json, strlen(json), h->tx_timeout_ms);
-    ESP_LOGI(TAG, "send cmd=%s light=\"%s\" (%d bytes) -> %s",
+    LIGHT_CONTROL_LOGI( "send cmd=%s light=\"%s\" (%d bytes) -> %s",
              cmd_str, msg->light, (int)strlen(json),
              (ret == ESP_OK) ? "OK" : esp_err_to_name(ret));
 
     free(json);
+    cJSON_Delete(root);
+}
+
+/** 版本不兼容回告（verr）：收到高于本端支持的 version 时回发（best-effort）。
+ *  对端据此明确知道是"版本不认识"，而不是把语义跑偏的指令照常执行。 */
+static void Light_Send_Verr(light_control_handle_t h)
+{
+    cJSON *root = cJSON_CreateObject();
+    char  *json = NULL;
+
+    if (root == NULL)
+    {
+        return;
+    }
+    cJSON_AddStringToObject(root, "cmd", "verr");
+    cJSON_AddStringToObject(root, "light", "-");
+    cJSON_AddNumberToObject(root, "version", LC_PROTOCOL_VERSION);
+    json = cJSON_PrintUnformatted(root);
+    if (json != NULL)
+    {
+        esp_err_t ret = wifi_manager_mcast_send(h->chan, json, strlen(json), h->tx_timeout_ms);
+        LIGHT_CONTROL_LOGW( "send verr (local version %lu): %s",
+                 (unsigned long)LC_PROTOCOL_VERSION,
+                 (ret == ESP_OK) ? "OK" : esp_err_to_name(ret));
+        free(json);
+    }
     cJSON_Delete(root);
 }
 
@@ -184,31 +237,65 @@ static void Light_Handle_Frame(light_control_handle_t h, const char *json, size_
     cJSON *item_cmd  = NULL;
     cJSON *item_name = NULL;
     cJSON *item_ok   = NULL;
+    cJSON *item_ver  = NULL;
     const char *cmd_str = NULL;
     const char *name    = NULL;
     bool ok = false;
+    uint32_t peer_version = 0;
     light_state_t state;
     light_event_id_t event_id;
     light_entry_t *entry;
 
-    ESP_LOGI(TAG, "recv %u bytes: %s", (unsigned)len, json);
+    LIGHT_CONTROL_LOGI( "recv %u bytes: %s", (unsigned)len, json);
 
     root = cJSON_Parse(json);
     if (root == NULL)
     {
-        ESP_LOGW(TAG, "recv: json parse failed");
+        LIGHT_CONTROL_LOGW( "recv: json parse failed");
         return;
+    }
+
+    /* ---- 协议版本校验（必须在解析/执行任何指令之前）----
+     * 缺省（对端旧固件）= v1 兼容；高于本端支持 = 明确不兼容，直接丢弃。
+     * 这样 OTA 只升了一台时，旧端不会对语义跑偏的指令照常执行。 */
+    item_ver = cJSON_GetObjectItem(root, "version");
+    if (item_ver != NULL)
+    {
+        if (!cJSON_IsNumber(item_ver))
+        {
+            LIGHT_CONTROL_LOGW( "recv: invalid \"version\" (expect number), drop");
+            goto out;
+        }
+        peer_version = (uint32_t)item_ver->valuedouble;
+    }
+    if (peer_version > LC_PROTOCOL_VERSION)
+    {
+        LIGHT_CONTROL_LOGW( "recv: peer version %lu > local %lu -> 不兼容，丢弃报文",
+                 (unsigned long)peer_version, (unsigned long)LC_PROTOCOL_VERSION);
+        Light_Send_Verr(h);   /* 明确回告对端：本端不认识这个版本 */
+        Light_Fire_Event(h, LIGHT_EVT_INCOMPATIBLE, "-", false,
+                         LIGHT_STATE_UNKNOWN, peer_version);
+        goto out;
     }
 
     item_cmd = cJSON_GetObjectItem(root, "cmd");
     if (!cJSON_IsString(item_cmd) || item_cmd->valuestring == NULL)
     {
-        ESP_LOGW(TAG, "recv: missing/invalid \"cmd\"");
+        LIGHT_CONTROL_LOGW( "recv: missing/invalid \"cmd\"");
         goto out;
     }
     cmd_str = item_cmd->valuestring;
 
-    if (strcmp(cmd_str, "ack") == 0)
+    if (strcmp(cmd_str, "verr") == 0)
+    {
+        /* 对端明确回告不兼容（它不认识我们的 version）：只展示告警，不解析其余字段 */
+        LIGHT_CONTROL_LOGW( "recv verr from peer (peer version %lu) -> 版本不兼容",
+                 (unsigned long)peer_version);
+        Light_Fire_Event(h, LIGHT_EVT_INCOMPATIBLE, "-", false,
+                         LIGHT_STATE_UNKNOWN, peer_version);
+        goto out;
+    }
+    else if (strcmp(cmd_str, "ack") == 0)
     {
         event_id = LIGHT_EVT_ACK;
     }
@@ -218,7 +305,7 @@ static void Light_Handle_Frame(light_control_handle_t h, const char *json, size_
     }
     else
     {
-        ESP_LOGW(TAG, "recv: unexpected cmd \"%s\", ignore (only ack/status)", cmd_str);
+        LIGHT_CONTROL_LOGW( "recv: unexpected cmd \"%s\", ignore (only ack/status)", cmd_str);
         goto out;
     }
 
@@ -227,7 +314,7 @@ static void Light_Handle_Frame(light_control_handle_t h, const char *json, size_
         strlen(item_name->valuestring) == 0 ||
         strlen(item_name->valuestring) >= LC_LIGHT_NAME_LEN)
     {
-        ESP_LOGW(TAG, "recv: missing/invalid \"light\"");
+        LIGHT_CONTROL_LOGW( "recv: missing/invalid \"light\"");
         goto out;
     }
     name = item_name->valuestring;
@@ -235,7 +322,7 @@ static void Light_Handle_Frame(light_control_handle_t h, const char *json, size_
     item_ok = cJSON_GetObjectItem(root, "ok");
     if (!cJSON_IsBool(item_ok))
     {
-        ESP_LOGW(TAG, "recv: missing/invalid \"ok\" (expect bool)");
+        LIGHT_CONTROL_LOGW( "recv: missing/invalid \"ok\" (expect bool)");
         goto out;
     }
     ok    = cJSON_IsTrue(item_ok);
@@ -257,7 +344,7 @@ static void Light_Handle_Frame(light_control_handle_t h, const char *json, size_
         if (entry == NULL)
         {
             xSemaphoreGive(h->lock);
-            ESP_LOGW(TAG, "recv: tracked table full, ignore \"%s\"", name);
+            LIGHT_CONTROL_LOGW( "recv: tracked table full, ignore \"%s\"", name);
             goto out;
         }
         entry->active = true;
@@ -268,10 +355,10 @@ static void Light_Handle_Frame(light_control_handle_t h, const char *json, size_
     entry->last_rx_ms = (uint32_t)(esp_timer_get_time() / 1000);
     xSemaphoreGive(h->lock);
 
-    ESP_LOGI(TAG, "%s: light=\"%s\" ok=%d state=%s",
+    LIGHT_CONTROL_LOGI( "%s: light=\"%s\" ok=%d state=%s",
              (event_id == LIGHT_EVT_ACK) ? "ACK" : "STATUS",
              name, ok, (state == LIGHT_STATE_ON) ? "ON" : "OFF");
-    Light_Fire_Event(h, event_id, name, ok, state);
+    Light_Fire_Event(h, event_id, name, ok, state, peer_version);
 
 out:
     cJSON_Delete(root);
@@ -295,7 +382,7 @@ static void Light_Check_Timeouts(light_control_handle_t h)
         }
         if ((now_ms - entry->last_rx_ms) >= h->state_timeout_ms)
         {
-            ESP_LOGW(TAG, "light \"%s\" no report for %lu ms -> UNKNOWN",
+            LIGHT_CONTROL_LOGW( "light \"%s\" no report for %lu ms -> UNKNOWN",
                      entry->name,
                      (unsigned long)(now_ms - entry->last_rx_ms));
             entry->state = LIGHT_STATE_UNKNOWN;  /* 落回；下次上报前不再重复触发 */
@@ -313,7 +400,8 @@ static void Light_Check_Timeouts(light_control_handle_t h)
     for (int i = 0; i < n; i++)
     {
         Light_Fire_Event(h, evt[i].id, evt[i].data.light,
-                         evt[i].data.ok, evt[i].data.state);
+                         evt[i].data.ok, evt[i].data.state,
+                         evt[i].data.peer_version);
     }
 }
 
@@ -360,7 +448,7 @@ light_control_handle_t light_control_create(const light_control_cfg_t *cfg)
 
     if (cfg == NULL || cfg->chan == NULL)
     {
-        ESP_LOGE(TAG, "create: cfg or chan is NULL");
+        LIGHT_CONTROL_LOGE( "create: cfg or chan is NULL");
         return NULL;
     }
 
@@ -368,7 +456,7 @@ light_control_handle_t light_control_create(const light_control_cfg_t *cfg)
     h = heap_caps_calloc(1, sizeof(*h), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (h == NULL)
     {
-        ESP_LOGE(TAG, "create: no mem");
+        LIGHT_CONTROL_LOGE( "create: no mem");
         return NULL;
     }
 
@@ -384,18 +472,18 @@ light_control_handle_t light_control_create(const light_control_cfg_t *cfg)
     h->destroy_done = xSemaphoreCreateBinaryWithCaps(MALLOC_CAP_SPIRAM);
     if (h->cmd_q == NULL || h->lock == NULL || h->destroy_done == NULL)
     {
-        ESP_LOGE(TAG, "create: queue/sem create failed");
+        LIGHT_CONTROL_LOGE( "create: queue/sem create failed");
         goto fail;
     }
 
     if (xTaskCreatePinnedToCore(Light_Control_Task, LC_TASK_NAME, LC_TASK_STACK, h,
                                 LC_TASK_PRIO, &h->task, LC_TASK_CORE) != pdPASS)
     {
-        ESP_LOGE(TAG, "create: task create failed");
+        LIGHT_CONTROL_LOGE( "create: task create failed");
         goto fail;
     }
 
-    ESP_LOGI(TAG, "created: chan=%p tx_timeout=%lu ms state_timeout=%lu ms",
+    LIGHT_CONTROL_LOGI( "created: chan=%p tx_timeout=%lu ms state_timeout=%lu ms",
              (void *)h->chan, (unsigned long)h->tx_timeout_ms,
              (unsigned long)h->state_timeout_ms);
     return h;
@@ -429,12 +517,12 @@ void light_control_destroy(light_control_handle_t h)
     msg.qcmd = LIGHT_QUEUE_DESTROY;
     if (xQueueSend(h->cmd_q, &msg, pdMS_TO_TICKS(LC_CMD_QUEUE_TIMEOUT_MS)) != pdTRUE)
     {
-        ESP_LOGE(TAG, "destroy: queue send timeout");
+        LIGHT_CONTROL_LOGE( "destroy: queue send timeout");
         return;
     }
     if (xSemaphoreTake(h->destroy_done, pdMS_TO_TICKS(3000)) != pdTRUE)
     {
-        ESP_LOGE(TAG, "destroy: task exit timeout");
+        LIGHT_CONTROL_LOGE( "destroy: task exit timeout");
         return;
     }
 
@@ -442,7 +530,7 @@ void light_control_destroy(light_control_handle_t h)
     vSemaphoreDeleteWithCaps(h->lock);
     vSemaphoreDeleteWithCaps(h->destroy_done);
     heap_caps_free(h);
-    ESP_LOGI(TAG, "destroy done");
+    LIGHT_CONTROL_LOGI( "destroy done");
 }
 
 esp_err_t light_control_send(light_control_handle_t h,
@@ -460,7 +548,7 @@ esp_err_t light_control_send(light_control_handle_t h,
     }
     if (strlen(light) == 0 || strlen(light) >= LC_LIGHT_NAME_LEN)
     {
-        ESP_LOGW(TAG, "send: invalid light name \"%s\"", light);
+        LIGHT_CONTROL_LOGW( "send: invalid light name \"%s\"", light);
         return ESP_ERR_INVALID_ARG;
     }
 

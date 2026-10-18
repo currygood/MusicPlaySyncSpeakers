@@ -15,6 +15,9 @@
 #ifndef __LIGHT_CONTROL_H__
 #define __LIGHT_CONTROL_H__
 
+/* ======================== 是否打开灯控模块调试打印 ======================== */
+#define LIGHT_CONTROL_DEBUG_LOGS    (1)
+
 #include "wifi_manager.h"
 #include "esp_err.h"
 
@@ -48,12 +51,14 @@ typedef enum {
     LIGHT_EVT_ACK = 0,    /* 收到即时回执 {"cmd":"ack",...} */
     LIGHT_EVT_STATUS,     /* 收到周期状态上报 {"cmd":"status",...}（每 30s） */
     LIGHT_EVT_ERROR,      /* 回执异常 / 状态上报超时 */
+    LIGHT_EVT_INCOMPATIBLE, /* 对端协议版本不兼容（version 不匹配或高于本端支持） */
 } light_event_id_t;
 
 typedef struct {
     char          light[16]; /* 区域灯名，如 "bedroom" */
     bool          ok;        /* ack/status 上报：true=开，false=关 */
     light_state_t state;     /* 本次上报对应的实际开关状态（由 ok 归一化，超时为 UNKNOWN） */
+    uint32_t      peer_version; /* 上行/下行报文的协议版本（0=对端未携带） */
 } light_event_data_t;
 
 typedef struct {

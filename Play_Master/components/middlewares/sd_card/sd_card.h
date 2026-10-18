@@ -29,6 +29,9 @@
 #ifndef SD_CARD_H
 #define SD_CARD_H
 
+/* ======================== 是否打开 SD 卡模块调试打印 ======================== */
+#define SD_CARD_DEBUG_LOGS    (false)
+
 #include "esp_err.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -50,8 +53,11 @@
 /** SPI 数据输入引脚（与 LCD 共用总线） */
 #define SD_CARD_MISO_GPIO     21
 
-/** SPI 时钟频率（Hz）：SD 卡 SPI 模式上限 25MHz，10MHz 兼顾稳定性 */
-#define SD_CARD_SPI_FREQ_HZ   (10 * 1000 * 1000)
+/** SPI 时钟频率（Hz）：SD 卡 SPI 模式上限 25MHz；20MHz 兼顾吞吐与稳定性 */
+#define SD_CARD_SPI_FREQ_HZ   (20 * 1000 * 1000)
+
+/** SPI 时钟降级值（Hz）：20MHz 建立失败时回退到 10MHz 重试一次 */
+#define SD_CARD_FALLBACK_FREQ_HZ   (10 * 1000 * 1000)
 
 /** SPI 上电/识别时钟（Hz）：SD 规范要求初始化命令 <=400kHz */
 #define SD_CARD_INIT_FREQ_HZ   (400 * 1000)

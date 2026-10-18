@@ -127,6 +127,7 @@ struct wifi_manager_s {
     struct wifi_mcast_s *mcast_list;
     TaskHandle_t         rx_task;
     bool                 rx_stop;   /* destroy() 置位，RX 任务自行退出 */
+    bool                 scanning;  /* 扫描进行中，阻止重连调度干扰扫描 */
     SemaphoreHandle_t    rx_done;   /* RX 任务退出信号（destroy 等待） */
 };
 
@@ -156,7 +157,9 @@ static void wifi_mgr_handle_wifi(void *arg, esp_event_base_t base,
     switch (event_id)
     {
     case WIFI_EVENT_STA_START:
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGI(TAG, "sta started, connecting to \"%s\"", h->ssid);
+#endif
         wifi_mgr_connect(h);
         break;
 
@@ -171,17 +174,20 @@ static void wifi_mgr_handle_wifi(void *arg, esp_event_base_t base,
         h->state = WIFI_STATE_IDLE;
         wifi_mgr_close_all_mcast(h);       /* 需持锁调用 */
         xSemaphoreGive(h->lock);
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGI(TAG, "sta stopped");
+#endif
         break;
 
     case WIFI_EVENT_STA_CONNECTED:
         /* 链路已通，等待 DHCP 拿 IP；状态保持 CONNECTING */
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGI(TAG, "sta connected, waiting IP...");
+#endif
         break;
 
     case WIFI_EVENT_STA_DISCONNECTED:
     {
-        wifi_event_sta_disconnected_t *evt = event_data;
         bool was_connected;
 
         xSemaphoreTake(h->lock, portMAX_DELAY);
@@ -201,7 +207,9 @@ static void wifi_mgr_handle_wifi(void *arg, esp_event_base_t base,
         {
             wifi_mgr_fire_event(h, WIFI_EVT_DISCONNECTED);
         }
-        ESP_LOGW(TAG, "disconnected, reason=%d", evt->reason);
+#if WIFI_MANAGER_DEBUG_LOGS
+        ESP_LOGW(TAG, "disconnected, reason=%d", ((wifi_event_sta_disconnected_t *)event_data)->reason);
+#endif
         wifi_mgr_schedule_reconnect(h);
         break;
     }
@@ -242,9 +250,10 @@ static void wifi_mgr_handle_ip(void *arg, esp_event_base_t base,
         /* IP 就绪：整体重建（关闭后重新创建）组播 socket */
         wifi_mgr_reopen_all_mcast(h);
         xSemaphoreGive(h->lock);
-
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGI(TAG, "connected, ip=%s (first=%d, changed=%d)",
                  ipstr, first, ip_changed);
+#endif
 
         if (first)
         {
@@ -260,7 +269,9 @@ static void wifi_mgr_handle_ip(void *arg, esp_event_base_t base,
         xSemaphoreTake(h->lock, portMAX_DELAY);
         strncpy(h->ip, "0.0.0.0", sizeof(h->ip) - 1);
         xSemaphoreGive(h->lock);
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGI(TAG, "sta lost ip");
+#endif
     }
 }
 
@@ -272,7 +283,9 @@ static void wifi_mgr_connect(wifi_manager_handle_t h)
     esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+#endif
         wifi_mgr_schedule_reconnect(h);
         return;
     }
@@ -310,8 +323,10 @@ static void wifi_mgr_on_connect_timeout(void *arg)
 
     if (need_disconnect)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGW(TAG, "connect timeout (%lu ms), disconnect & retry",
                  (unsigned long)h->cfg.connect_timeout_ms);
+#endif
         esp_wifi_disconnect();
     }
 }
@@ -320,7 +335,9 @@ static void wifi_mgr_on_connect_timeout(void *arg)
 static void wifi_mgr_on_reconnect(void *arg)
 {
     wifi_manager_handle_t h = arg;
+#if WIFI_MANAGER_DEBUG_LOGS
     ESP_LOGI(TAG, "auto reconnect...");
+#endif
     wifi_mgr_fire_event(h, WIFI_EVT_RECONNECTING);
     /* 每次重连前先下发最新凭据：set_sta() 修改后无需等待下次启动即生效 */
     wifi_mgr_apply_config(h);
@@ -333,7 +350,7 @@ static void wifi_mgr_schedule_reconnect(wifi_manager_handle_t h)
     bool give_up = false;
 
     xSemaphoreTake(h->lock, portMAX_DELAY);
-    if (!h->running)
+    if (!h->running || h->scanning)
     {
         xSemaphoreGive(h->lock);
         return;
@@ -351,16 +368,20 @@ static void wifi_mgr_schedule_reconnect(wifi_manager_handle_t h)
         esp_timer_stop(h->reconnect_timer);
         esp_timer_start_once(h->reconnect_timer,
                              (uint64_t)h->cfg.reconnect_interval_ms * 1000);
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGI(TAG, "reconnect scheduled in %lu ms (fail=%lu)",
                  (unsigned long)h->cfg.reconnect_interval_ms,
                  (unsigned long)h->retry_count);
+#endif
     }
     xSemaphoreGive(h->lock);
 
     if (give_up)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "reconnect retries exhausted (max=%lu), enter ERROR",
                  (unsigned long)h->cfg.max_retries);
+#endif
     }
 }
 
@@ -409,7 +430,9 @@ static int wifi_mcast_socket_create(const char *group, uint16_t port,
     sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "socket create failed, errno=%d", errno);
+#endif
         return -1;
     }
 
@@ -419,7 +442,9 @@ static int wifi_mcast_socket_create(const char *group, uint16_t port,
     memset(&imreq, 0, sizeof(imreq));
     if (inet_aton(group, &imreq.imr_multiaddr.s_addr) != 1)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "invalid mcast group: \"%s\"", group);
+#endif
         close(sock);
         return -1;
     }
@@ -427,8 +452,10 @@ static int wifi_mcast_socket_create(const char *group, uint16_t port,
     if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                    &imreq, sizeof(imreq)) < 0)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "IP_ADD_MEMBERSHIP(\"%s\") failed, errno=%d",
                  group, errno);
+#endif
         close(sock);
         return -1;
     }
@@ -440,7 +467,9 @@ static int wifi_mcast_socket_create(const char *group, uint16_t port,
     saddr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(sock, (struct sockaddr *)&saddr, sizeof(saddr)) < 0)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "bind port %u failed, errno=%d", port, errno);
+#endif
         close(sock);
         return -1;
     }
@@ -517,8 +546,10 @@ static void wifi_mcast_rx_task(void *arg)
 
     if (buf == NULL)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "mcast rx buf alloc failed (%u bytes), task exits",
                  (unsigned)WIFI_MCAST_RX_BUF_BYTES);
+#endif
         xSemaphoreGive(h->rx_done);
         vTaskDelete(NULL);
     }
@@ -615,9 +646,13 @@ static esp_err_t wifi_mgr_apply_config(wifi_manager_handle_t h)
     conf.sta.scan_method     = WIFI_ALL_CHANNEL_SCAN;
     conf.sta.threshold.authmode = (p_len > 0) ? WIFI_AUTH_WPA2_PSK
                                               : WIFI_AUTH_OPEN;
+    conf.sta.pmf_cfg.capable   = true;
+    conf.sta.pmf_cfg.required  = false;
     xSemaphoreGive(h->lock);
 
+#if WIFI_MANAGER_DEBUG_LOGS
     ESP_LOGI(TAG, "set sta config: ssid=\"%s\" plen=%u", ssid, (unsigned)p_len);
+#endif
     return esp_wifi_set_config(WIFI_IF_STA, &conf);
 }
 /* ======================== 生命周期 ======================== */
@@ -639,7 +674,9 @@ wifi_manager_handle_t wifi_manager_create(const wifi_manager_cfg_t *cfg)
         }
         if (nerr != ESP_OK)
         {
+#if WIFI_MANAGER_DEBUG_LOGS
             ESP_LOGE(TAG, "nvs_flash_init failed: %s", esp_err_to_name(nerr));
+#endif
             return NULL;
         }
     }
@@ -649,14 +686,18 @@ wifi_manager_handle_t wifi_manager_create(const wifi_manager_cfg_t *cfg)
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "event loop create failed: %s", esp_err_to_name(err));
+#endif
         return NULL;
     }
 
     h = calloc(1, sizeof(*h));
     if (h == NULL)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "alloc manager failed");
+#endif
         return NULL;
     }
     h->lock = xSemaphoreCreateMutex();
@@ -711,13 +752,17 @@ wifi_manager_handle_t wifi_manager_create(const wifi_manager_cfg_t *cfg)
                                 WIFI_MCAST_RX_TASK_PRIO,
                                 &h->rx_task, WIFI_MCAST_RX_TASK_CORE) != pdPASS)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "mcast rx task create failed");
+#endif
     }
 
+#if WIFI_MANAGER_DEBUG_LOGS
     ESP_LOGI(TAG, "wifi_manager created (timeout=%lums, reconn=%lums, retry=%lu)",
              (unsigned long)h->cfg.connect_timeout_ms,
              (unsigned long)h->cfg.reconnect_interval_ms,
              (unsigned long)h->cfg.max_retries);
+#endif
     return h;
 }
 
@@ -741,7 +786,9 @@ esp_err_t wifi_manager_start(wifi_manager_handle_t h)
         {
             if (esp_netif_create_default_wifi_sta() == NULL)
             {
+#if WIFI_MANAGER_DEBUG_LOGS
                 ESP_LOGE(TAG, "create default wifi sta netif failed");
+#endif
                 return ESP_FAIL;
             }
             h->netif_created = true;
@@ -751,7 +798,9 @@ esp_err_t wifi_manager_start(wifi_manager_handle_t h)
         err = esp_wifi_init(&wif_cfg);
         if (err != ESP_OK)
         {
+#if WIFI_MANAGER_DEBUG_LOGS
             ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+#endif
             return err;
         }
         /* RAM 存储：本模块不写 NVS */
@@ -763,14 +812,18 @@ esp_err_t wifi_manager_start(wifi_manager_handle_t h)
     err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != ESP_OK)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "esp_wifi_set_mode STA failed: %s", esp_err_to_name(err));
+#endif
         return err;
     }
 
     err = wifi_mgr_apply_config(h);
     if (err != ESP_OK)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "apply sta config failed: %s", esp_err_to_name(err));
+#endif
         return err;
     }
 
@@ -783,7 +836,9 @@ esp_err_t wifi_manager_start(wifi_manager_handle_t h)
     err = esp_wifi_start();
     if (err != ESP_OK)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+#endif
         xSemaphoreTake(h->lock, portMAX_DELAY);
         h->running = false;
         h->state   = WIFI_STATE_ERROR;
@@ -799,11 +854,15 @@ esp_err_t wifi_manager_start(wifi_manager_handle_t h)
     err = esp_wifi_set_ps(WIFI_PS_NONE);
     if (err != ESP_OK)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGW(TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s",
                  esp_err_to_name(err));
+#endif
     }
 
+#if WIFI_MANAGER_DEBUG_LOGS
     ESP_LOGI(TAG, "wifi_manager started");
+#endif
     return ESP_OK;
 }
 
@@ -827,7 +886,9 @@ esp_err_t wifi_manager_stop(wifi_manager_handle_t h)
         esp_wifi_disconnect();
         esp_wifi_stop();
     }
+#if WIFI_MANAGER_DEBUG_LOGS
     ESP_LOGI(TAG, "wifi_manager stopped");
+#endif
     return ESP_OK;
 }
 
@@ -856,7 +917,9 @@ void wifi_manager_destroy(wifi_manager_handle_t h)
         xSemaphoreGive(h->lock);
         if (xSemaphoreTake(h->rx_done, pdMS_TO_TICKS(2000)) != pdPASS)
         {
+#if WIFI_MANAGER_DEBUG_LOGS
             ESP_LOGW(TAG, "rx task did not exit in time, force delete");
+#endif
             vTaskDelete(h->rx_task);
         }
         h->rx_task = NULL;
@@ -880,7 +943,167 @@ void wifi_manager_destroy(wifi_manager_handle_t h)
     vSemaphoreDelete(h->rx_done);
     vSemaphoreDelete(h->lock);
     free(h);
+#if WIFI_MANAGER_DEBUG_LOGS
     ESP_LOGI(TAG, "wifi_manager destroyed");
+#endif
+}
+
+/* ======================== WiFi 扫描 ======================== */
+
+/** 扫描超时（每信道 120ms × 14 信道 ≈ 1.7s，留余量） */
+#define WIFI_SCAN_TIMEOUT_MS    (5000)
+
+/** 默认最大返回 AP 数（UI 列表足够，减少内存占用） */
+#define WIFI_SCAN_DEFAULT_MAX_AP   (20)
+
+esp_err_t wifi_manager_scan(wifi_manager_handle_t h, wifi_scan_result_t *out)
+{
+    esp_err_t err;
+    uint16_t ap_num = 0;
+    wifi_ap_record_t *ap_list = NULL;
+
+    if (h == NULL || out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    if (!h->running)
+    {
+#if WIFI_MANAGER_DEBUG_LOGS
+        ESP_LOGE(TAG, "scan failed: wifi not started");
+#endif
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 0) 暂停重连循环，确保 WiFi 处于可扫描状态 */
+    xSemaphoreTake(h->lock, portMAX_DELAY);
+    h->scanning = true;
+    esp_timer_stop(h->reconnect_timer);
+    xSemaphoreGive(h->lock);
+
+    /* 若正在连接/已连接，先断开以释放射频资源 */
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+#if WIFI_MANAGER_DEBUG_LOGS
+    ESP_LOGI(TAG, "starting wifi scan...");
+#endif
+
+    /* 1) 启动扫描（被动模式：监听 Beacon，不依赖 Probe 响应，阻塞约 5~7 秒） */
+    {
+        wifi_scan_config_t scan_cfg = {
+            .ssid = NULL,
+            .bssid = NULL,
+            .channel = 0,
+            .show_hidden = false,
+            .scan_type = WIFI_SCAN_TYPE_PASSIVE,
+            .scan_time.passive = 400,
+        };
+        err = esp_wifi_scan_start(&scan_cfg, true);
+        if (err != ESP_OK)
+        {
+#if WIFI_MANAGER_DEBUG_LOGS
+            ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
+#endif
+            goto scan_cleanup;
+        }
+    }
+
+    /* 2) 获取扫描到的 AP 数量 */
+    err = esp_wifi_scan_get_ap_num(&ap_num);
+    if (err != ESP_OK)
+    {
+#if WIFI_MANAGER_DEBUG_LOGS
+        ESP_LOGE(TAG, "esp_wifi_scan_get_ap_num failed: %s", esp_err_to_name(err));
+#endif
+        goto scan_cleanup;
+    }
+    if (ap_num == 0)
+    {
+#if WIFI_MANAGER_DEBUG_LOGS
+        ESP_LOGW(TAG, "scan found 0 APs");
+#endif
+        out->ap_list = NULL;
+        out->count   = 0;
+        out->capacity = 0;
+        goto scan_cleanup;
+    }
+
+    /* 3) 限制最大数量（避免内存过大） */
+    if (ap_num > WIFI_SCAN_DEFAULT_MAX_AP)
+    {
+        ap_num = WIFI_SCAN_DEFAULT_MAX_AP;
+    }
+
+    /* 4) 分配内存并获取 AP 记录 */
+    ap_list = (wifi_ap_record_t *)calloc(ap_num, sizeof(wifi_ap_record_t));
+    if (ap_list == NULL)
+    {
+#if WIFI_MANAGER_DEBUG_LOGS
+        ESP_LOGE(TAG, "alloc ap_list failed (%u entries)", (unsigned)ap_num);
+#endif
+        err = ESP_ERR_NO_MEM;
+        goto scan_cleanup;
+    }
+
+    {
+        uint16_t got_num = ap_num;
+        err = esp_wifi_scan_get_ap_records(&got_num, ap_list);
+        if (err != ESP_OK)
+        {
+#if WIFI_MANAGER_DEBUG_LOGS
+            ESP_LOGE(TAG, "esp_wifi_scan_get_ap_records failed: %s", esp_err_to_name(err));
+#endif
+            free(ap_list);
+            ap_list = NULL;
+            goto scan_cleanup;
+        }
+
+        /* 5) 填充输出结构 */
+        out->ap_list  = ap_list;
+        out->count    = got_num;
+        out->capacity = ap_num;
+
+#if WIFI_MANAGER_DEBUG_LOGS
+        ESP_LOGI(TAG, "scan done: found %u AP(s)", (unsigned)got_num);
+        {
+            uint16_t dbg_i;
+            for (dbg_i = 0; dbg_i < got_num && dbg_i < 5; dbg_i++)
+            {
+                ESP_LOGI(TAG, "  [%02u] \"%s\" rssi=%d auth=%u ch=%u",
+                     (unsigned)dbg_i, ap_list[dbg_i].ssid, (int)ap_list[dbg_i].rssi,
+                     (unsigned)ap_list[dbg_i].authmode, (unsigned)ap_list[dbg_i].primary);
+            }
+            if (got_num > 5)
+            {
+                ESP_LOGI(TAG, "  ... and %u more", (unsigned)(got_num - 5));
+            }
+        }
+#endif
+    }
+
+scan_cleanup:
+    xSemaphoreTake(h->lock, portMAX_DELAY);
+    h->scanning = false;
+    xSemaphoreGive(h->lock);
+    return err;
+}
+
+void wifi_manager_scan_free(wifi_scan_result_t *result)
+{
+    if (result == NULL)
+    {
+        return;
+    }
+    if (result->ap_list != NULL)
+    {
+        free(result->ap_list);
+        result->ap_list = NULL;
+    }
+    result->count    = 0;
+    result->capacity = 0;
 }
 
 /* ======================== 配网 / 订阅 / 查询 ======================== */
@@ -906,7 +1129,9 @@ esp_err_t wifi_manager_set_sta(wifi_manager_handle_t h,
     snprintf(h->password, sizeof(h->password), "%s", password);
     st = h->state;
     xSemaphoreGive(h->lock);
+#if WIFI_MANAGER_DEBUG_LOGS
     ESP_LOGI(TAG, "set sta credentials: \"%s\"", ssid);
+#endif
 
     if (!h->running)
     {
@@ -928,7 +1153,9 @@ esp_err_t wifi_manager_set_sta(wifi_manager_handle_t h,
     err = wifi_mgr_apply_config(h);
     if (err != ESP_OK)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "apply sta config failed: %s", esp_err_to_name(err));
+#endif
         return err;
     }
     wifi_mgr_connect(h);
@@ -1025,8 +1252,10 @@ esp_err_t wifi_manager_mcast_open(wifi_manager_handle_t h,
     if (glen == 0 || glen >= WIFI_MCAST_GROUP_LEN ||
         inet_aton(cfg->group, &chk) != 1)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGE(TAG, "invalid mcast group: \"%s\"",
                  cfg->group ? cfg->group : "");
+#endif
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1051,8 +1280,10 @@ esp_err_t wifi_manager_mcast_open(wifi_manager_handle_t h,
                                         RINGBUF_TYPE_NOSPLIT);
         if (ch->rx_fifo == NULL)
         {
+#if WIFI_MANAGER_DEBUG_LOGS
             ESP_LOGE(TAG, "rx fifo create failed (%u bytes)",
                      (unsigned)ch->rx_fifo_bytes);
+#endif
             free(ch);
             return ESP_ERR_NO_MEM;
         }
@@ -1070,9 +1301,11 @@ esp_err_t wifi_manager_mcast_open(wifi_manager_handle_t h,
     xSemaphoreGive(h->lock);
 
     *out = ch;
+#if WIFI_MANAGER_DEBUG_LOGS
     ESP_LOGI(TAG, "mcast opened: %s:%u rx=%d fifo=%u",
              ch->group, ch->port, ch->rx_enable,
              (unsigned)ch->rx_fifo_bytes);
+#endif
     return ESP_OK;
 }
 
@@ -1110,7 +1343,9 @@ esp_err_t wifi_manager_mcast_send(wifi_mcast_handle_t ch,
         }
         if (!(ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
         {
+#if WIFI_MANAGER_DEBUG_LOGS
             ESP_LOGW(TAG, "mcast sendto failed ret=%d errno=%d", ret, errno);
+#endif
             return ESP_FAIL;
         }
         if (timeout_ms == 0 || xTaskGetTickCount() >= deadline)
@@ -1148,8 +1383,10 @@ esp_err_t wifi_manager_mcast_recv(wifi_mcast_handle_t ch,
 
     if (item_size > cap)
     {
+#if WIFI_MANAGER_DEBUG_LOGS
         ESP_LOGW(TAG, "mcast item %u > cap %u, truncated",
                  (unsigned)item_size, (unsigned)cap);
+#endif
         item_size = cap;
     }
     memcpy(buf, item, item_size);

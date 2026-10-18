@@ -18,6 +18,9 @@
 #ifndef __START_AND_STOP_H__
 #define __START_AND_STOP_H__
 
+/* ======================== 是否打开开关机模块调试打印 ======================== */
+#define START_AND_STOP_DEBUG_LOGS    (false)
+
 #include "gpio_driver.h"
 
 /* ======================== 宏定义 =============================================== */

@@ -32,6 +32,9 @@
 #ifndef __OTA_UPDATE_H__
 #define __OTA_UPDATE_H__
 
+/* ======================== 是否打开 OTA 模块调试打印 ======================== */
+#define OTA_UPDATE_DEBUG_LOGS    (false)
+
 #include "esp_err.h"
 #include <stdbool.h>
 #include <stdint.h>

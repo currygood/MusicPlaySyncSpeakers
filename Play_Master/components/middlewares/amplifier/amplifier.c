@@ -26,7 +26,16 @@
 
 /* ======================== 模块静态变量 ============================================= */
 
-static const char *TAG = "AMPLIFIER";  /* 日志标签 */
+#if AMPLIFIER_DEBUG_LOGS
+static const char *TAG = "AMPLIFIER"; /* 日志标签 */
+#define AMP_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define AMP_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define AMP_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define AMP_LOGE(...) do { } while (0)
+#define AMP_LOGW(...) do { } while (0)
+#define AMP_LOGI(...) do { } while (0)
+#endif
 
 /* 当前音量值（0~100），默认 80% */
 static uint8_t Amplifier_Volume = 80;
@@ -87,7 +96,7 @@ esp_err_t Amplifier_Init(void)
     /* 重复初始化保护 */
     if (Amp_Phy != NULL)
     {
-        ESP_LOGW(TAG, "already initialized");
+        AMP_LOGW("already initialized");
         return ESP_OK;
     }
 
@@ -95,7 +104,7 @@ esp_err_t Amplifier_Init(void)
     esp_err_t ret = i2s_bus_phy_create(I2S_NUM_1, true, &Amp_PinCfg, &Amp_BusCfg, &Amp_Phy);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "i2s phy create failed: %s", esp_err_to_name(ret));
+        AMP_LOGE("i2s phy create failed: %s", esp_err_to_name(ret));
         Amp_Phy = NULL;
         return ESP_FAIL;
     }
@@ -104,7 +113,7 @@ esp_err_t Amplifier_Init(void)
     Amp_WriteMutex = xSemaphoreCreateMutex();
     if (Amp_WriteMutex == NULL)
     {
-        ESP_LOGE(TAG, "write mutex create failed");
+        AMP_LOGE("write mutex create failed");
         i2s_bus_phy_destroy(Amp_Phy);
         Amp_Phy = NULL;
         return ESP_FAIL;
@@ -121,11 +130,11 @@ esp_err_t Amplifier_Init(void)
         }
         if (s_amp_scaled == NULL)
         {
-            ESP_LOGW(TAG, "volume buffer alloc failed, volume will not take effect");
+            AMP_LOGW("volume buffer alloc failed, volume will not take effect");
         }
     }
 
-    ESP_LOGI(TAG, "NS4168 amplifier initialized, volume=%d%%", Amplifier_Volume);
+    AMP_LOGI("NS4168 amplifier initialized, volume=%d%%", Amplifier_Volume);
     return ESP_OK;
 }
 
@@ -146,7 +155,7 @@ esp_err_t Amplifier_Deinit(void)
         heap_caps_free(s_amp_scaled);
         s_amp_scaled = NULL;
     }
-    ESP_LOGI(TAG, "NS4168 amplifier deinitialized");
+    AMP_LOGI("NS4168 amplifier deinitialized");
     return ESP_OK;
 }
 
@@ -155,12 +164,12 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
     /* 参数校验 */
     if (buffer == NULL || size == 0)
     {
-        ESP_LOGE(TAG, "Invalid buffer parameters");
+        AMP_LOGE("Invalid buffer parameters");
         return ESP_ERR_INVALID_ARG;
     }
     if (Amp_Phy == NULL || Amp_WriteMutex == NULL)
     {
-        ESP_LOGE(TAG, "amplifier not initialized");
+        AMP_LOGE("amplifier not initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -199,7 +208,7 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
     TickType_t wait_ticks = (timeout == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(timeout);
     if (xSemaphoreTake(Amp_WriteMutex, wait_ticks) != pdTRUE)
     {
-        ESP_LOGW(TAG, "write lock timeout");
+        AMP_LOGW("write lock timeout");
         return ESP_ERR_TIMEOUT;
     }
     size_t written = 0;
@@ -208,7 +217,7 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
 
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Play buffer failed: %s", esp_err_to_name(ret));
+        AMP_LOGE("Play buffer failed: %s", esp_err_to_name(ret));
         return ret;
     }
     if (bytes_written != NULL)
@@ -233,7 +242,7 @@ esp_err_t Amplifier_Set_Volume(uint8_t volume)
         volume = AMPLIFIER_VOLUME_MAX;
     }
     Amplifier_Volume = volume;
-    ESP_LOGI(TAG, "volume set: %d%%", Amplifier_Volume);
+    AMP_LOGI("volume set: %d%%", Amplifier_Volume);
     return ESP_OK;
 }
 

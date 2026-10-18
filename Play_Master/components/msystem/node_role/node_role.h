@@ -23,6 +23,9 @@
 #ifndef __NODE_ROLE_H__
 #define __NODE_ROLE_H__
 
+/* ======================== 是否打开节点配置模块调试打印 ======================== */
+#define NODE_ROLE_DEBUG_LOGS    (false)
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -112,4 +115,3 @@ node_role_t node_role_get_role(void);
 bool node_role_is_master(void);
 
 #endif /* __NODE_ROLE_H__ */
-

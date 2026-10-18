@@ -7,7 +7,16 @@
 #include <string.h>
 #include <stdio.h>
 
+#if LCD_TOUCH_DEBUG_LOGS
 static const char *TAG = "LCD_Touch";
+#define LCD_TOUCH_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define LCD_TOUCH_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define LCD_TOUCH_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define LCD_TOUCH_LOGE(...) do { } while (0)
+#define LCD_TOUCH_LOGW(...) do { } while (0)
+#define LCD_TOUCH_LOGI(...) do { } while (0)
+#endif
 static Spi_Handle_t LcdSpiHandle;
 static i2c_master_dev_handle_t Ft6336I2cHandle = NULL;
 static TaskHandle_t TouchTaskHandle = NULL;
@@ -69,7 +78,7 @@ static void LCD_GPIO_Init(void)
 static void LCD_SPI_Init(void)
 {
     Spi_Config_t spiConfig = {
-        .clockSpeedHz = 10 * 1000 * 1000,
+        .clockSpeedHz = LCD_TOUCH_SPI_FREQ_HZ,
         .sckPin = SPI_SCK_GPIO,
         .mosiPin = SPI_MOSI_GPIO,
         .misoPin = SPI_MISO_GPIO
@@ -79,17 +88,20 @@ static void LCD_SPI_Init(void)
 
     Spi_DeviceConfig_t lcdDevCfg = {
         .csPin        = LCD_TOUCH_SPI_CS,
-        .clockSpeedHz = 10 * 1000 * 1000,
+        .clockSpeedHz = LCD_TOUCH_SPI_FREQ_HZ,
         .mode         = 0,
         /* LVGL 刷屏走阻塞式 Spi_Transmit，同一设备不会有多笔事务同时在飞，
          * 队列深度 2 足够；队列对象本身占内部 RAM，不必按默认值放大 */
         .queueSize    = 2,
+        /* 仲裁：LCD 是实时消费者，优先级最高；SD 卡在安全点让出时优先服务它 */
+        .priority     = SPI_PRIO_HIGH,
+        .label        = "lcd",
     };
     LcdSpiHandle = Spi_Register_Device(&lcdDevCfg);
 
     if(LcdSpiHandle == NULL)
     {
-        ESP_LOGE(TAG, "Failed to register LCD SPI device");
+        LCD_TOUCH_LOGE("Failed to register LCD SPI device");
     }
 }
 
@@ -176,7 +188,7 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
             s_touchReadFailCount++;
             if(s_touchReadFailCount == 1 || s_touchReadFailCount % 50 == 0)
             {
-                ESP_LOGW(TAG, "[FT6336G] read fail #%lu: %s",
+                LCD_TOUCH_LOGW("[FT6336G] read fail #%lu: %s",
                          (unsigned long)s_touchReadFailCount, esp_err_to_name(ret));
             }
             if(s_touchReadFailCount % 25 == 0)
@@ -237,7 +249,7 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
 static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
 {
 #if LCD_TOUCH_FT6336_RST != LCD_TOUCH_SPI_RST
-    ESP_LOGI(TAG, "[FT6336G] Step 1: Hardware reset...");
+    LCD_TOUCH_LOGI("[FT6336G] Step 1: Hardware reset...");
 
     gpio_config_t rstConf = {
         .mode = GPIO_MODE_OUTPUT,
@@ -249,26 +261,26 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
     vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level((gpio_num_t)LCD_TOUCH_FT6336_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
-    ESP_LOGI(TAG, "[FT6336G] Step 1: Reset complete");
+    LCD_TOUCH_LOGI("[FT6336G] Step 1: Reset complete");
 #else
     /* CTP_RST 与 LCD_RST 共用 GPIO25：LCD 复位时已同时复位触摸，这里不能再拉低 */
-    ESP_LOGI(TAG, "[FT6336G] Step 1: reset shared with LCD_RST, skip");
+    LCD_TOUCH_LOGI("[FT6336G] Step 1: reset shared with LCD_RST, skip");
 #endif
 
     if(i2cBusHandle == NULL)
     {
-        ESP_LOGE(TAG, "[FT6336G] Error: I2C bus handle is NULL");
+        LCD_TOUCH_LOGE("[FT6336G] Error: I2C bus handle is NULL");
         return;
     }
 
-    ESP_LOGI(TAG, "[FT6336G] Step 2: Adding I2C device (addr: 0x%02X)...", LCD_TOUCH_FT6336G_DEV_ADDR);
+    LCD_TOUCH_LOGI("[FT6336G] Step 2: Adding I2C device (addr: 0x%02X)...", LCD_TOUCH_FT6336G_DEV_ADDR);
     esp_err_t ret = I2c_Add_Device(i2cBusHandle, LCD_TOUCH_FT6336G_DEV_ADDR, I2C_FREQ, &Ft6336I2cHandle);
     if(ret != ESP_OK || Ft6336I2cHandle == NULL)
     {
-        ESP_LOGE(TAG, "[FT6336G] Error: Failed to add FT6336G device");
+        LCD_TOUCH_LOGE("[FT6336G] Error: Failed to add FT6336G device");
         return;
     }
-    ESP_LOGI(TAG, "[FT6336G] Step 2: Device added successfully");
+    LCD_TOUCH_LOGI("[FT6336G] Step 2: Device added successfully");
 
     vTaskDelay(pdMS_TO_TICKS(30));
 
@@ -277,30 +289,30 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
     
     if(ret == ESP_OK && chipId == 0x36)
     {
-        ESP_LOGI(TAG, "[FT6336G] Step 3: Chip ID verified (0x%02X)", chipId);
+        LCD_TOUCH_LOGI("[FT6336G] Step 3: Chip ID verified (0x%02X)", chipId);
     }
     else
     {
-        ESP_LOGW(TAG, "[FT6336G] Step 3: Chip ID = 0x%02X (continuing...)", chipId);
+        LCD_TOUCH_LOGW("[FT6336G] Step 3: Chip ID = 0x%02X (continuing...)", chipId);
     }
 
-    ESP_LOGI(TAG, "[FT6336G] Step 4: Configuring registers...");
+    LCD_TOUCH_LOGI("[FT6336G] Step 4: Configuring registers...");
     ret = I2c_Write_Reg(Ft6336I2cHandle, LCD_TOUCH_FT6336G_REG_G_MODE, 0x01);
     if(ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "[FT6336G] Error: Failed to write G_MODE register (%s)", esp_err_to_name(ret));
+        LCD_TOUCH_LOGE("[FT6336G] Error: Failed to write G_MODE register (%s)", esp_err_to_name(ret));
         return;
     }
 
     ret = I2c_Write_Reg(Ft6336I2cHandle, LCD_TOUCH_FT6336G_REG_PWR_MODE, 0x00);
     if(ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "[FT6336G] Warning: Failed to write PWR_MODE register (%s)", esp_err_to_name(ret));
+        LCD_TOUCH_LOGW("[FT6336G] Warning: Failed to write PWR_MODE register (%s)", esp_err_to_name(ret));
     }
-    ESP_LOGI(TAG, "[FT6336G] Step 4: Registers configured successfully");
+    LCD_TOUCH_LOGI("[FT6336G] Step 4: Registers configured successfully");
 
 #if LCD_TOUCH_FT6336_INT >= 0
-    ESP_LOGI(TAG, "[FT6336G] Step 5: Setting up interrupt (GPIO%d)...", LCD_TOUCH_FT6336_INT);
+    LCD_TOUCH_LOGI("[FT6336G] Step 5: Setting up interrupt (GPIO%d)...", LCD_TOUCH_FT6336_INT);
 
     gpio_install_isr_service(0);
 
@@ -314,17 +326,17 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
 
     gpio_isr_handler_add((gpio_num_t)LCD_TOUCH_FT6336_INT, LCD_TOUCH_FT6336G_Int_Isr_Handler, NULL);
     gpio_intr_enable((gpio_num_t)LCD_TOUCH_FT6336_INT);
-    ESP_LOGI(TAG, "[FT6336G] Step 5: Interrupt configured (falling edge)");
+    LCD_TOUCH_LOGI("[FT6336G] Step 5: Interrupt configured (falling edge)");
 #else
-    ESP_LOGI(TAG, "[FT6336G] Step 5: INT not wired, polling every 20ms");
+    LCD_TOUCH_LOGI("[FT6336G] Step 5: INT not wired, polling every 20ms");
 #endif
 
-    ESP_LOGI(TAG, "[FT6336G] Step 6: Creating touch processing task...");
+    LCD_TOUCH_LOGI("[FT6336G] Step 6: Creating touch processing task...");
     /* FT6336G 只做 I2C 轮询 + 快照缓存（栈上仅 6B 缓冲），2KB 足够 */
     xTaskCreatePinnedToCore(LCD_TOUCH_FT6336G_Process_Task, "Touch_Task", 2048, NULL, 3, &TouchTaskHandle, 0);
-    ESP_LOGI(TAG, "[FT6336G] Step 6: Task created (Core 0, Priority 3)");
+    LCD_TOUCH_LOGI("[FT6336G] Step 6: Task created (Core 0, Priority 3)");
 
-    ESP_LOGI(TAG, "[FT6336G] Initialization complete!");
+    LCD_TOUCH_LOGI("[FT6336G] Initialization complete!");
 }
 
 /**
@@ -343,7 +355,7 @@ void LCD_Write_Cmd(uint8_t cmd)
     WRITE_CMD_TO_SET_RS();
     if (Spi_Transmit(LcdSpiHandle, &cmd, 1) != ESP_OK)
     {
-        ESP_LOGE(TAG, "write cmd 0x%02X failed", cmd);
+        LCD_TOUCH_LOGE("write cmd 0x%02X failed", cmd);
     }
 }
 
@@ -364,7 +376,7 @@ void LCD_Write_Data(uint8_t data)
     WRITE_DATA_TO_SET_RS();
     if (Spi_Transmit(LcdSpiHandle, &data, 1) != ESP_OK)
     {
-        ESP_LOGE(TAG, "write data 0x%02X failed", data);
+        LCD_TOUCH_LOGE("write data 0x%02X failed", data);
     }
 }
 
@@ -390,7 +402,7 @@ void LCD_Write_Data_16Bit(uint16_t data)
     WRITE_DATA_TO_SET_RS();
     if (Spi_Transmit_16Bit(LcdSpiHandle, data) != ESP_OK)
     {
-        ESP_LOGE(TAG, "write data 0x%04X failed", data);
+        LCD_TOUCH_LOGE("write data 0x%04X failed", data);
     }
 }
 
@@ -571,7 +583,7 @@ void LCD_Write_PixelData(const uint16_t *data, uint32_t pixelCount)
     WRITE_DATA_TO_SET_RS();
     if (Spi_Transmit(LcdSpiHandle, (const uint8_t *)data, pixelCount * 2) != ESP_OK)
     {
-        ESP_LOGE(TAG, "write %lu pixels failed", (unsigned long)pixelCount);
+        LCD_TOUCH_LOGE("write %lu pixels failed", (unsigned long)pixelCount);
     }
 }
 
@@ -750,7 +762,7 @@ void LCD_TOUCH_Init(i2c_master_bus_handle_t i2cBusHandle)
     LCD_Write_Cmd(ILI9341_DISPON);
     vTaskDelay(pdMS_TO_TICKS(10));  // 等待10ms确保显示稳定
 
-    ESP_LOGI(TAG, "LCD initialized successfully");
+    LCD_TOUCH_LOGI("LCD initialized successfully");
 
     LCD_TOUCH_FT6336G_Init(i2cBusHandle);
 }
@@ -967,14 +979,14 @@ static void Lcd_Test_Draw_Touch_Block(uint16_t x, uint16_t y, uint16_t color)
  */
 void Lcd_Touch_Test(void)
 {
-    ESP_LOGI(TAG, "=== LCD + Touch Test Start ===");
+    LCD_TOUCH_LOGI("=== LCD + Touch Test Start ===");
 
     i2c_master_bus_handle_t i2cBus = NULL;
     esp_err_t err = I2c_Init_Bus(I2C_PORT, (gpio_num_t)I2C_SDA_GPIO,
                                  (gpio_num_t)I2C_SCL_GPIO, I2C_FREQ, &i2cBus);
     if (err != ESP_OK || i2cBus == NULL)
     {
-        ESP_LOGE(TAG, "I2C bus init failed: %s", esp_err_to_name(err));
+        LCD_TOUCH_LOGE("I2C bus init failed: %s", esp_err_to_name(err));
         return;
     }
 
@@ -1001,7 +1013,7 @@ void Lcd_Touch_Test(void)
         {
             if (pressed)
             {
-                ESP_LOGI(TAG, "Touch pressed: x=%u y=%u",
+                LCD_TOUCH_LOGI("Touch pressed: x=%u y=%u",
                          (unsigned)tp.touchX, (unsigned)tp.touchY);
                 snprintf(line, sizeof(line), "TOUCH:%3u,%3u",
                          (unsigned)tp.touchX, (unsigned)tp.touchY);
@@ -1009,7 +1021,7 @@ void Lcd_Touch_Test(void)
             }
             else
             {
-                ESP_LOGI(TAG, "Touch released");
+                LCD_TOUCH_LOGI("Touch released");
                 snprintf(line, sizeof(line), "TOUCH: --,--");
             }
             Lcd_Test_Draw_String(20, 120, line, colorOk, colorBg, 2);

@@ -21,6 +21,9 @@
 #ifndef __CALL_PHONE_H__
 #define __CALL_PHONE_H__
 
+/* ======================== 是否打开语音通话模块调试打印 ======================== */
+#define CALL_PHONE_DEBUG_LOGS    (1)
+
 #include "esp_err.h"
 #include "microphone.h"
 #include "bt_audio.h"

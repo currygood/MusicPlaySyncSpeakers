@@ -18,4 +18,6 @@ idf_component_register(
     INCLUDE_DIRS ${MID_INCLUDE_DIRS}
     # Middlewares 的传感器通常需要调用 BSP 层的底层通信逻辑
     REQUIRES esp_driver_i2c esp_driver_i2s esp_driver_spi esp_driver_gpio
-) 
+    # spi_driver 会话预算/防饿死需要 esp_timer 时间戳
+    PRIV_REQUIRES esp_timer
+)

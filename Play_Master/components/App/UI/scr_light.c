@@ -14,8 +14,6 @@
 #include "esp_log.h"
 #include <string.h>
 
-static const char *TAG = "UI";
-
 typedef struct {
     const char *name_cn;     /* 卡片名 */
     const char *name_en;     /* 灯控协议灯名 */
@@ -94,7 +92,7 @@ static void sw_click_cb(lv_event_t *e)
                                            card->name_en);
         lv_label_set_text(card->state_lbl, "等待回执…");
         lv_obj_set_style_text_color(card->state_lbl, UI_COLOR_ACCENT, 0);
-        ESP_LOGI(TAG, "light %s(%s) -> light_control_send(%s): %s",
+        UI_LOGI( "light %s(%s) -> light_control_send(%s): %s",
                  card->name_cn, card->name_en,
                  wantOn ? "LIGHT_CMD_ON" : "LIGHT_CMD_OFF",
                  esp_err_to_name(ret));
@@ -103,10 +101,24 @@ static void sw_click_cb(lv_event_t *e)
     {
         /* 第八阶段占位：本地演示态 + 日志（LightControl 第七阶段已实现，
          * app_main 传入句柄后本分支自动不再进入） */
-        ESP_LOGI(TAG, "[占位] 灯控 %s %s -> TODO: light_control_send(LIGHT_CMD_%s, \"%s\")",
+        UI_LOGI( "[占位] 灯控 %s %s -> TODO: light_control_send(LIGHT_CMD_%s, \"%s\")",
                  card->name_cn, wantOn ? "ON" : "OFF",
                  wantOn ? "ON" : "OFF", card->name_en);
         light_card_apply(card, wantOn ? LIGHT_STATE_ON : LIGHT_STATE_OFF);
+    }
+}
+
+/** 兼容性告警：状态文本改为“版本不兼容”，图标/开关保持不可用语义 */
+static void scr_light_card_incompatible(light_card_t *card)
+{
+    if (card->state_lbl != NULL)
+    {
+        lv_label_set_text(card->state_lbl, "版本不兼容");
+        lv_obj_set_style_text_color(card->state_lbl, UI_COLOR_ERR, 0);
+    }
+    if (card->icon_lbl != NULL)
+    {
+        lv_obj_set_style_text_color(card->icon_lbl, UI_COLOR_ERR, 0);
     }
 }
 
@@ -114,23 +126,36 @@ void scr_light_apply_event(const light_event_t *evt)
 {
     int i;
 
+    /* 协议不兼容（对端固件版本更高，常见于 OTA 只升了一台）：
+     * 与具体某盏灯无关，直接在对应卡片上提示，交由用户升级固件对齐版本 */
+    if (evt->id == LIGHT_EVT_INCOMPATIBLE)
+    {
+        for (i = 0; i < 2; i++)
+        {
+            scr_light_card_incompatible(&s_cards[i]);
+        }
+        UI_LOGW( "灯控协议不兼容：对端 version=%lu，请对齐两端固件版本",
+                 (unsigned long)evt->data.peer_version);
+        return;
+    }
+
     for (i = 0; i < 2; i++)
     {
         if (strcmp(s_cards[i].name_en, evt->data.light) == 0)
         {
             const char *id = (evt->id == LIGHT_EVT_ACK)    ? "ACK"    :
                              (evt->id == LIGHT_EVT_STATUS) ? "STATUS" : "ERROR";
-            ESP_LOGI(TAG, "light evt %s: %s ok=%d", id, evt->data.light, evt->data.ok);
+            UI_LOGI( "light evt %s: %s ok=%d", id, evt->data.light, evt->data.ok);
             light_card_apply(&s_cards[i], evt->data.state);
             if (evt->id == LIGHT_EVT_ERROR)
             {
-                ESP_LOGW(TAG, "light %s: 回执异常/状态上报超时 -> 状态回落未知",
+                UI_LOGW( "light %s: 回执异常/状态上报超时 -> 状态回落未知",
                          evt->data.light);
             }
             return;
         }
     }
-    ESP_LOGW(TAG, "light evt: unknown light \"%s\"", evt->data.light);
+    UI_LOGW( "light evt: unknown light \"%s\"", evt->data.light);
 }
 
 /* ======================== 页面构建 ======================== */

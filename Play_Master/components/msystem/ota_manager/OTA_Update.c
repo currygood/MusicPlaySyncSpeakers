@@ -34,7 +34,18 @@
 #include "cJSON.h"
 #include "psa/crypto.h"
 
+#if OTA_UPDATE_DEBUG_LOGS
 #define TAG "OTA_UPDATE"
+#define OTA_UPDATE_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define OTA_UPDATE_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define OTA_UPDATE_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#define OTA_UPDATE_LOGD(...) ESP_LOGD(TAG, __VA_ARGS__)
+#else
+#define OTA_UPDATE_LOGE(...) do { } while (0)
+#define OTA_UPDATE_LOGW(...) do { } while (0)
+#define OTA_UPDATE_LOGI(...) do { } while (0)
+#define OTA_UPDATE_LOGD(...) do { } while (0)
+#endif
 
 /** /ota/check JSON 响应接收缓冲区大小 */
 #define OTA_CHECK_BUF_SIZE       1024
@@ -150,7 +161,7 @@ static bool ota_load_check_url_from_nvs(char *buf, size_t buf_size)
     esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &handle);
     if (err != ESP_OK)
     {
-        ESP_LOGD(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        OTA_UPDATE_LOGD( "NVS open failed: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -160,7 +171,7 @@ static bool ota_load_check_url_from_nvs(char *buf, size_t buf_size)
 
     if (err != ESP_OK || len == 0 || buf[0] == '\0')
     {
-        ESP_LOGD(TAG, "OTA URL not found in NVS: %s", esp_err_to_name(err));
+        OTA_UPDATE_LOGD( "OTA URL not found in NVS: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -379,14 +390,14 @@ static esp_err_t ota_http_get_to_buffer(const char *url, uint32_t timeout_ms,
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL)
     {
-        ESP_LOGE(TAG, "esp_http_client_init failed");
+        OTA_UPDATE_LOGE( "esp_http_client_init failed");
         return ESP_FAIL;
     }
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
+        OTA_UPDATE_LOGE( "HTTP open failed: %s", esp_err_to_name(err));
         goto cleanup;
     }
 
@@ -395,14 +406,14 @@ static esp_err_t ota_http_get_to_buffer(const char *url, uint32_t timeout_ms,
 
     if (*out_status != 200)
     {
-        ESP_LOGE(TAG, "HTTP status error: %d", *out_status);
+        OTA_UPDATE_LOGE( "HTTP status error: %d", *out_status);
         err = ESP_FAIL;
         goto cleanup;
     }
 
     if (content_length >= 0 && (size_t)content_length >= buf_size)
     {
-        ESP_LOGE(TAG, "Response too large: %d bytes, buffer=%u", content_length, (unsigned)buf_size);
+        OTA_UPDATE_LOGE( "Response too large: %d bytes, buffer=%u", content_length, (unsigned)buf_size);
         err = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -413,7 +424,7 @@ static esp_err_t ota_http_get_to_buffer(const char *url, uint32_t timeout_ms,
         int read_len = esp_http_client_read(client, buf + total, (int)(buf_size - 1 - total));
         if (read_len < 0)
         {
-            ESP_LOGE(TAG, "HTTP read failed: %d", read_len);
+            OTA_UPDATE_LOGE( "HTTP read failed: %d", read_len);
             err = ESP_FAIL;
             goto cleanup;
         }
@@ -448,7 +459,7 @@ static esp_err_t ota_parse_check_response(const char *buf, ota_update_meta_t *me
     cJSON *root = cJSON_Parse(buf);
     if (root == NULL)
     {
-        ESP_LOGE(TAG, "Invalid JSON: %s", buf);
+        OTA_UPDATE_LOGE( "Invalid JSON: %s", buf);
         return ESP_FAIL;
     }
 
@@ -468,7 +479,7 @@ static esp_err_t ota_parse_check_response(const char *buf, ota_update_meta_t *me
     }
     else
     {
-        ESP_LOGE(TAG, "Missing version/sha256/url in response");
+        OTA_UPDATE_LOGE( "Missing version/sha256/url in response");
     }
 
     cJSON_Delete(root);
@@ -527,7 +538,7 @@ static esp_err_t ota_http_event_handler(esp_http_client_event_t *evt)
             break;
 
         case HTTP_EVENT_ERROR:
-            ESP_LOGE(TAG, "HTTP download error");
+            OTA_UPDATE_LOGE( "HTTP download error");
             break;
 
         default:
@@ -547,7 +558,7 @@ static esp_err_t ota_download_and_apply(const ota_update_meta_t *meta)
     dl_ctx.sha_op = psa_hash_operation_init();
     if (psa_hash_setup(&dl_ctx.sha_op, PSA_ALG_SHA_256) != PSA_SUCCESS)
     {
-        ESP_LOGE(TAG, "psa_hash_setup(SHA-256) failed");
+        OTA_UPDATE_LOGE( "psa_hash_setup(SHA-256) failed");
         return ESP_FAIL;
     }
 
@@ -570,14 +581,14 @@ static esp_err_t ota_download_and_apply(const ota_update_meta_t *meta)
     esp_err_t err = esp_https_ota_begin(&ota_config, &handle);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "esp_https_ota_begin failed: %s", esp_err_to_name(err));
+        OTA_UPDATE_LOGE( "esp_https_ota_begin failed: %s", esp_err_to_name(err));
         return err;
     }
 
     int image_size = esp_https_ota_get_image_size(handle);
     if (image_size > 0)
     {
-        ESP_LOGI(TAG, "OTA image size: %d bytes", image_size);
+        OTA_UPDATE_LOGI( "OTA image size: %d bytes", image_size);
     }
 
     ota_notify(OTA_UPDATE_EVT_DOWNLOAD_STARTED, 0, 0);
@@ -615,7 +626,7 @@ static esp_err_t ota_download_and_apply(const ota_update_meta_t *meta)
 
     if (err != ESP_OK || !esp_https_ota_is_complete_data_received(handle))
     {
-        ESP_LOGE(TAG, "OTA download incomplete, err=%s", esp_err_to_name(err));
+        OTA_UPDATE_LOGE( "OTA download incomplete, err=%s", esp_err_to_name(err));
         psa_hash_abort(&dl_ctx.sha_op);
         esp_https_ota_abort(handle);
         return (err == ESP_OK) ? ESP_FAIL : err;
@@ -625,7 +636,7 @@ static esp_err_t ota_download_and_apply(const ota_update_meta_t *meta)
     size_t computed_hash_len = 0;
     if (psa_hash_finish(&dl_ctx.sha_op, computed_hash, sizeof(computed_hash), &computed_hash_len) != PSA_SUCCESS)
     {
-        ESP_LOGE(TAG, "psa_hash_finish(SHA-256) failed");
+        OTA_UPDATE_LOGE( "psa_hash_finish(SHA-256) failed");
         esp_https_ota_abort(handle);
         return ESP_FAIL;
     }
@@ -637,27 +648,27 @@ static esp_err_t ota_download_and_apply(const ota_update_meta_t *meta)
 
         if (!ota_sha256_equal(computed_hex, meta->sha256))
         {
-            ESP_LOGE(TAG, "SHA256 mismatch: expected=%s computed=%s", meta->sha256, computed_hex);
+            OTA_UPDATE_LOGE( "SHA256 mismatch: expected=%s computed=%s", meta->sha256, computed_hex);
             esp_https_ota_abort(handle);
             return ESP_ERR_INVALID_RESPONSE;
         }
 
-        ESP_LOGI(TAG, "SHA256 verification passed: %s", computed_hex);
+        OTA_UPDATE_LOGI( "SHA256 verification passed: %s", computed_hex);
     }
     else
     {
-        ESP_LOGW(TAG, "Server did not provide sha256, skipping verification");
+        OTA_UPDATE_LOGW( "Server did not provide sha256, skipping verification");
     }
 
     err = esp_https_ota_finish(handle);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "esp_https_ota_finish failed: %s", esp_err_to_name(err));
+        OTA_UPDATE_LOGE( "esp_https_ota_finish failed: %s", esp_err_to_name(err));
         return err;
     }
 
     ota_notify(OTA_UPDATE_EVT_DOWNLOAD_FINISHED, 100, 0);
-    ESP_LOGI(TAG, "OTA firmware downloaded and validated");
+    OTA_UPDATE_LOGI( "OTA firmware downloaded and validated");
     return ESP_OK;
 }
 
@@ -677,7 +688,7 @@ static esp_err_t ota_check_and_upgrade(void)
     esp_err_t err = ota_check_for_update(&remote, &http_status);
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "OTA check failed: %s", esp_err_to_name(err));
+        OTA_UPDATE_LOGW( "OTA check failed: %s", esp_err_to_name(err));
         ota_notify(OTA_UPDATE_EVT_ABORTED, -1, http_status);
         return err;
     }
@@ -690,30 +701,30 @@ static esp_err_t ota_check_and_upgrade(void)
     ota_str_copy(local_version, sizeof(local_version), s_rt.local_version);
     ota_unlock();
 
-    ESP_LOGI(TAG, "Remote firmware: version=%s, sha256=%s, url=%s",
+    OTA_UPDATE_LOGI( "Remote firmware: version=%s, sha256=%s, url=%s",
              remote.version, remote.sha256, remote.url);
 
     int cmp = ota_compare_versions(local_version, remote.version);
     if (cmp >= 0)
     {
-        ESP_LOGI(TAG, "Firmware is up to date (local=%s remote=%s)", local_version, remote.version);
+        OTA_UPDATE_LOGI( "Firmware is up to date (local=%s remote=%s)", local_version, remote.version);
         ota_notify(OTA_UPDATE_EVT_UP_TO_DATE, -1, http_status);
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "New firmware available: %s -> %s", local_version, remote.version);
+    OTA_UPDATE_LOGI( "New firmware available: %s -> %s", local_version, remote.version);
     ota_notify(OTA_UPDATE_EVT_UPDATE_AVAILABLE, -1, http_status);
 
     err = ota_download_and_apply(&remote);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "OTA download/apply failed: %s", esp_err_to_name(err));
+        OTA_UPDATE_LOGE( "OTA download/apply failed: %s", esp_err_to_name(err));
         ota_notify(OTA_UPDATE_EVT_ABORTED, -1, 0);
         return err;
     }
 
     ota_notify(OTA_UPDATE_EVT_READY_TO_REBOOT, 100, 0);
-    ESP_LOGI(TAG, "OTA success, rebooting ...");
+    OTA_UPDATE_LOGI( "OTA success, rebooting ...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
 
@@ -724,7 +735,7 @@ static esp_err_t ota_check_and_upgrade(void)
 
 static void ota_update_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "OTA background task started");
+    OTA_UPDATE_LOGI( "OTA background task started");
 
     for (;;)
     {
@@ -732,11 +743,11 @@ static void ota_update_task(void *pvParameters)
 
         if (err == ESP_OK)
         {
-            ESP_LOGI(TAG, "OTA check finished, retry after %d ms", OTA_RETRY_INTERVAL_MS);
+            OTA_UPDATE_LOGI( "OTA check finished, retry after %d ms", OTA_RETRY_INTERVAL_MS);
         }
         else
         {
-            ESP_LOGI(TAG, "OTA check error 0x%x, retry after %d ms", err, OTA_RETRY_INTERVAL_MS);
+            OTA_UPDATE_LOGI( "OTA check error 0x%x, retry after %d ms", err, OTA_RETRY_INTERVAL_MS);
         }
 
         vTaskDelay(pdMS_TO_TICKS(OTA_RETRY_INTERVAL_MS));
@@ -766,7 +777,7 @@ esp_err_t OTA_Update_Init(const ota_update_config_t *cfg)
     }
     else if (ota_load_check_url_from_nvs(s_rt.check_url, sizeof(s_rt.check_url)))
     {
-        ESP_LOGI(TAG, "OTA check_url loaded from NVS");
+        OTA_UPDATE_LOGI( "OTA check_url loaded from NVS");
     }
     else
     {
@@ -792,7 +803,7 @@ esp_err_t OTA_Update_Init(const ota_update_config_t *cfg)
 
     ota_unlock();
 
-    ESP_LOGI(TAG, "OTA module initialized: check_url=%s local_version=%s",
+    OTA_UPDATE_LOGI( "OTA module initialized: check_url=%s local_version=%s",
              s_rt.check_url, s_rt.local_version);
     return ESP_OK;
 }
@@ -827,7 +838,7 @@ esp_err_t OTA_Update_Start(void)
                                  OTA_TASK_PRIORITY, NULL, 0);
     if (ret != pdPASS)
     {
-        ESP_LOGE(TAG, "Failed to create OTA task");
+        OTA_UPDATE_LOGE( "Failed to create OTA task");
         return ESP_FAIL;
     }
 
@@ -891,7 +902,7 @@ esp_err_t OTA_Update_CheckAndUpgrade(void)
                                  OTA_TASK_PRIORITY, NULL, 0);
     if (ret != pdPASS)
     {
-        ESP_LOGE(TAG, "Failed to create OTA sync task");
+        OTA_UPDATE_LOGE( "Failed to create OTA sync task");
         ota_lock();
         s_rt.busy = false;
         ota_unlock();
@@ -924,18 +935,18 @@ esp_err_t OTA_Update_MarkAppValid(void)
         err = esp_ota_mark_app_valid_cancel_rollback();
         if (err == ESP_OK)
         {
-            ESP_LOGI(TAG, "App marked valid, rollback cancelled");
+            OTA_UPDATE_LOGI( "App marked valid, rollback cancelled");
         }
         else
         {
-            ESP_LOGE(TAG, "Failed to mark app valid: %s", esp_err_to_name(err));
+            OTA_UPDATE_LOGE( "Failed to mark app valid: %s", esp_err_to_name(err));
         }
         return err;
     }
 
     return ESP_OK;
 #else
-    ESP_LOGD(TAG, "Bootloader app rollback is disabled, skip marking app valid");
+    OTA_UPDATE_LOGD( "Bootloader app rollback is disabled, skip marking app valid");
     return ESP_OK;
 #endif
 }

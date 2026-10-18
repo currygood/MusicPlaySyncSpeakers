@@ -19,6 +19,8 @@
 #ifndef __BT_AUDIO_H__
 #define __BT_AUDIO_H__
 
+/* ======================== 是否打开蓝牙音频模块调试打印 ======================== */
+#define BT_AUDIO_DEBUG_LOGS    (false)
 
 #include <stdbool.h>
 #include <stddef.h>

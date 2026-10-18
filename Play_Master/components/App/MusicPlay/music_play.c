@@ -57,7 +57,16 @@
 
 /* ======================== 模块常量 ======================================== */
 
+#if MUSIC_PLAY_DEBUG_LOGS
 #define TAG "MusicPlay"
+#define MUSIC_PLAY_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define MUSIC_PLAY_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define MUSIC_PLAY_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define MUSIC_PLAY_LOGE(...) do { } while (0)
+#define MUSIC_PLAY_LOGW(...) do { } while (0)
+#define MUSIC_PLAY_LOGI(...) do { } while (0)
+#endif
 
 /** MusicPlay_Task（设计任务表：优先级 9 / 栈 4096 / Core 1） */
 #define MP_TASK_NAME          "MusicPlay_Task"
@@ -233,7 +242,7 @@ static void Sync_Start(music_play_handle_t h, uint16_t stream_id,
     if (sync_protocol_master_start(stream_id, sample_rate, channels) == ESP_OK)
     {
         h->sync_started = true;
-        ESP_LOGI(TAG, "sync start: stream=%u %luHz %uch",
+        MUSIC_PLAY_LOGI( "sync start: stream=%u %luHz %uch",
                  stream_id, (unsigned long)sample_rate, channels);
     }
 }
@@ -246,7 +255,7 @@ static void Sync_Stop(music_play_handle_t h)
     }
     sync_protocol_master_stop();
     h->sync_started = false;
-    ESP_LOGI(TAG, "sync stop");
+    MUSIC_PLAY_LOGI( "sync stop");
 }
 
 static void Sync_Pause(music_play_handle_t h)
@@ -364,7 +373,8 @@ static void Music_Set_Mode_Msg(music_play_handle_t h, music_play_mode_t mode)
 
 /* ---------------- 本地源解码回调 ---------------- */
 
-/** 本地 MP3 解码 PCM → sync_protocol（仅本地播放态时推送，非阻塞丢帧由协议负责） */
+/** 本地 MP3 解码 PCM → sync_protocol（仅本地播放态推送；播放中协议做
+ *  ≤30ms 背压保证编解码不被抢占拖垮，暂停/停止态非阻塞丢帧） */
 static void Music_Dec_Pcm_Cb(const int16_t *pcm, size_t samples,
                              uint32_t sample_rate, uint8_t channels,
                              void *user_ctx)
@@ -429,7 +439,7 @@ static void Music_Start_Local_Track(music_play_handle_t h, uint16_t index)
 
     if (h->track_count == 0 || index >= h->track_count)
     {
-        ESP_LOGE(TAG, "local start: bad index %u (count=%u)",
+        MUSIC_PLAY_LOGE( "local start: bad index %u (count=%u)",
                  index, h->track_count);
         return;
     }
@@ -451,11 +461,11 @@ static void Music_Start_Local_Track(music_play_handle_t h, uint16_t index)
     h->dec = audio_decoder_open(h->tracks[index].path, &dcfg);
     if (h->dec == NULL)
     {
-        ESP_LOGE(TAG, "open failed: %s", h->tracks[index].path);
+        MUSIC_PLAY_LOGE( "open failed: %s", h->tracks[index].path);
         Music_On_Local_Error(h);
         return;
     }
-    ESP_LOGI(TAG, "open track[%u]: %s", index, h->tracks[index].display_name);
+    MUSIC_PLAY_LOGI( "open track[%u]: %s", index, h->tracks[index].display_name);
 }
 
 /** 暂停本地源（解码器挂起 + sync 暂停，位置保持） */
@@ -782,7 +792,7 @@ static void Music_Cmd_BT(music_play_handle_t h, music_cmd_t cmd)
 
     if (bt_audio_send_ctrl_cmd(h->cfg.bt_audio, bcmd) != ESP_OK)
     {
-        ESP_LOGW(TAG, "bt ctrl cmd %d failed", (int)bcmd);
+        MUSIC_PLAY_LOGW( "bt ctrl cmd %d failed", (int)bcmd);
         xSemaphoreTake(h->lock, portMAX_DELAY);
         h->view.pending_cmd = false;
         xSemaphoreGive(h->lock);
@@ -810,7 +820,7 @@ static void Music_Cmd_Local(music_play_handle_t h, music_cmd_t cmd)
             }
             else
             {
-                ESP_LOGW(TAG, "local play: empty playlist, scan first");
+                MUSIC_PLAY_LOGW( "local play: empty playlist, scan first");
             }
         }
         break;
@@ -832,7 +842,7 @@ static void Music_Cmd_Local(music_play_handle_t h, music_cmd_t cmd)
         }
         else
         {
-            ESP_LOGW(TAG, "local toggle: empty playlist");
+            MUSIC_PLAY_LOGW( "local toggle: empty playlist");
         }
         break;
 
@@ -932,7 +942,7 @@ static void Music_Poll_Source(music_play_handle_t h)
 
     if (bt_audio_get_a2dp_info(h->cfg.bt_audio, &info) != ESP_OK)
     {
-        ESP_LOGW(TAG, "poll: bt_audio_get_a2dp_info failed");
+        MUSIC_PLAY_LOGW( "poll: bt_audio_get_a2dp_info failed");
         Music_Emit(h, MUSIC_EVT_ERROR);
         return;
     }
@@ -940,7 +950,7 @@ static void Music_Poll_Source(music_play_handle_t h)
     want = info.connected ? MUSIC_SOURCE_BT : MUSIC_SOURCE_LOCAL;
     if (want != h->view.source)
     {
-        ESP_LOGI(TAG, "auto switch: a2dp %s -> source %s",
+        MUSIC_PLAY_LOGI( "auto switch: a2dp %s -> source %s",
                  info.connected ? "connected" : "disconnected",
                  (want == MUSIC_SOURCE_BT) ? "BT" : "LOCAL");
         Music_Switch_Source_Msg(h, want);
@@ -958,13 +968,13 @@ static void Music_Scan_Local_Msg(music_play_handle_t h)
 
     if (!SD_Card_Is_Mounted())
     {
-        ESP_LOGW(TAG, "scan: sd not mounted");
+        MUSIC_PLAY_LOGW( "scan: sd not mounted");
         goto done;
     }
     dir = opendir(MP_MUSIC_DIR);
     if (dir == NULL)
     {
-        ESP_LOGW(TAG, "scan: open %s failed", MP_MUSIC_DIR);
+        MUSIC_PLAY_LOGW( "scan: open %s failed", MP_MUSIC_DIR);
         goto done;
     }
     while ((ent = readdir(dir)) != NULL)
@@ -996,7 +1006,7 @@ static void Music_Scan_Local_Msg(music_play_handle_t h)
             music_track_t *nb = realloc(tracks, ncap * sizeof(*nb));
             if (nb == NULL)
             {
-                ESP_LOGE(TAG, "scan: realloc fail at %u", count);
+                MUSIC_PLAY_LOGE( "scan: realloc fail at %u", count);
                 break;
             }
             tracks = nb;
@@ -1058,7 +1068,7 @@ done:
     h->view.track_count = count;
     xSemaphoreGive(h->lock);
 
-    ESP_LOGI(TAG, "scan: %u tracks under %s", count, MP_MUSIC_DIR);
+    MUSIC_PLAY_LOGI( "scan: %u tracks under %s", count, MP_MUSIC_DIR);
     Music_Emit(h, MUSIC_EVT_PLAYLIST_CHANGED);
     Music_Publish_View(h);
 }
@@ -1094,7 +1104,7 @@ static void Music_Handle_Msg(music_play_handle_t h, const music_msg_t *msg)
         }
         else
         {
-            ESP_LOGW(TAG, "cmd before source selected");
+            MUSIC_PLAY_LOGW( "cmd before source selected");
         }
         break;
 
@@ -1131,7 +1141,7 @@ static void Music_Handle_Msg(music_play_handle_t h, const music_msg_t *msg)
         }
         else
         {
-            ESP_LOGW(TAG, "select: bad index %u (count=%u)",
+            MUSIC_PLAY_LOGW( "select: bad index %u (count=%u)",
                      msg->u.track_index, h->track_count);
         }
         break;
@@ -1159,13 +1169,13 @@ static void Music_Handle_Msg(music_play_handle_t h, const music_msg_t *msg)
                 h->view.track = &h->tracks[h->view.track_index];
                 xSemaphoreGive(h->lock);
             }
-            ESP_LOGI(TAG, "READY: %luHz/%uch dur=%lums",
+            MUSIC_PLAY_LOGI( "READY: %luHz/%uch dur=%lums",
                      (unsigned long)msg->u.dec.info.sample_rate,
                      msg->u.dec.info.channels,
                      (unsigned long)msg->u.dec.info.duration_ms);
             if (msg->u.dec.info.sample_rate != MP_SAMPLE_RATE_44100)
             {
-                ESP_LOGW(TAG, "track is %luHz, full-chain is 44.1kHz",
+                MUSIC_PLAY_LOGW( "track is %luHz, full-chain is 44.1kHz",
                          (unsigned long)msg->u.dec.info.sample_rate);
             }
             Sync_Start(h, MP_STREAM_ID_LOCAL, msg->u.dec.info.sample_rate,
@@ -1205,7 +1215,7 @@ static void Music_Play_Task(void *arg)
     music_play_handle_t h = arg;
     music_msg_t msg;
 
-    ESP_LOGI(TAG, "task started");
+    MUSIC_PLAY_LOGI( "task started");
     for (;;)
     {
         if (xQueueReceive(h->cmd_q, &msg, pdMS_TO_TICKS(50)) == pdTRUE)
@@ -1218,7 +1228,7 @@ static void Music_Play_Task(void *arg)
         }
         Music_Poll_Source(h);   /* 自动源选择：每 tick 检查，内部按 source_poll_ms 限频 */
     }
-    ESP_LOGI(TAG, "task exit");
+    MUSIC_PLAY_LOGI( "task exit");
     xSemaphoreGive(h->destroy_done);
     vTaskDelete(NULL);
 }
@@ -1237,7 +1247,7 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
     if (cfg == NULL || cfg->bt_audio == NULL ||
         cfg->audio_chan == NULL || cfg->control_chan == NULL)
     {
-        ESP_LOGE(TAG, "create: invalid cfg (need bt_audio + 2 mcast chan)");
+        MUSIC_PLAY_LOGE( "create: invalid cfg (need bt_audio + 2 mcast chan)");
         return NULL;
     }
 
@@ -1245,7 +1255,7 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
     h = heap_caps_calloc(1, sizeof(*h), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (h == NULL)
     {
-        ESP_LOGE(TAG, "create: no mem");
+        MUSIC_PLAY_LOGE( "create: no mem");
         return NULL;
     }
     h->cfg       = *cfg;
@@ -1260,7 +1270,7 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
                                            MALLOC_CAP_SPIRAM);
     if (h->lock == NULL || h->destroy_done == NULL || h->cmd_q == NULL)
     {
-        ESP_LOGE(TAG, "create: queue/sem create failed: free=%u largest=%u",
+        MUSIC_PLAY_LOGE( "create: queue/sem create failed: free=%u largest=%u",
                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         goto fail;
@@ -1305,11 +1315,11 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
     if (sync_protocol_master_init(&scfg) == ESP_OK)
     {
         h->sync_ok = true;
-        ESP_LOGI(TAG, "sync_protocol inited (D=%u ms)", delay_ms);
+        MUSIC_PLAY_LOGI( "sync_protocol inited (D=%u ms)", delay_ms);
     }
     else
     {
-        ESP_LOGE(TAG, "sync_protocol_master_init failed, sync disabled");
+        MUSIC_PLAY_LOGE( "sync_protocol_master_init failed, sync disabled");
     }
 
     audio_decoder_init();   /* 解码注册表：可重复调用 */
@@ -1317,11 +1327,11 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
     if (xTaskCreatePinnedToCore(Music_Play_Task, MP_TASK_NAME, MP_TASK_STACK, h,
                                 MP_TASK_PRIO, &h->task, MP_TASK_CORE) != pdPASS)
     {
-        ESP_LOGE(TAG, "create: task create failed");
+        MUSIC_PLAY_LOGE( "create: task create failed");
         goto fail;
     }
 
-    ESP_LOGI(TAG, "created (vol=%u mode=%u)", volume, mode);
+    MUSIC_PLAY_LOGI( "created (vol=%u mode=%u)", volume, mode);
     return h;
 
 fail:
@@ -1359,12 +1369,12 @@ esp_err_t music_play_destroy(music_play_handle_t player)
     if (xQueueSend(player->cmd_q, &msg, pdMS_TO_TICKS(MP_QUEUE_TIMEOUT_MS))
             != pdTRUE)
     {
-        ESP_LOGE(TAG, "destroy: queue send timeout");
+        MUSIC_PLAY_LOGE( "destroy: queue send timeout");
         return ESP_ERR_TIMEOUT;
     }
     if (xSemaphoreTake(player->destroy_done, pdMS_TO_TICKS(3000)) != pdTRUE)
     {
-        ESP_LOGW(TAG, "destroy: task exit timeout");
+        MUSIC_PLAY_LOGW( "destroy: task exit timeout");
     }
 
     if (player->dec != NULL)
@@ -1384,7 +1394,7 @@ esp_err_t music_play_destroy(music_play_handle_t player)
         free(player->tracks);
     }
     heap_caps_free(player);
-    ESP_LOGI(TAG, "destroyed");
+    MUSIC_PLAY_LOGI( "destroyed");
     return ESP_OK;
 }
 
@@ -1400,7 +1410,7 @@ esp_err_t music_play_set_source(music_play_handle_t player,
     if (source != MUSIC_SOURCE_BT && source != MUSIC_SOURCE_LOCAL)
     {
         /* 源参数非法：发 ERROR 事件（Music_Emit 内部先锁后回调，可跨线程调用） */
-        ESP_LOGW(TAG, "set_source: invalid source %d", (int)source);
+        MUSIC_PLAY_LOGW( "set_source: invalid source %d", (int)source);
         Music_Emit(player, MUSIC_EVT_ERROR);
         return ESP_ERR_INVALID_ARG;
     }

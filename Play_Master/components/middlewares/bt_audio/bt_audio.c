@@ -44,6 +44,18 @@
 
 #define TAG "bt_audio"
 
+#if BT_AUDIO_DEBUG_LOGS
+#define BT_AUDIO_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define BT_AUDIO_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define BT_AUDIO_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#define BT_AUDIO_LOGD(...) ESP_LOGD(TAG, __VA_ARGS__)
+#else
+#define BT_AUDIO_LOGE(...) do { } while (0)
+#define BT_AUDIO_LOGW(...) do { } while (0)
+#define BT_AUDIO_LOGI(...) do { } while (0)
+#define BT_AUDIO_LOGD(...) do { } while (0)
+#endif
+
 /* ======================== 默认参数 ============================================ */
 
 /** A2DP PCM FIFO 默认大小（cfg->a2dp_fifo_bytes 为 0 时使用） */
@@ -331,7 +343,7 @@ static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len)
     if (sent != len)
     {
         s_bt_audio.dropped_pcm += (uint32_t)(len - sent);
-        ESP_LOGW(TAG, "A2DP FIFO overflow, drop %u bytes", (unsigned)(len - sent));
+        BT_AUDIO_LOGW("A2DP FIFO overflow, drop %u bytes", (unsigned)(len - sent));
     }
 }
 
@@ -358,7 +370,7 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             memcpy(s_bt_audio.remote_addr, param->conn_stat.remote_bda, 6);
             BT_AUDIO_UNLOCK();
 
-            ESP_LOGI(TAG, "A2DP connected");
+            BT_AUDIO_LOGI("A2DP connected");
         }
         else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED)
         {
@@ -372,7 +384,7 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             memset(s_bt_audio.remote_addr, 0, sizeof(s_bt_audio.remote_addr));
             BT_AUDIO_UNLOCK();
 
-            ESP_LOGI(TAG, "A2DP disconnected");
+            BT_AUDIO_LOGI("A2DP disconnected");
         }
         else
         {
@@ -392,13 +404,13 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         {
             evt.id = BT_AUDIO_EVT_A2DP_STREAM_STARTED;
             s_bt_audio.stream_started = true;
-            ESP_LOGI(TAG, "A2DP stream started");
+            BT_AUDIO_LOGI("A2DP stream started");
         }
         else if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_SUSPEND)
         {
             evt.id = BT_AUDIO_EVT_A2DP_STREAM_STOPPED;
             s_bt_audio.stream_started = false;
-            ESP_LOGI(TAG, "A2DP stream stopped");
+            BT_AUDIO_LOGI("A2DP stream stopped");
         }
         else
         {
@@ -430,7 +442,7 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         memcpy(evt.remote_addr, param->audio_cfg.remote_bda, 6);
         bt_audio_post_event(&evt);
 
-        ESP_LOGI(TAG, "A2DP audio cfg: rate=%" PRIu32 " Hz, ch=%" PRIu8 ", bits=16", rate, ch);
+        BT_AUDIO_LOGI("A2DP audio cfg: rate=%" PRIu32 " Hz, ch=%" PRIu8 ", bits=16", rate, ch);
         break;
     }
 
@@ -463,7 +475,7 @@ static void bt_hfp_data_recv_cb(const uint8_t *data, uint32_t length)
     if (sent != length)
     {
         s_bt_audio.hfp_dn_dropped += (uint32_t)(length - sent);
-        ESP_LOGW(TAG, "HFP downlink FIFO overflow, drop %u bytes", (unsigned)(length - sent));
+        BT_AUDIO_LOGW("HFP downlink FIFO overflow, drop %u bytes", (unsigned)(length - sent));
     }
 
     /* 关键：协议栈只有收到 CI_SCO_DATA 事件才拉取上行数据。
@@ -536,7 +548,7 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
             evt.id = BT_AUDIO_EVT_HFP_CONNECTED;
             memcpy(evt.remote_addr, param->conn_stat.remote_bda, 6);
             bt_audio_post_event(&evt);
-            ESP_LOGI(TAG, "HFP SLC connected");
+            BT_AUDIO_LOGI("HFP SLC connected");
         }
         else if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED)
         {
@@ -550,7 +562,7 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
             evt.id = BT_AUDIO_EVT_HFP_DISCONNECTED;
             memcpy(evt.remote_addr, param->conn_stat.remote_bda, 6);
             bt_audio_post_event(&evt);
-            ESP_LOGI(TAG, "HFP SLC disconnected");
+            BT_AUDIO_LOGI("HFP SLC disconnected");
         }
         break;
     }
@@ -589,7 +601,7 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
             memcpy(evt.remote_addr, param->audio_stat.remote_bda, 6);
             evt.data.sample_rate = bt_audio_hfp_sco_rate();
             bt_audio_post_event(&evt);
-            ESP_LOGI(TAG, "HFP SCO open (%s, %" PRIu32 " Hz, frame=%u B)",
+            BT_AUDIO_LOGI("HFP SCO open (%s, %" PRIu32 " Hz, frame=%u B)",
                      s_bt_audio.hfp_msbsbc ? "mSBC" : "CVSD",
                      bt_audio_hfp_sco_rate(), param->audio_stat.preferred_frame_size);
         }
@@ -615,13 +627,13 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
             evt.id = BT_AUDIO_EVT_HFP_AUDIO_CLOSE;
             memcpy(evt.remote_addr, param->audio_stat.remote_bda, 6);
             bt_audio_post_event(&evt);
-            ESP_LOGI(TAG, "HFP SCO closed");
+            BT_AUDIO_LOGI("HFP SCO closed");
         }
         break;
     }
 
     case ESP_HF_CLIENT_BVRA_EVT:
-        ESP_LOGI(TAG, "HFP voice recognition %s",
+        BT_AUDIO_LOGI("HFP voice recognition %s",
                  param->bvra.value == ESP_HF_VR_STATE_ENABLED ? "ENABLED" : "DISABLED");
         break;
 
@@ -641,7 +653,7 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
              * 期间 AG 常上报 +VGS=1（归一化后 6%）；若直接跟随，功放会被压到几乎
              * 无声，而用户按的是媒体音量键、怎么调都恢复不了（第十阶段问题复现）。
              * HFP 下行（语音助手/通话）响度统一由本机音量决定，这里只记录。 */
-            ESP_LOGI(TAG, "HFP +VGS=%u (0~15) -> %u%% (recorded only, local volume kept)",
+            BT_AUDIO_LOGI("HFP +VGS=%u (0~15) -> %u%% (recorded only, local volume kept)",
                      (unsigned)v015, (unsigned)v100);
         }
         break;
@@ -658,7 +670,7 @@ static void bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     switch (event)
     {
     case ESP_BT_GAP_AUTH_CMPL_EVT:
-        ESP_LOGI(TAG, "pair %s (%02x:%02x:%02x)",
+        BT_AUDIO_LOGI("pair %s (%02x:%02x:%02x)",
                  (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) ? "success" : "failed",
                  param->auth_cmpl.bda[0], param->auth_cmpl.bda[1], param->auth_cmpl.bda[2]);
         break;
@@ -666,7 +678,7 @@ static void bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     case ESP_BT_GAP_CFM_REQ_EVT:
         /* 测试阶段自动确认；后续可改为 UI 弹窗确认 */
         esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
-        ESP_LOGI(TAG, "SSP confirm auto-accept");
+        BT_AUDIO_LOGI("SSP confirm auto-accept");
         break;
 
     case ESP_BT_GAP_KEY_REQ_EVT:
@@ -675,12 +687,12 @@ static void bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
         esp_bt_pin_code_t pin_code = {0};
         memcpy(pin_code, BT_PIN_CODE, strlen(BT_PIN_CODE));
         esp_bt_gap_pin_reply(param->key_req.bda, true, strlen(BT_PIN_CODE), pin_code);
-        ESP_LOGI(TAG, "PIN reply: %s", BT_PIN_CODE);
+        BT_AUDIO_LOGI("PIN reply: %s", BT_PIN_CODE);
         break;
     }
 
     case ESP_BT_GAP_KEY_NOTIF_EVT:
-        ESP_LOGI(TAG, "PASSKEY: %" PRIu32, param->key_notif.passkey);
+        BT_AUDIO_LOGI("PASSKEY: %" PRIu32, param->key_notif.passkey);
         break;
 
     default:
@@ -794,7 +806,7 @@ static void bt_audio_avrc_set_volume_local(uint8_t avrc_raw)
     evt.data.volume = vol100;
     bt_audio_post_event(&evt);
 
-    ESP_LOGI(TAG, "AVRCP abs vol %u (0~127) -> %u%% (media volume, applied)",
+    BT_AUDIO_LOGI("AVRCP abs vol %u (0~127) -> %u%% (media volume, applied)",
              (unsigned)avrc_raw, (unsigned)vol100);
 }
 
@@ -867,7 +879,7 @@ static void bt_audio_avrc_meta_handle(uint8_t attr_id, const uint8_t *text, int 
     evt.data.track_info = s_bt_audio.track_info;
     BT_AUDIO_UNLOCK();
     bt_audio_post_event(&evt);
-    ESP_LOGD(TAG, "AVRCP meta attr 0x%02x len %d", attr_id, len);
+    BT_AUDIO_LOGD("AVRCP meta attr 0x%02x len %d", attr_id, len);
 }
 
 /** AVRCP 控制器回调：协议栈上下文，只更新内部状态并投递事件 */
@@ -887,7 +899,7 @@ static void bt_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
 
             /* 先取手机端能力（按支持程度注册通知） */
             esp_avrc_ct_send_get_rn_capabilities_cmd(bt_audio_avrc_alloc_tl());
-            ESP_LOGI(TAG, "AVRCP connected");
+            BT_AUDIO_LOGI("AVRCP connected");
         }
         else
         {
@@ -901,7 +913,7 @@ static void bt_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             s_bt_audio.play_pos_valid      = false;
             memset(&s_bt_audio.track_info, 0, sizeof(s_bt_audio.track_info));
             BT_AUDIO_UNLOCK();
-            ESP_LOGI(TAG, "AVRCP disconnected");
+            BT_AUDIO_LOGI("AVRCP disconnected");
         }
         break;
     }
@@ -1019,11 +1031,11 @@ static void bt_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         break;
 
     case ESP_AVRC_CT_REMOTE_FEATURES_EVT:
-        ESP_LOGD(TAG, "AVRCP remote features: 0x%" PRIx32, param->rmt_feats.feat_mask);
+        BT_AUDIO_LOGD("AVRCP remote features: 0x%" PRIx32, param->rmt_feats.feat_mask);
         break;
 
     case ESP_AVRC_CT_PASSTHROUGH_RSP_EVT:
-        ESP_LOGD(TAG, "AVRCP pth rsp: key 0x%x rsp %d",
+        BT_AUDIO_LOGD("AVRCP pth rsp: key 0x%x rsp %d",
                  param->psth_rsp.key_code, param->psth_rsp.rsp_code);
         break;
 
@@ -1056,7 +1068,7 @@ static void bt_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *
             memset(&s_bt_audio.track_info, 0, sizeof(s_bt_audio.track_info));
         }
         BT_AUDIO_UNLOCK();
-        ESP_LOGI(TAG, "AVRCP TG %s", param->conn_stat.connected ? "connected" : "disconnected");
+        BT_AUDIO_LOGI("AVRCP TG %s", param->conn_stat.connected ? "connected" : "disconnected");
         break;
 
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
@@ -1068,12 +1080,12 @@ static void bt_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *
         /* 手机通过透传键控制音箱（暂仅记录，后续可映射事件） */
         if (param->psth_cmd.key_state == ESP_AVRC_PT_CMD_STATE_PRESSED)
         {
-            ESP_LOGD(TAG, "AVRCP TG pth key 0x%x", param->psth_cmd.key_code);
+            BT_AUDIO_LOGD("AVRCP TG pth key 0x%x", param->psth_cmd.key_code);
         }
         break;
 
     case ESP_AVRC_TG_REMOTE_FEATURES_EVT:
-        ESP_LOGD(TAG, "AVRCP TG remote features: 0x%" PRIx32, param->rmt_feats.feat_mask);
+        BT_AUDIO_LOGD("AVRCP TG remote features: 0x%" PRIx32, param->rmt_feats.feat_mask);
         break;
 
     case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
@@ -1093,7 +1105,7 @@ static StreamBufferHandle_t bt_audio_sbuf_create(size_t bytes,
     uint8_t *buf = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buf == NULL)
     {
-        ESP_LOGE(TAG, "PSRAM alloc %u bytes failed", (unsigned)bytes);
+        BT_AUDIO_LOGE("PSRAM alloc %u bytes failed", (unsigned)bytes);
         return NULL;
     }
 
@@ -1101,7 +1113,7 @@ static StreamBufferHandle_t bt_audio_sbuf_create(size_t bytes,
     if (h == NULL)
     {
         heap_caps_free(buf);
-        ESP_LOGE(TAG, "stream buffer create failed");
+        BT_AUDIO_LOGE("stream buffer create failed");
         return NULL;
     }
     *buf_out = buf;
@@ -1189,7 +1201,7 @@ bt_audio_handle_t bt_audio_create(const bt_audio_cfg_t *cfg)
 {
     if (s_bt_audio.task != NULL)
     {
-        ESP_LOGW(TAG, "bt_audio already created");
+        BT_AUDIO_LOGW("bt_audio already created");
         return &s_bt_audio;
     }
 
@@ -1227,7 +1239,7 @@ bt_audio_handle_t bt_audio_create(const bt_audio_cfg_t *cfg)
     s_bt_audio.lock = xSemaphoreCreateMutex();
     if (s_bt_audio.lock == NULL)
     {
-        ESP_LOGE(TAG, "create mutex failed");
+        BT_AUDIO_LOGE("create mutex failed");
         return NULL;
     }
     s_bt_audio.hfp_audio_sem = xSemaphoreCreateBinary();
@@ -1235,14 +1247,14 @@ bt_audio_handle_t bt_audio_create(const bt_audio_cfg_t *cfg)
     {
         vSemaphoreDelete(s_bt_audio.lock);
         s_bt_audio.lock = NULL;
-        ESP_LOGE(TAG, "create hfp audio sem failed");
+        BT_AUDIO_LOGE("create hfp audio sem failed");
         return NULL;
     }
 
 
     s_bt_audio.volume = 80;
 
-    ESP_LOGI(TAG, "bt_audio created, device=\"%s\"", s_bt_audio.device_name);
+    BT_AUDIO_LOGI("bt_audio created, device=\"%s\"", s_bt_audio.device_name);
     return &s_bt_audio;
 }
 
@@ -1252,7 +1264,7 @@ esp_err_t bt_audio_destroy(bt_audio_handle_t audio)
 
     if (s_bt_audio.task != NULL)
     {
-        ESP_LOGW(TAG, "destroy: call bt_audio_stop first");
+        BT_AUDIO_LOGW("destroy: call bt_audio_stop first");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1319,7 +1331,7 @@ esp_err_t bt_audio_destroy(bt_audio_handle_t audio)
     }
 
     memset(&s_bt_audio, 0, sizeof(s_bt_audio));
-    ESP_LOGI(TAG, "bt_audio destroyed");
+    BT_AUDIO_LOGI("bt_audio destroyed");
     return ESP_OK;
 }
 
@@ -1327,7 +1339,7 @@ esp_err_t bt_audio_destroy(bt_audio_handle_t audio)
 /** 临时诊断：打印内部/PSRAM 堆占用（定位 WiFi+BT 初始化各阶段内存消耗，联调完删除） */
 static void bt_audio_heap_dump(const char *stage)
 {
-    ESP_LOGI(TAG, "[heap] %s: int free=%u largest=%u, psram free=%u",
+    BT_AUDIO_LOGI("[heap] %s: int free=%u largest=%u, psram free=%u",
              stage,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -1349,7 +1361,7 @@ static esp_err_t bt_stack_init(void)
     }
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "nvs init failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGE("nvs init failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -1358,13 +1370,13 @@ static esp_err_t bt_stack_init(void)
     err = esp_bt_controller_init(&bt_cfg);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "controller init failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGE("controller init failed: %s", esp_err_to_name(err));
         return err;
     }
     err = esp_bt_controller_enable(BT_AUDIO_CTRL_MODE);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "controller enable failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGE("controller enable failed: %s", esp_err_to_name(err));
         return err;
     }
     bt_audio_heap_dump("after controller enable");
@@ -1373,13 +1385,13 @@ static esp_err_t bt_stack_init(void)
     err = esp_bluedroid_init();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "bluedroid init failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGE("bluedroid init failed: %s", esp_err_to_name(err));
         return err;
     }
     err = esp_bluedroid_enable();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "bluedroid enable failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGE("bluedroid enable failed: %s", esp_err_to_name(err));
         return err;
     }
     bt_audio_heap_dump("after bluedroid enable");
@@ -1389,14 +1401,14 @@ static esp_err_t bt_stack_init(void)
     err = esp_avrc_ct_init();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "avrc ct init failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGE("avrc ct init failed: %s", esp_err_to_name(err));
         return err;
     }
     esp_avrc_ct_register_callback(bt_avrc_cb);
     err = esp_avrc_tg_init();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "avrc tg init failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGE("avrc tg init failed: %s", esp_err_to_name(err));
         return err;
     }
     esp_avrc_tg_register_callback(bt_avrc_tg_cb);
@@ -1405,7 +1417,7 @@ static esp_err_t bt_stack_init(void)
     err = esp_a2d_sink_init();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "a2dp sink init failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGE("a2dp sink init failed: %s", esp_err_to_name(err));
         return err;
     }
     esp_a2d_register_callback(bt_a2dp_cb);
@@ -1416,7 +1428,7 @@ static esp_err_t bt_stack_init(void)
     err = esp_hf_client_init();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "hfp client init failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGE("hfp client init failed: %s", esp_err_to_name(err));
         return err;
     }
     esp_hf_client_register_callback(bt_hfp_cb);
@@ -1466,7 +1478,7 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
                                                    &s_bt_audio.pcm_fifo_buf);
         if (s_bt_audio.pcm_fifo == NULL)
         {
-            ESP_LOGE(TAG, "pcm fifo create failed");
+            BT_AUDIO_LOGE("pcm fifo create failed");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1491,7 +1503,7 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
             {
                 vStreamBufferDelete(s_bt_audio.pcm_fifo);
                 s_bt_audio.pcm_fifo = NULL;
-                ESP_LOGE(TAG, "evt queue storage alloc failed");
+                BT_AUDIO_LOGE("evt queue storage alloc failed");
                 return ESP_ERR_NO_MEM;
             }
         }
@@ -1501,7 +1513,7 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
         {
             vStreamBufferDelete(s_bt_audio.pcm_fifo);
             s_bt_audio.pcm_fifo = NULL;
-            ESP_LOGE(TAG, "evt queue create failed");
+            BT_AUDIO_LOGE("evt queue create failed");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1519,7 +1531,7 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
                                                       &s_bt_audio.hfp_up_fifo_buf);
         if (s_bt_audio.hfp_up_fifo == NULL)
         {
-            ESP_LOGE(TAG, "hfp up fifo create failed");
+            BT_AUDIO_LOGE("hfp up fifo create failed");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1535,7 +1547,7 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
                                                       &s_bt_audio.hfp_dn_fifo_buf);
         if (s_bt_audio.hfp_dn_fifo == NULL)
         {
-            ESP_LOGE(TAG, "hfp dn fifo create failed");
+            BT_AUDIO_LOGE("hfp dn fifo create failed");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1555,7 +1567,7 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
         }
         if (s_bt_audio.task_pcm_buf == NULL)
         {
-            ESP_LOGE(TAG, "task pcm buf alloc failed");
+            BT_AUDIO_LOGE("task pcm buf alloc failed");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1570,7 +1582,7 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
         }
         if (s_bt_audio.task_hfp_dn_raw == NULL)
         {
-            ESP_LOGE(TAG, "task hfp dn buf alloc failed");
+            BT_AUDIO_LOGE("task hfp dn buf alloc failed");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1588,7 +1600,7 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
         if (s_bt_audio.hfp_up_fifo_buf != NULL) { heap_caps_free(s_bt_audio.hfp_up_fifo_buf); s_bt_audio.hfp_up_fifo_buf = NULL; }
         if (s_bt_audio.hfp_dn_fifo != NULL) { vStreamBufferDelete(s_bt_audio.hfp_dn_fifo); s_bt_audio.hfp_dn_fifo = NULL; }
         if (s_bt_audio.hfp_dn_fifo_buf != NULL) { heap_caps_free(s_bt_audio.hfp_dn_fifo_buf); s_bt_audio.hfp_dn_fifo_buf = NULL; }
-        ESP_LOGE(TAG, "task create failed: internal free=%u largest=%u",
+        BT_AUDIO_LOGE("task create failed: internal free=%u largest=%u",
                heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         return ESP_ERR_NO_MEM;
@@ -1596,7 +1608,7 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
 
     /* 可被发现 / 可连接 */
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-    ESP_LOGI(TAG, "bt_audio started, discoverable ON");
+    BT_AUDIO_LOGI("bt_audio started, discoverable ON");
     return ESP_OK;
 }
 
@@ -1637,7 +1649,7 @@ esp_err_t bt_audio_stop(bt_audio_handle_t audio)
     vTaskDelete(s_bt_audio.task);
     s_bt_audio.task = NULL;
 
-    ESP_LOGI(TAG, "bt_audio stopped");
+    BT_AUDIO_LOGI("bt_audio stopped");
     return ESP_OK;
 }
 
@@ -1710,7 +1722,7 @@ esp_err_t bt_audio_hfp_start_voice(bt_audio_handle_t audio)
     }
     if (!s_bt_audio.hfp_connected)
     {
-        ESP_LOGW(TAG, "hfp_start_voice: HFP SLC not connected");
+        BT_AUDIO_LOGW("hfp_start_voice: HFP SLC not connected");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1718,7 +1730,7 @@ esp_err_t bt_audio_hfp_start_voice(bt_audio_handle_t audio)
     err = esp_hf_client_start_voice_recognition();
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "start voice recognition failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGW("start voice recognition failed: %s", esp_err_to_name(err));
     }
     return err;
 }
@@ -1741,7 +1753,7 @@ esp_err_t bt_audio_hfp_stop_voice(bt_audio_handle_t audio)
     err = esp_hf_client_stop_voice_recognition();
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "stop voice recognition failed: %s", esp_err_to_name(err));
+        BT_AUDIO_LOGW("stop voice recognition failed: %s", esp_err_to_name(err));
     }
 
     /* 手机助手结束对话后通常自动断开 SCO；这里再主动请求一次以确保释放 */
@@ -1926,7 +1938,7 @@ esp_err_t bt_audio_set_volume(bt_audio_handle_t audio, uint8_t volume)
             bt_audio_avrc_alloc_tl(), BT_VOL_LOCAL_TO_AVRC(volume));
         if (err != ESP_OK)
         {
-            ESP_LOGW(TAG, "send abs volume failed: %s", esp_err_to_name(err));
+            BT_AUDIO_LOGW("send abs volume failed: %s", esp_err_to_name(err));
         }
     }
     return ESP_OK;

@@ -36,6 +36,16 @@
 /** 日志标签 */
 #define TAG "I2S_PHY"
 
+#if I2S_DRIVER_DEBUG_LOGS
+#define I2S_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define I2S_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define I2S_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define I2S_LOGE(...) do { } while (0)
+#define I2S_LOGW(...) do { } while (0)
+#define I2S_LOGI(...) do { } while (0)
+#endif
+
 /**
  * @brief 句柄魔数，用于校验非法/悬空句柄
  *
@@ -105,12 +115,12 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
     /* TX 必须有数据输出脚，RX 必须有数据输入脚 */
     if (is_tx && (pin_cfg->dout < 0))
     {
-        ESP_LOGE(TAG, "TX bus requires a valid dout pin");
+        I2S_LOGE("TX bus requires a valid dout pin");
         return ESP_ERR_INVALID_ARG;
     }
     if (!is_tx && (pin_cfg->din < 0))
     {
-        ESP_LOGE(TAG, "RX bus requires a valid din pin");
+        I2S_LOGE("RX bus requires a valid din pin");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -144,7 +154,7 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
     esp_err_t ret = i2s_new_channel(&chan_cfg, tx_handle, rx_handle);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(ret));
+        I2S_LOGE("i2s_new_channel failed: %s", esp_err_to_name(ret));
         free(bus);
         return ret;
     }
@@ -177,7 +187,7 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
     ret = i2s_channel_init_std_mode(bus->chan, &std_cfg);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(ret));
+        I2S_LOGE("i2s_channel_init_std_mode failed: %s", esp_err_to_name(ret));
         i2s_del_channel(bus->chan);
         free(bus);
         return ret;
@@ -225,7 +235,7 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
             ret = i2s_channel_preload_data(bus->chan, preload_zero, preload_chunk, &loaded);
             if (ret != ESP_OK)
             {
-                ESP_LOGE(TAG, "i2s_channel_preload_data failed: %s", esp_err_to_name(ret));
+                I2S_LOGE("i2s_channel_preload_data failed: %s", esp_err_to_name(ret));
                 free(preload_zero);
                 i2s_del_channel(bus->chan);
                 free(bus);
@@ -238,7 +248,7 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
     ret = i2s_channel_enable(bus->chan);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "i2s_channel_enable failed: %s", esp_err_to_name(ret));
+        I2S_LOGE("i2s_channel_enable failed: %s", esp_err_to_name(ret));
         i2s_del_channel(bus->chan);
         free(bus);
         return ret;
@@ -255,7 +265,7 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
         {
             i2s_ll_dma_enable_auto_write_back(hw, true);
             i2s_ll_dma_enable_eof_on_fifo_empty(hw, true);
-            ESP_LOGI(TAG, "DMA cfg: lc_conf=0x%08" PRIx32 ", dscr_en=%u, tx_start=%u, link_start=%u",
+            I2S_LOGI("DMA cfg: lc_conf=0x%08" PRIx32 ", dscr_en=%u, tx_start=%u, link_start=%u",
                      (uint32_t)hw->lc_conf.val,
                      (uint32_t)hw->fifo_conf.dscr_en,
                      (uint32_t)hw->conf.tx_start,
@@ -264,12 +274,12 @@ esp_err_t i2s_bus_phy_create(i2s_port_t port, bool is_tx,
     }
 #endif
 
-    ESP_LOGI(TAG, "I2S phy created: port=%d, %s, sample_rate=%" PRIu32
+    I2S_LOGI("I2S phy created: port=%d, %s, sample_rate=%" PRIu32
              ", bclk=%d, ws=%d, dout=%d, din=%d",
              (int)port, is_tx ? "TX" : "RX", bus_cfg->sample_rate,
              pin_cfg->bclk, pin_cfg->ws, pin_cfg->dout, pin_cfg->din);
     /* BCLK = 采样率 x 总槽数 x 位宽（STD 帧固定 2 槽；MONO 只影响数据重复不影响时钟） */
-    ESP_LOGI(TAG, "BCLK = %" PRIu32 " Hz (fs=%" PRIu32 " x %dch x %u bit)",
+    I2S_LOGI("BCLK = %" PRIu32 " Hz (fs=%" PRIu32 " x %dch x %u bit)",
              (uint32_t)bus_cfg->sample_rate * 2 * (uint32_t)bus_cfg->bit_width,
              (uint32_t)bus_cfg->sample_rate, 2, (uint32_t)bus_cfg->bit_width);
 
@@ -305,14 +315,14 @@ esp_err_t i2s_bus_phy_write(i2s_bus_handle_t bus, const uint8_t *buffer,
      */
     if (ret == ESP_ERR_TIMEOUT)
     {
-        ESP_LOGW(TAG, "tx timeout, restarting channel and retrying...");
+        I2S_LOGW("tx timeout, restarting channel and retrying...");
         if (i2s_channel_disable(bus->chan) == ESP_OK &&
             i2s_channel_enable(bus->chan) == ESP_OK)
         {
             ret = i2s_channel_write(bus->chan, buffer, size, bytes_written, timeout);
             if (ret == ESP_OK)
             {
-                ESP_LOGW(TAG, "tx recovered after channel restart");
+                I2S_LOGW("tx recovered after channel restart");
             }
         }
     }
@@ -335,7 +345,7 @@ void i2s_bus_phy_debug_dma(i2s_bus_handle_t bus)
     uint32_t eof_addr = 0;
     i2s_ll_tx_get_eof_des_addr(hw, &eof_addr);
     uint32_t intr = (uint32_t)i2s_ll_get_intr_status(hw);
-    ESP_LOGI(TAG, "[dbg] intr=0x%08" PRIx32 " (out_eof=%u) eof_desc=0x%" PRIx32
+    I2S_LOGI("[dbg] intr=0x%08" PRIx32 " (out_eof=%u) eof_desc=0x%" PRIx32
                   " dscr_en=%u tx_start=%u link_start=%u lc_conf=0x%08" PRIx32,
              intr, (uint32_t)((intr & I2S_LL_EVENT_TX_EOF) ? 1 : 0), eof_addr,
              (uint32_t)hw->fifo_conf.dscr_en,
@@ -380,13 +390,13 @@ esp_err_t i2s_bus_phy_flush(i2s_bus_handle_t bus)
     esp_err_t ret = i2s_channel_disable(bus->chan);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "disable failed during flush: %s", esp_err_to_name(ret));
+        I2S_LOGE("disable failed during flush: %s", esp_err_to_name(ret));
         return ret;
     }
     ret = i2s_channel_enable(bus->chan);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "enable failed during flush: %s", esp_err_to_name(ret));
+        I2S_LOGE("enable failed during flush: %s", esp_err_to_name(ret));
         return ret;
     }
     return ESP_OK;
@@ -420,7 +430,7 @@ esp_err_t i2s_bus_phy_set_sample_rate(i2s_bus_handle_t bus, uint32_t sample_rate
     ret = i2s_channel_reconfig_std_clock(bus->chan, &clk_cfg);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "reconfig clock failed: %s", esp_err_to_name(ret));
+        I2S_LOGE("reconfig clock failed: %s", esp_err_to_name(ret));
         i2s_channel_enable(bus->chan);
         return ret;
     }
@@ -429,7 +439,7 @@ esp_err_t i2s_bus_phy_set_sample_rate(i2s_bus_handle_t bus, uint32_t sample_rate
     if (ret == ESP_OK)
     {
         bus->bus_cfg.sample_rate = sample_rate;
-        ESP_LOGI(TAG, "sample rate switched to %u Hz", sample_rate);
+        I2S_LOGI("sample rate switched to %u Hz", sample_rate);
     }
     return ret;
 }
@@ -463,6 +473,6 @@ esp_err_t i2s_bus_phy_destroy(i2s_bus_handle_t bus)
     }
     bus->magic = 0;
     free(bus);
-    ESP_LOGI(TAG, "I2S phy destroyed");
+    I2S_LOGI("I2S phy destroyed");
     return ESP_OK;
 }

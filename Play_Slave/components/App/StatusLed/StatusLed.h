@@ -9,6 +9,8 @@
 #ifndef __STATUS_LED_H__
 #define __STATUS_LED_H__
 
+/* ======================== 是否打开状态 LED 模块调试打印 ======================== */
+#define STATUS_LED_DEBUG_LOGS    (1)
 
 #include "esp_err.h"
 #include "gpio_driver.h"

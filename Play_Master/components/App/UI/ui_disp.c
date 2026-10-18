@@ -30,8 +30,6 @@
 #include <stdio.h>
 #include <string.h>
 
-static const char *TAG = "UI";
-
 /* 渲染缓冲：必须落内部 DMA RAM（LCD 经 SPI DMA 直传），是内部 DRAM 的大头。
  * 40 行 × 320 像素 × 2B = 25.6KB → 16 行 = 10.2KB → 8 行 = 5.1KB；
  * 8 行 ≈ 1/30 屏，整屏多 flush 几次，对本 UI（静态页面为主）足够，
@@ -115,7 +113,7 @@ static void *ui_fs_open_cb(lv_fs_drv_t *drv, const char *path, lv_fs_mode_t mode
     fp = fopen(full, "rb");
     if (fp == NULL)
     {
-        ESP_LOGD(TAG, "img open miss: %s", full);
+        UI_LOGD( "img open miss: %s", full);
         return NULL;
     }
     return (void *)fp;
@@ -185,7 +183,7 @@ static void ui_fs_register(void)
     s_fsDrv.seek_cb = ui_fs_seek_cb;
     s_fsDrv.tell_cb = ui_fs_tell_cb;
     lv_fs_drv_register(&s_fsDrv);
-    ESP_LOGI(TAG, "lv_fs drive 'F:' -> %s/ui_img (flash storage 分区)", UI_IMG_MOUNT_POINT);
+    UI_LOGI( "lv_fs drive 'F:' -> %s/ui_img (flash storage 分区)", UI_IMG_MOUNT_POINT);
 }
 
 /* ======================== 对内服务 ======================== */
@@ -219,6 +217,7 @@ bool ui_img_file_ok(const char *lv_path)
 esp_err_t ui_hw_bringup(void)
 {
     esp_err_t ret;
+    int64_t   t_stage = esp_timer_get_time();
 
     /* 1) 挂载 flash storage 分区（UI 图片随固件烧录，见 main/CMakeLists.txt 的
      *    spiffs_create_partition_image）。挂载失败不阻塞 UI（占位降级）。 */
@@ -232,28 +231,36 @@ esp_err_t ui_hw_bringup(void)
         ret = esp_vfs_spiffs_register(&spiffsCfg);
         if (ret != ESP_OK)
         {
-            ESP_LOGW(TAG, "SPIFFS storage mount failed: %s（UI 图片将使用占位显示；"
+            UI_LOGW( "SPIFFS storage mount failed: %s（UI 图片将使用占位显示；"
                           "请确认 idf.py flash 已烧录分区镜像）", esp_err_to_name(ret));
         }
         else
         {
-            ESP_LOGI(TAG, "SPIFFS storage mounted: %s (partition 'storage')",
+            UI_LOGI( "SPIFFS storage mounted: %s (partition 'storage')",
                      UI_IMG_MOUNT_POINT);
         }
     }
+    UI_LOGI( "stage: spiffs mount %u ms",
+             (unsigned)((esp_timer_get_time() - t_stage) / 1000));
 
     /* 2) I2C 总线（FT6336G 触摸用，引脚宏来自 bsp/i2c_driver.h） */
+    t_stage = esp_timer_get_time();
     ret = I2c_Init_Bus(I2C_PORT, (gpio_num_t)I2C_SDA_GPIO,
                        (gpio_num_t)I2C_SCL_GPIO, I2C_FREQ, &s_i2cBus);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "I2c_Init_Bus failed: %s", esp_err_to_name(ret));
+        UI_LOGE( "I2c_Init_Bus failed: %s", esp_err_to_name(ret));
         return ret;
     }
+    UI_LOGI( "stage: i2c bus %u ms",
+             (unsigned)((esp_timer_get_time() - t_stage) / 1000));
 
     /* 3) LCD + 触摸初始化（内部注册 LCD SPI 设备、创建触摸轮询任务） */
+    t_stage = esp_timer_get_time();
     LCD_TOUCH_Init(s_i2cBus);
-    ESP_LOGI(TAG, "LCD(%dx%d landscape) + FT6336G ready", LCD_WIDTH, LCD_HEIGHT);
+    UI_LOGI( "LCD(%dx%d landscape) + FT6336G ready (%u ms)",
+             LCD_WIDTH, LCD_HEIGHT,
+             (unsigned)((esp_timer_get_time() - t_stage) / 1000));
     return ESP_OK;
 }
 
@@ -273,14 +280,14 @@ esp_err_t ui_lvgl_port_init(void)
     disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
     if (disp == NULL)
     {
-        ESP_LOGE(TAG, "lv_display_create failed");
+        UI_LOGE( "lv_display_create failed");
         return ESP_FAIL;
     }
     lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
     lv_display_set_flush_cb(disp, ui_flush_cb);
 
     /* 渲染缓冲：DMA 可达的内部 RAM（LCD 直传给 SPI DMA） */
-    ESP_LOGI(TAG, "DMA heap before flush buffer: free=%u largest=%u",
+    UI_LOGI( "DMA heap before flush buffer: free=%u largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     while (flushBuf == NULL && rows >= UI_FLUSH_ROWS_MIN)
@@ -294,13 +301,13 @@ esp_err_t ui_lvgl_port_init(void)
     }
     if (flushBuf == NULL)
     {
-        ESP_LOGE(TAG, "DMA flush buffer alloc failed (min=%u bytes, int largest=%u)",
+        UI_LOGE( "DMA flush buffer alloc failed (min=%u bytes, int largest=%u)",
                  (unsigned)(LCD_WIDTH * UI_FLUSH_ROWS_MIN * sizeof(uint16_t)),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
         return ESP_ERR_NO_MEM;
     }
     bufBytes = LCD_WIDTH * rows * sizeof(uint16_t);
-    ESP_LOGI(TAG, "flush buffer: %u rows (%u bytes, DMA internal RAM)",
+    UI_LOGI( "flush buffer: %u rows (%u bytes, DMA internal RAM)",
              (unsigned)rows, (unsigned)bufBytes);
     lv_display_set_buffers(disp, flushBuf, NULL, (uint32_t)bufBytes,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
@@ -309,14 +316,14 @@ esp_err_t ui_lvgl_port_init(void)
     indev = lv_indev_create();
     if (indev == NULL)
     {
-        ESP_LOGE(TAG, "lv_indev_create failed");
+        UI_LOGE( "lv_indev_create failed");
         return ESP_FAIL;
     }
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, ui_touch_read_cb);
     lv_indev_set_display(indev, disp);
 
-    ESP_LOGI(TAG, "LVGL %d.%d.%d ported: display 320x240 RGB565 + FT6336G pointer",
+    UI_LOGI( "LVGL %d.%d.%d ported: display 320x240 RGB565 + FT6336G pointer",
              LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
     return ESP_OK;
 }

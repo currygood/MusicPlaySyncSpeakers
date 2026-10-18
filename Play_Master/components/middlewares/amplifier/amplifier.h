@@ -22,6 +22,9 @@
 #ifndef AMPLIFIER_H
 #define AMPLIFIER_H
 
+/* ======================== 是否打开功放模块调试打印 ======================== */
+#define AMPLIFIER_DEBUG_LOGS    (false)
+
 #include "esp_err.h"
 #include <stdint.h>
 #include <stddef.h>

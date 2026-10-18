@@ -15,15 +15,15 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include <string.h>
-
-static const char *TAG = "UI";
 
 static ui_cfg_t     s_cfg;              /* ui_init 保存的句柄配置（可能全 NULL） */
 static bool         s_inited = false;
 static TaskHandle_t s_taskHandle = NULL;
 static QueueHandle_t s_lightEvtQueue = NULL;   /* 灯控事件队列（深度 8） */
 static QueueHandle_t s_musicEvtQueue = NULL;   /* 播放事件队列（深度 8） */
+static QueueHandle_t s_otaEvtQueue = NULL;     /* OTA 事件队列（深度 4） */
 
 /** 每个页面对应一个独立 screen（切页 = lv_screen_load 整屏重绘，无残影） */
 static lv_obj_t *s_pages[UI_PAGE_COUNT] = {0};
@@ -91,7 +91,7 @@ void ui_nav_goto(ui_page_t page)
     }
     if (lv_screen_active() != s_pages[page])
     {
-        ESP_LOGI(TAG, "nav -> page %d", (int)page);   /* 诊断：与画面切换时刻对照 */
+        UI_LOGI( "nav -> page %d", (int)page);   /* 诊断：与画面切换时刻对照 */
         lv_screen_load(s_pages[page]);     /* 内部已 invalidate 新屏 */
         lv_obj_invalidate(s_pages[page]);  /* 双保险：显式强制整屏重绘 */
     }
@@ -110,7 +110,7 @@ void ui_run(void)
     music_event_t mevt;
 
     s_taskHandle = xTaskGetCurrentTaskHandle();
-    ESP_LOGI(TAG, "UI task running (core=%d, prio=%d, hwm_words=%u)",
+    UI_LOGI( "UI task running (core=%d, prio=%d, hwm_words=%u)",
              (int)xPortGetCoreID(), (int)uxTaskPriorityGet(NULL),
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
@@ -132,6 +132,16 @@ void ui_run(void)
         {
             scr_player_apply_event(&mevt);
             scr_playlist_apply_event(&mevt);
+        }
+
+        /* 排空 OTA 事件队列（ota_sync_task 上下文入队），刷新设置页固件状态 */
+        {
+            ota_update_event_info_t oinfo;
+            while (s_otaEvtQueue != NULL &&
+                   xQueueReceive(s_otaEvtQueue, &oinfo, 0) == pdTRUE)
+            {
+                scr_settings_apply_ota_event(&oinfo);
+            }
         }
 
         lv_timer_handler();
@@ -161,6 +171,16 @@ void ui_on_music_event(const music_event_t *evt, void *user_ctx)
     (void)xQueueSend(s_musicEvtQueue, evt, 0);
 }
 
+void ui_on_ota_event(const ota_update_event_info_t *info)
+{
+    if (info == NULL || s_otaEvtQueue == NULL)
+    {
+        return;
+    }
+    /* ota_sync_task 上下文：只入队，lv_* 留给 UI_Task */
+    (void)xQueueSend(s_otaEvtQueue, info, 0);
+}
+
 /* ======================== 开机显示自检（诊断残影用，定位后置 0 关闭） ======================== */
 
 #define UI_BOOT_SELFTEST  0   /* 自检已确认：面板/flush/字节序正常，关闭省 8s 开机时间 */
@@ -187,17 +207,17 @@ static void ui_boot_selftest(void)
     lv_obj_t *scr = lv_screen_active();   /* 此时尚未创建页面，用默认屏 */
     size_t i;
 
-    ESP_LOGI(TAG, "selftest A1: LCD 直填黑色 2s（应纯黑无内容）");
+    UI_LOGI( "selftest A1: LCD 直填黑色 2s（应纯黑无内容）");
     LCD_Fill_Color(RGB565(0, 0, 0));
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    ESP_LOGI(TAG, "selftest A2: LCD 直填白色 2s（若见黑残影=LCD/硬件层）");
+    UI_LOGI( "selftest A2: LCD 直填白色 2s（若见黑残影=LCD/硬件层）");
     LCD_Fill_Color(RGB565(255, 255, 255));
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     for (i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
     {
-        ESP_LOGI(TAG, "selftest B%u: LVGL 填 %s 2s", (unsigned)(i + 1), seq[i].name);
+        UI_LOGI( "selftest B%u: LVGL 填 %s 2s", (unsigned)(i + 1), seq[i].name);
         lv_obj_set_style_bg_color(scr, lv_color_hex(seq[i].color), 0);
         lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
         lv_obj_invalidate(scr);
@@ -212,10 +232,11 @@ static void ui_boot_selftest(void)
 esp_err_t ui_init(const ui_cfg_t *cfg)
 {
     esp_err_t ret;
+    int64_t   t_stage;
 
     if (s_inited)
     {
-        ESP_LOGW(TAG, "ui already inited");
+        UI_LOGW( "ui already inited");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -227,20 +248,26 @@ esp_err_t ui_init(const ui_cfg_t *cfg)
 
     /* 1) 硬件自举：SD(未挂载时) → I2C 总线 → LCD/触摸。SD 失败不阻塞
      *    （页面降级为占位显示，见 UI 界面设计 8.4 容错矩阵）。 */
+    t_stage = esp_timer_get_time();
     ret = ui_hw_bringup();
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "hw bringup failed: %s", esp_err_to_name(ret));
+        UI_LOGE( "hw bringup failed: %s", esp_err_to_name(ret));
         return ret;
     }
+    UI_LOGI( "stage: hw bringup ok in %u ms",
+             (unsigned)((esp_timer_get_time() - t_stage) / 1000));
 
     /* 2) LVGL 移植：lv_init + tick + lv_fs('F') + 显示/触摸适配 */
+    t_stage = esp_timer_get_time();
     ret = ui_lvgl_port_init();
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "lvgl port init failed: %s", esp_err_to_name(ret));
+        UI_LOGE( "lvgl port init failed: %s", esp_err_to_name(ret));
         return ret;
     }
+    UI_LOGI( "stage: lvgl port ok in %u ms",
+             (unsigned)((esp_timer_get_time() - t_stage) / 1000));
 
     /* 2.5) 开机显示自检：分离 面板/SPI 层 与 LVGL 渲染层（诊断残影，定位后置 0） */
 #if UI_BOOT_SELFTEST
@@ -254,20 +281,21 @@ esp_err_t ui_init(const ui_cfg_t *cfg)
     /* 4) 灯控/播放事件队列（PSRAM：内部 DRAM 留给任务栈与 DMA） */
     s_lightEvtQueue = xQueueCreateWithCaps(8, sizeof(light_event_t), MALLOC_CAP_SPIRAM);
     s_musicEvtQueue = xQueueCreateWithCaps(8, sizeof(music_event_t), MALLOC_CAP_SPIRAM);
+    s_otaEvtQueue   = xQueueCreateWithCaps(4, sizeof(ota_update_event_info_t), MALLOC_CAP_SPIRAM);
     if (s_lightEvtQueue == NULL || s_musicEvtQueue == NULL)
     {
-        ESP_LOGE(TAG, "event queue create failed");
+        UI_LOGE( "event queue create failed");
         return ESP_ERR_NO_MEM;
     }
 
     s_inited = true;
     /* 固件版本标记：串口出现 multi-screen 才说明跑的是多 screen 新固件 */
-    ESP_LOGI(TAG, "ui init ok (multi-screen v2): wifi=%s, light=%s, call_phone=%s, music=%s",
+    UI_LOGI( "ui init ok (multi-screen v2): wifi=%s, light=%s, call_phone=%s, music=%s",
              (s_cfg.wifi       != NULL) ? "wired" : "placeholder",
              (s_cfg.light      != NULL) ? "wired" : "placeholder",
              (s_cfg.call_phone != NULL) ? "wired" : "placeholder",
              (s_cfg.music      != NULL) ? "wired" : "placeholder");
-    ESP_LOGI(TAG, "free heap: internal=%lu B, psram=%lu B",
+    UI_LOGI( "free heap: internal=%lu B, psram=%lu B",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return ESP_OK;
@@ -294,6 +322,11 @@ void ui_deinit(void)
         vQueueDeleteWithCaps(s_musicEvtQueue);
         s_musicEvtQueue = NULL;
     }
+    if (s_otaEvtQueue != NULL)
+    {
+        vQueueDeleteWithCaps(s_otaEvtQueue);
+        s_otaEvtQueue = NULL;
+    }
     s_inited = false;
-    ESP_LOGI(TAG, "ui deinit");
+    UI_LOGI( "ui deinit");
 }

@@ -9,6 +9,9 @@
  *     CMD9 读 CSD 解析容量、CMD17/24 单块读写；
  *   - CS 使用会话手动控制（csManualCtrl + Spi_Device_Acquire/SetCS），
  *     保证“命令 + 响应 + 数据”整段序列 CS 恒定，且上电训练时钟时 CS 为高；
+ *   - 总线仲裁：会话按优先级准入（低于 LCD），在卡内部忙等待与多扇区读写
+ *     边界调用 Spi_Device_Session_Yield_If_Needed 主动让出，让 UI 刷屏
+ *     插入一笔事务（CS 保持低电平，命令序列不中断）；
  *   - FATFS 通过 ff_diskio_register 注册自定义 diskio，再以
  *     esp_vfs_fat_register + f_mount 挂载到 /sdcard。
  *
@@ -35,6 +38,16 @@
 #include <sys/stat.h>
 
 #define TAG "SD_CARD"
+
+#if SD_CARD_DEBUG_LOGS
+#define SD_CARD_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define SD_CARD_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define SD_CARD_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define SD_CARD_LOGE(...) do { } while (0)
+#define SD_CARD_LOGW(...) do { } while (0)
+#define SD_CARD_LOGI(...) do { } while (0)
+#endif
 
 /* ======================== SD SPI 协议常量 ======================================== */
 
@@ -66,6 +79,7 @@ typedef struct
     uint32_t     sector_count;    /* 总扇区数（CSD 解析） */
     uint32_t     sector_size;     /* 扇区字节数（通常 512） */
     bool         high_capacity;   /* TRUE=块寻址（SDHC/SDXC），FALSE=字节寻址（SDSC） */
+    uint32_t     current_freq_hz; /* 当前生效的 SPI 时钟（降级重试用） */
     BYTE         pdrv;            /* FATFS 物理驱动号 */
     FATFS       *fs;              /* esp_vfs_fat_register 分配的 FATFS 结构 */
     bool         mounted;         /* FATFS+VFS 是否已挂载 */
@@ -73,6 +87,9 @@ typedef struct
 } sd_card_ctx_t;
 
 static sd_card_ctx_t Sd;
+
+/** 会话安全点让出总线的前置声明（实现见“会话”小节） */
+static void Sd_Session_Yield(void);
 
 /** 上电自动裸扇区回环诊断开关（调试用）：
  *  0 = 关闭（默认）。SD_Card_Init() 不再自动对引导扇区/FAT 等区域做
@@ -186,6 +203,9 @@ static esp_err_t Sd_Wait_Not_Busy(void)
         }
         if ((i & 0x3FF) == 0)
         {
+            /* 安全点让出总线：卡正在内部忙、总线可给 LCD 用一笔事务。
+             * 非卡忙状态不许让出（CS 已拉低，命令序列中间不可插入其他事务） */
+            Sd_Session_Yield();
             vTaskDelay(pdMS_TO_TICKS(1));   /* 周期性让出 CPU */
         }
     }
@@ -194,17 +214,50 @@ static esp_err_t Sd_Wait_Not_Busy(void)
 
 /* ======================== 会话（bus 占用 + CS 手动） =========================== */
 
-/** 进入设备会话：独占总线，等待调用方手动拉低 CS */
+/** 会话配置：普通优先级 + 默认预算/防饿死（见 spi_driver.h 仲裁说明） */
+#define SD_SESSION_BUDGET_MS     10
+#define SD_SESSION_STARVATION_MS 500
+static const spi_session_cfg_t Sd_SessionCfg = {
+    .priority          = SPI_PRIO_NORMAL,
+    .session_budget_ms = SD_SESSION_BUDGET_MS,
+    .starvation_ms     = SD_SESSION_STARVATION_MS,
+};
+static void *Sd_Session;
+
+/** 进入设备会话：按优先级独占总线，等待调用方手动拉低 CS */
 static esp_err_t Sd_Session_Start(void)
 {
-    return Spi_Device_Acquire(Sd.handle);
+    Sd_Session = Spi_Device_Session_Start(Sd.handle, &Sd_SessionCfg);
+    return (Sd_Session != NULL) ? ESP_OK : ESP_FAIL;
 }
 
 /** 结束设备会话：先拉高 CS 再归还总线 */
 static void Sd_Session_End(void)
 {
     Spi_Device_SetCS(Sd.handle, true);
-    Spi_Device_Release(Sd.handle);
+    Spi_Device_Session_End(Sd_Session);
+    Sd_Session = NULL;
+}
+
+/**
+ * @brief 会话安全点让出总线（供长等待循环与多扇区读写调用）
+ *
+ * 仅当仲裁器判定“有更高优先级设备在等/本段超预算”时才真正让出；
+ * 让出期间 CS 保持低电平，SD 命令序列不中断。
+ */
+static void Sd_Session_Yield(void)
+{
+    if (Sd_Session == NULL)
+    {
+        return;
+    }
+    if (Spi_Device_Session_Yield_If_Needed(Sd_Session))
+    {
+        if (Spi_Device_Session_Yield(Sd_Session) != ESP_OK)
+        {
+            SD_CARD_LOGE("session yield failed");
+        }
+    }
 }
 
 /* ======================== CSD 解析 ============================================== */
@@ -244,7 +297,7 @@ static esp_err_t Sd_Parse_Csd(const uint8_t *csd, uint32_t *out_sectors)
     }
     else
     {
-        ESP_LOGE(TAG, "unknown CSD version %d", csd_ver);
+        SD_CARD_LOGE("unknown CSD version %d", csd_ver);
         return ESP_ERR_NOT_SUPPORTED;
     }
 
@@ -268,10 +321,22 @@ static esp_err_t Sd_Card_Init_Hw(void)
 
     Sd.sector_count = 0;        /* Probing 未完成前不可用 */
 
+    /* 目标时钟可能在 SD_Card_Init 里被降级重试改写：先回到识别时钟
+     * （SD 规范要求初始化命令 <=400kHz），识别完成后再升到目标时钟 */
+    if (Sd.current_freq_hz == 0)
+    {
+        Sd.current_freq_hz = SD_CARD_SPI_FREQ_HZ;
+    }
+    if (Spi_Device_Set_Clock(Sd.handle, SD_CARD_INIT_FREQ_HZ) != ESP_OK)
+    {
+        SD_CARD_LOGE("set init clock failed");
+        return ESP_FAIL;
+    }
+
     esp_err_t err = Sd_Session_Start();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "acquire bus failed: %s", esp_err_to_name(err));
+        SD_CARD_LOGE("acquire bus failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -304,12 +369,12 @@ static esp_err_t Sd_Card_Init_Hw(void)
     }
     if (!idle)
     {
-        ESP_LOGE(TAG, "CMD0 failed: err=%s r1=0x%02X (检查卡座接触/供电/连线)",
+        SD_CARD_LOGE("CMD0 failed: err=%s r1=0x%02X (检查卡座接触/供电/连线)",
                  esp_err_to_name(err), r1);
         Sd_Session_End();
         return ESP_ERR_INVALID_RESPONSE;
     }
-    ESP_LOGI(TAG, "CMD0 OK, card in idle state");
+    SD_CARD_LOGI("CMD0 OK, card in idle state");
 
     /* ④ CMD8 探测 SD v2.0+ */
     err = Sd_Cmd_R1(SD_CMD_8, 0x000001AA, 0x87, &r1);
@@ -319,20 +384,20 @@ static esp_err_t Sd_Card_Init_Hw(void)
         err = Sd_Rx(echo, sizeof(echo));
         if (err != ESP_OK || echo[2] != 0x01 || echo[3] != 0xAA)
         {
-            ESP_LOGE(TAG, "CMD8 echo mismatch: %02X %02X %02X %02X",
+            SD_CARD_LOGE("CMD8 echo mismatch: %02X %02X %02X %02X",
                      echo[0], echo[1], echo[2], echo[3]);
             Sd_Session_End();
             return ESP_ERR_INVALID_RESPONSE;
         }
-        ESP_LOGI(TAG, "SD v2.0+ card detected");
+        SD_CARD_LOGI("SD v2.0+ card detected");
     }
     else if (err == ESP_OK && (r1 & SD_R1_ILLEGAL_CMD))
     {
-        ESP_LOGW(TAG, "SD v1.x card (不支持 CMD8)");
+        SD_CARD_LOGW("SD v1.x card (不支持 CMD8)");
     }
     else
     {
-        ESP_LOGE(TAG, "CMD8 failed: err=%s r1=0x%02X", esp_err_to_name(err), r1);
+        SD_CARD_LOGE("CMD8 failed: err=%s r1=0x%02X", esp_err_to_name(err), r1);
         Sd_Session_End();
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -366,17 +431,17 @@ static esp_err_t Sd_Card_Init_Hw(void)
     }
     if (!ready)
     {
-        ESP_LOGE(TAG, "ACMD41 timeout: err=%s r1=0x%02X", esp_err_to_name(err), r1);
+        SD_CARD_LOGE("ACMD41 timeout: err=%s r1=0x%02X", esp_err_to_name(err), r1);
         Sd_Session_End();
         return ESP_ERR_TIMEOUT;
     }
-    ESP_LOGI(TAG, "ACMD41 ready");
+    SD_CARD_LOGI("ACMD41 ready");
 
     /* ⑥ CMD58 读 OCR：bit30=HCS → 高位容量判别块寻址 */
     err = Sd_Cmd_R1(SD_CMD_58, 0, 0xFF, &r1);
     if (err != ESP_OK || r1 != 0x00)
     {
-        ESP_LOGE(TAG, "CMD58 failed: err=%s r1=0x%02X", esp_err_to_name(err), r1);
+        SD_CARD_LOGE("CMD58 failed: err=%s r1=0x%02X", esp_err_to_name(err), r1);
         Sd_Session_End();
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -384,18 +449,18 @@ static esp_err_t Sd_Card_Init_Hw(void)
     err = Sd_Rx(ocr, sizeof(ocr));
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "CMD58 OCR read failed: %s", esp_err_to_name(err));
+        SD_CARD_LOGE("CMD58 OCR read failed: %s", esp_err_to_name(err));
         Sd_Session_End();
         return err;
     }
     Sd.high_capacity = (ocr[0] & 0x40) != 0;
-    ESP_LOGI(TAG, "OCR: %02X %02X %02X %02X, high-capacity=%d", ocr[0], ocr[1], ocr[2], ocr[3], Sd.high_capacity);
+    SD_CARD_LOGI("OCR: %02X %02X %02X %02X, high-capacity=%d", ocr[0], ocr[1], ocr[2], ocr[3], Sd.high_capacity);
 
     /* ⑧ CMD16 设置块长 512B（400kHz 下配置） */
     err = Sd_Cmd_R1(SD_CMD_16, 512, 0xFF, &r1);
     if (err != ESP_OK || r1 != 0x00)
     {
-        ESP_LOGE(TAG, "CMD16 failed: err=%s r1=0x%02X", esp_err_to_name(err), r1);
+        SD_CARD_LOGE("CMD16 failed: err=%s r1=0x%02X", esp_err_to_name(err), r1);
         Sd_Session_End();
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -404,7 +469,7 @@ static esp_err_t Sd_Card_Init_Hw(void)
     err = Sd_Cmd_R1(SD_CMD_9, 0, 0xFF, &r1);
     if (err != ESP_OK || r1 != 0x00)
     {
-        ESP_LOGE(TAG, "CMD9 failed: err=%s r1=0x%02X", esp_err_to_name(err), r1);
+        SD_CARD_LOGE("CMD9 failed: err=%s r1=0x%02X", esp_err_to_name(err), r1);
         Sd_Session_End();
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -412,7 +477,7 @@ static esp_err_t Sd_Card_Init_Hw(void)
     err = Sd_Wait_Data_Token(&tok);
     if (err != ESP_OK || tok != SD_DATA_TOKEN)
     {
-        ESP_LOGE(TAG, "CSD data token error: err=%s tok=0x%02X", esp_err_to_name(err), tok);
+        SD_CARD_LOGE("CSD data token error: err=%s tok=0x%02X", esp_err_to_name(err), tok);
         Sd_Session_End();
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -420,7 +485,7 @@ static esp_err_t Sd_Card_Init_Hw(void)
     err = Sd_Rx(csd, sizeof(csd));
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "CSD read failed: %s", esp_err_to_name(err));
+        SD_CARD_LOGE("CSD read failed: %s", esp_err_to_name(err));
         Sd_Session_End();
         return err;
     }
@@ -431,25 +496,30 @@ static esp_err_t Sd_Card_Init_Hw(void)
         return err;
     }
     Sd.sector_size = 512;
-    ESP_LOGI(TAG, "SD capacity: %lu MB (%lu sectors)",
+    SD_CARD_LOGI("SD capacity: %lu MB (%lu sectors)",
              (unsigned long)(Sd.sector_count / 2048UL), (unsigned long)Sd.sector_count);
 
     /* 识别 + CSD 已在 400kHz 完成：释放会话后提升时钟 */
     Sd_Session_End();
 
-    err = Spi_Device_Set_Clock(Sd.handle, SD_CARD_SPI_FREQ_HZ);
+    if (Sd.current_freq_hz == 0)
+    {
+        Sd.current_freq_hz = SD_CARD_SPI_FREQ_HZ;
+    }
+    err = Spi_Device_Set_Clock(Sd.handle, (int)Sd.current_freq_hz);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "raise clock failed: %s", esp_err_to_name(err));
+        SD_CARD_LOGE("raise clock failed: %s", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG, "card ready, SPI clock raised to 10MHz");
+    SD_CARD_LOGI("card ready, SPI clock = %lu kHz",
+             (unsigned long)(Sd.current_freq_hz / 1000));
 
     /* 重新开会话并立即结束：后续读写/诊断自行管理会话 */
     err = Sd_Session_Start();
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "acquire bus failed: %s", esp_err_to_name(err));
+        SD_CARD_LOGE("acquire bus failed: %s", esp_err_to_name(err));
         return err;
     }
     Sd_Session_End();
@@ -497,14 +567,14 @@ static esp_err_t Sd_Read_Sector(uint32_t sector, uint8_t *buffer)
         }
         else
         {
-            ESP_LOGE(TAG, "sector %lu read token error: 0x%02X",
+            SD_CARD_LOGE("sector %lu read token error: 0x%02X",
                      (unsigned long)sector, token);
             err = ESP_ERR_INVALID_RESPONSE;
         }
     }
     else
     {
-        ESP_LOGE(TAG, "CMD17(0x%08lX) failed: r1=0x%02X err=%s",
+        SD_CARD_LOGE("CMD17(0x%08lX) failed: r1=0x%02X err=%s",
                  (unsigned long)Sd_Block_Addr(sector), r1, esp_err_to_name(err));
         err = (err == ESP_OK) ? ESP_ERR_INVALID_RESPONSE : err;
     }
@@ -550,14 +620,14 @@ static esp_err_t Sd_Write_Sector(uint32_t sector, const uint8_t *buffer)
             }
             else
             {
-                ESP_LOGE(TAG, "write response: 0x%02X", resp);
+                SD_CARD_LOGE("write response: 0x%02X", resp);
                 err = ESP_ERR_INVALID_RESPONSE;
             }
         }
     }
     else
     {
-        ESP_LOGE(TAG, "CMD24(0x%lx) failed: r1=0x%02X err=%s",
+        SD_CARD_LOGE("CMD24(0x%lx) failed: r1=0x%02X err=%s",
                  (unsigned long)Sd_Block_Addr(sector), r1, esp_err_to_name(err));
         err = (err == ESP_OK) ? ESP_ERR_INVALID_RESPONSE : err;
     }
@@ -578,7 +648,7 @@ static void sd_hex_log(const char *label, uint32_t sector, const uint8_t *data, 
     {
         n += snprintf(line + n, sizeof(line) - n, " %02X", data[i]);
     }
-    ESP_LOGI(TAG, "%s%s", label, line);
+    SD_CARD_LOGI("%s%s", label, line);
 }
 
 /* 定义在本段下方 */
@@ -588,10 +658,10 @@ esp_err_t SD_Card_Diag(void)
 {
     if (Sd.sector_count == 0)
     {
-        ESP_LOGE(TAG, "diag: card not initialized");
+        SD_CARD_LOGE("diag: card not initialized");
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "diag: 多点位扇区回环开始 (total=%lu)",
+    SD_CARD_LOGI("diag: 多点位扇区回环开始 (total=%lu)",
              (unsigned long)Sd.sector_count);
     const uint32_t probes[] = {0, 1, 63, 64, 1000, 40960,
                                Sd.sector_count / 2, Sd.sector_count - 1};
@@ -599,7 +669,8 @@ esp_err_t SD_Card_Diag(void)
     {
         sd_loopback(probes[i]);
     }
-    ESP_LOGI(TAG, "diag: 回环结束");
+    Spi_Dump_Stats();   /* 仲裁观测：持有时长/等待/让出统计（板级调参依据） */
+    SD_CARD_LOGI("diag: 回环结束");
     return ESP_OK;
 }
 
@@ -611,7 +682,7 @@ static void sd_loopback(uint32_t sector)
 
     if (Sd_Read_Sector(sector, orig) != ESP_OK)
     {
-        ESP_LOGW(TAG, "LB[%lu]: read-before FAIL", (unsigned long)sector);
+        SD_CARD_LOGW("LB[%lu]: read-before FAIL", (unsigned long)sector);
         return;
     }
     sd_hex_log("LB before:", sector, orig, 8);
@@ -624,14 +695,14 @@ static void sd_loopback(uint32_t sector)
     bool dirty = false;
     if (Sd_Write_Sector(sector, pat) != ESP_OK)
     {
-        ESP_LOGE(TAG, "LB[%lu]: write FAIL", (unsigned long)sector);
+        SD_CARD_LOGE("LB[%lu]: write FAIL", (unsigned long)sector);
     }
     else
     {
         dirty = true;
         if (Sd_Read_Sector(sector, chk) != ESP_OK)
         {
-            ESP_LOGE(TAG, "LB[%lu]: re-read FAIL", (unsigned long)sector);
+            SD_CARD_LOGE("LB[%lu]: re-read FAIL", (unsigned long)sector);
         }
         else
         {
@@ -650,11 +721,11 @@ static void sd_loopback(uint32_t sector)
             }
             if (diff == 0)
             {
-                ESP_LOGI(TAG, "LB[%lu]: PASS (512B identical)", (unsigned long)sector);
+                SD_CARD_LOGI("LB[%lu]: PASS (512B identical)", (unsigned long)sector);
             }
             else
             {
-                ESP_LOGE(TAG, "LB[%lu]: FAIL diff=%d first@%d",
+                SD_CARD_LOGE("LB[%lu]: FAIL diff=%d first@%d",
                          (unsigned long)sector, diff, first);
             }
         }
@@ -670,15 +741,15 @@ static void sd_loopback(uint32_t sector)
     /* 恢复原内容并校验 */
     if (Sd_Write_Sector(sector, orig) != ESP_OK)
     {
-        ESP_LOGW(TAG, "LB[%lu]: restore-write FAIL", (unsigned long)sector);
+        SD_CARD_LOGW("LB[%lu]: restore-write FAIL", (unsigned long)sector);
         return;
     }
     if (Sd_Read_Sector(sector, chk) != ESP_OK)
     {
-        ESP_LOGW(TAG, "LB[%lu]: restore-read FAIL", (unsigned long)sector);
+        SD_CARD_LOGW("LB[%lu]: restore-read FAIL", (unsigned long)sector);
         return;
     }
-    ESP_LOGI(TAG, "LB[%lu]: restore %s",
+    SD_CARD_LOGI("LB[%lu]: restore %s",
              (unsigned long)sector,
              (memcmp(chk, orig, 512) == 0) ? "OK" : "FAIL");
 }
@@ -695,17 +766,17 @@ void SD_Card_Diag_File(void)
 {
     if (Sd.fs == NULL || !Sd.mounted)
     {
-        ESP_LOGE(TAG, "diagf: FATFS not mounted");
+        SD_CARD_LOGE("diagf: FATFS not mounted");
         return;
     }
     FATFS *fs = Sd.fs;
-    ESP_LOGI(TAG, "diagf: FATFS buffer addr=%08X (%s)",
+    SD_CARD_LOGI("diagf: FATFS buffer addr=%08X (%s)",
              (unsigned)(uintptr_t)fs,
              ((uintptr_t)fs >= 0x3F800000U && (uintptr_t)fs < 0x3FC00000U)
                  ? "PSRAM(SPIRAM)!" : "internal DRAM");
-    ESP_LOGI(TAG, "diagf: fs_type=%u csize=%u n_fats=%u ssize=%u n_rootdir=%u",
+    SD_CARD_LOGI("diagf: fs_type=%u csize=%u n_fats=%u ssize=%u n_rootdir=%u",
              fs->fs_type, fs->csize, fs->n_fats, (uint32_t)fs->ssize, fs->n_rootdir);
-    ESP_LOGI(TAG, "diagf: volbase=%lu fatbase=%lu dirbase=%lu database=%lu n_fatent=%lu fsize=%lu",
+    SD_CARD_LOGI("diagf: volbase=%lu fatbase=%lu dirbase=%lu database=%lu n_fatent=%lu fsize=%lu",
              (unsigned long)fs->volbase, (unsigned long)fs->fatbase,
              (unsigned long)fs->dirbase, (unsigned long)fs->database,
              (unsigned long)fs->n_fatent, (unsigned long)fs->fsize);
@@ -720,7 +791,7 @@ void SD_Card_Diag_File(void)
     {
         root_sector = (uint32_t)fs->dirbase;
     }
-    ESP_LOGI(TAG, "diagf: root dir sector=%lu (read max 16 sectors)",
+    SD_CARD_LOGI("diagf: root dir sector=%lu (read max 16 sectors)",
              (unsigned long)root_sector);
 
     /* 在根目录里找 "TEST    TXT"（SFN 8.3） */
@@ -734,7 +805,7 @@ void SD_Card_Diag_File(void)
         esp_err_t err = sd_diag_raw_read(root_sector + s, sec);
         if (err != ESP_OK)
         {
-            ESP_LOGE(TAG, "diagf: read root sector %lu failed: %s",
+            SD_CARD_LOGE("diagf: read root sector %lu failed: %s",
                      (unsigned long)(root_sector + s), esp_err_to_name(err));
             break;
         }
@@ -753,10 +824,10 @@ void SD_Card_Diag_File(void)
     }
     if (found < 0)
     {
-        ESP_LOGE(TAG, "diagf: TEST    TXT NOT found in raw root dir -> 目录项没写进卡！");
+        SD_CARD_LOGE("diagf: TEST    TXT NOT found in raw root dir -> 目录项没写进卡！");
         return;
     }
-    ESP_LOGI(TAG, "diagf: TEST    TXT found at entry#%d start_cluster=%u size=%lu",
+    SD_CARD_LOGI("diagf: TEST    TXT found at entry#%d start_cluster=%u size=%lu",
              found, fclust, (unsigned long)fsize_bytes);
 
     /* FAT 表项：FAT16 2B / FAT12 1.5B（用 1024B 缓冲避免跨扇区越界） */
@@ -772,7 +843,7 @@ void SD_Card_Diag_File(void)
                 sd_diag_raw_read(fat_sect + 1, fatbuf + 512);
             }
             uint16_t val = (uint16_t)(fatbuf[fat_off % 512] | (fatbuf[fat_off % 512 + 1] << 8));
-            ESP_LOGI(TAG, "diagf: FAT16 entry = 0x%04X (期望 0xFFFF 文件结束)", val);
+            SD_CARD_LOGI("diagf: FAT16 entry = 0x%04X (期望 0xFFFF 文件结束)", val);
         }
     }
     else if (fs->fs_type == 1)
@@ -787,16 +858,16 @@ void SD_Card_Diag_File(void)
             }
             uint16_t raw = (uint16_t)(fatbuf[fat_off % 512] | (fatbuf[fat_off % 512 + 1] << 8));
             uint16_t val = (fclust & 1) ? (raw >> 4) : (raw & 0x0FFF);
-            ESP_LOGI(TAG, "diagf: FAT12 entry = 0x%03X (期望 0xFFF 文件结束)", val);
+            SD_CARD_LOGI("diagf: FAT12 entry = 0x%03X (期望 0xFFF 文件结束)", val);
         }
     }
 
     /* 文件数据第一个扇区：data base + (clust-2)*csize */
     uint32_t data_sector = (uint32_t)fs->database + (fclust - 2) * fs->csize;
-    ESP_LOGI(TAG, "diagf: file data sector=%lu", (unsigned long)data_sector);
+    SD_CARD_LOGI("diagf: file data sector=%lu", (unsigned long)data_sector);
     if (sd_diag_raw_read((uint32_t)data_sector, sec) == ESP_OK)
     {
-        ESP_LOGI(TAG, "diagf: raw data = %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+        SD_CARD_LOGI("diagf: raw data = %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
                  sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7],
                  sec[8], sec[9], sec[10], sec[11], sec[12], sec[13], sec[14], sec[15]);
         const char *expect = "Hello SD Card! This is a test message.";
@@ -805,7 +876,7 @@ void SD_Card_Diag_File(void)
         {
             matched = 1;
         }
-        ESP_LOGI(TAG, "diagf: data content %s",
+        SD_CARD_LOGI("diagf: data content %s",
                  matched ? "MATCHED (数据确实写进了卡)" : "NOT-matched (卡上不是预期内容)");
     }
 
@@ -834,6 +905,8 @@ static DRESULT Sd_Disk_Read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
     }
     for (UINT i = 0; i < count; i++)
     {
+        /* 扇区边界：必要时让出总线给 LCD（高优先级），随后自动续回 */
+        Sd_Session_Yield();
         if (Sd_Read_Sector(sector + i, buff + (size_t)i * Sd.sector_size) != ESP_OK)
         {
             return RES_ERROR;
@@ -851,6 +924,8 @@ static DRESULT Sd_Disk_Write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT cou
     }
     for (UINT i = 0; i < count; i++)
     {
+        /* 扇区边界：必要时让出总线给 LCD（高优先级），随后自动续回 */
+        Sd_Session_Yield();
         if (Sd_Write_Sector(sector + i, buff + (size_t)i * Sd.sector_size) != ESP_OK)
         {
             return RES_ERROR;
@@ -922,16 +997,16 @@ static FRESULT sd_mkfs_and_mount(FATFS *fs_obj, const char *drv)
     uint8_t *mkfs_work = Sd_Mkfs_Work();
     if (mkfs_work == NULL)
     {
-        ESP_LOGE(TAG, "FORMAT: mkfs work buffer alloc failed");
+        SD_CARD_LOGE("FORMAT: mkfs work buffer alloc failed");
         return FR_NOT_ENOUGH_CORE;
     }
     FRESULT fres = f_mkfs(drv, &opt, mkfs_work, 4096);
     if (fres != FR_OK)
     {
-        ESP_LOGE(TAG, "FORMAT: f_mkfs failed (%d)", (int)fres);
+        SD_CARD_LOGE("FORMAT: f_mkfs failed (%d)", (int)fres);
         return fres;
     }
-    ESP_LOGI(TAG, "FORMAT: f_mkfs OK, remounting ...");
+    SD_CARD_LOGI("FORMAT: f_mkfs OK, remounting ...");
 
     fres = f_mount(fs_obj, drv, 1);
     if (fres == FR_OK)
@@ -947,7 +1022,7 @@ static esp_err_t Sd_Fat_Mount(void)
     esp_err_t err = ff_diskio_get_drive(&pdrv);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "no free FATFS drive slot: %s", esp_err_to_name(err));
+        SD_CARD_LOGE("no free FATFS drive slot: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -972,7 +1047,7 @@ static esp_err_t Sd_Fat_Mount(void)
     err = esp_vfs_fat_register(&conf, &fs_obj);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "esp_vfs_fat_register failed: %s", esp_err_to_name(err));
+        SD_CARD_LOGE("esp_vfs_fat_register failed: %s", esp_err_to_name(err));
         ff_diskio_unregister(pdrv);
         return err;
     }
@@ -980,12 +1055,12 @@ static esp_err_t Sd_Fat_Mount(void)
     FRESULT fres = f_mount(fs_obj, drv, 1);
     if (fres != FR_OK && s_format_once)
     {
-        ESP_LOGW(TAG, "mount failed (%d), FORMAT_ONCE: 正在重建文件系统 ...", (int)fres);
+        SD_CARD_LOGW("mount failed (%d), FORMAT_ONCE: 正在重建文件系统 ...", (int)fres);
         fres = sd_mkfs_and_mount(fs_obj, drv);
     }
     if (fres != FR_OK)
     {
-        ESP_LOGE(TAG, "f_mount failed: %d (请确认卡为 FAT32)", (int)fres);
+        SD_CARD_LOGE("f_mount failed: %d (请确认卡为 FAT32)", (int)fres);
         f_mount(NULL, drv, 0);
         esp_vfs_fat_unregister_path(SD_CARD_MOUNT_POINT);
         ff_diskio_unregister(pdrv);
@@ -994,11 +1069,11 @@ static esp_err_t Sd_Fat_Mount(void)
     if (s_format_once)
     {
         /* 挂载成功但要求强制重建（防止旧结构残留） */
-        ESP_LOGW(TAG, "FORMAT_ONCE: 强制重建文件系统");
+        SD_CARD_LOGW("FORMAT_ONCE: 强制重建文件系统");
         fres = sd_mkfs_and_mount(fs_obj, drv);
         if (fres != FR_OK)
         {
-            ESP_LOGE(TAG, "FORMAT: 重建失败 (%d)", (int)fres);
+            SD_CARD_LOGE("FORMAT: 重建失败 (%d)", (int)fres);
             f_mount(NULL, drv, 0);
             esp_vfs_fat_unregister_path(SD_CARD_MOUNT_POINT);
             ff_diskio_unregister(pdrv);
@@ -1009,7 +1084,7 @@ static esp_err_t Sd_Fat_Mount(void)
     Sd.pdrv    = pdrv;
     Sd.fs      = fs_obj;
     Sd.mounted = true;
-    ESP_LOGI(TAG, "FATFS drive %d mounted, path=%s", pdrv, SD_CARD_MOUNT_POINT);
+    SD_CARD_LOGI("FATFS drive %d mounted, path=%s", pdrv, SD_CARD_MOUNT_POINT);
     return ESP_OK;
 }
 
@@ -1030,19 +1105,19 @@ static esp_err_t Sd_Bus_Init(void)
     esp_err_t ret = Spi_Init(&cfg);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(ret));
+        SD_CARD_LOGE("SPI bus init failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
     Sd.owns_bus = Spi_Is_Bus_Created();
     if (Sd.owns_bus)
     {
-        ESP_LOGI(TAG, "SPI2 bus created by SD card: SCK=%d MOSI=%d MISO=%d",
+        SD_CARD_LOGI("SPI2 bus created by SD card: SCK=%d MOSI=%d MISO=%d",
                  SD_CARD_SCK_GPIO, SD_CARD_MOSI_GPIO, SD_CARD_MISO_GPIO);
     }
     else
     {
-        ESP_LOGW(TAG, "SPI2 bus reused (already owned by LCD)");
+        SD_CARD_LOGW("SPI2 bus reused (already owned by LCD)");
     }
     return ESP_OK;
 }
@@ -1065,11 +1140,11 @@ static void Sd_Card_Ensure_Dirs(void)
         }
         if (mkdir(dirs[i], 0777) == 0)
         {
-            ESP_LOGI(TAG, "create dir: %s", dirs[i]);
+            SD_CARD_LOGI("create dir: %s", dirs[i]);
         }
         else
         {
-            ESP_LOGW(TAG, "create dir failed: %s", dirs[i]);
+            SD_CARD_LOGW("create dir failed: %s", dirs[i]);
         }
     }
 }
@@ -1083,14 +1158,14 @@ static void Sd_Card_Ensure_Dirs(void)
 void SD_Card_Set_Format_Once(bool enable)
 {
     s_format_once = enable;
-    ESP_LOGW(TAG, "FORMAT_ONCE=%d（本次启动内生效一次）", enable ? 1 : 0);
+    SD_CARD_LOGW("FORMAT_ONCE=%d（本次启动内生效一次）", enable ? 1 : 0);
 }
 
 esp_err_t SD_Card_Format(void)
 {
     if (Sd.fs == NULL || !Sd.mounted)
     {
-        ESP_LOGE(TAG, "FORMAT: FATFS 未挂载，无法格式化");
+        SD_CARD_LOGE("FORMAT: FATFS 未挂载，无法格式化");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1099,11 +1174,11 @@ esp_err_t SD_Card_Format(void)
     drv[1] = ':';
     drv[2] = '\0';
 
-    ESP_LOGW(TAG, "FORMAT: unmounting drive %s ...", drv);
+    SD_CARD_LOGW("FORMAT: unmounting drive %s ...", drv);
     FRESULT res = f_mount(NULL, drv, 0);
     if (res != FR_OK && res != FR_NO_FILESYSTEM)
     {
-        ESP_LOGE(TAG, "FORMAT: unmount failed (%d)", res);
+        SD_CARD_LOGE("FORMAT: unmount failed (%d)", res);
         return ESP_FAIL;
     }
     Sd.mounted = false;
@@ -1119,27 +1194,27 @@ esp_err_t SD_Card_Format(void)
     uint8_t *mkfs_work = Sd_Mkfs_Work();
     if (mkfs_work == NULL)
     {
-        ESP_LOGE(TAG, "FORMAT: mkfs work buffer alloc failed");
+        SD_CARD_LOGE("FORMAT: mkfs work buffer alloc failed");
         return ESP_ERR_NO_MEM;
     }
     res = f_mkfs(drv, &opt, mkfs_work, 4096);
     if (res != FR_OK)
     {
-        ESP_LOGE(TAG, "FORMAT: f_mkfs failed (%d)", res);
+        SD_CARD_LOGE("FORMAT: f_mkfs failed (%d)", res);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "FORMAT: f_mkfs OK, remounting ...");
+    SD_CARD_LOGI("FORMAT: f_mkfs OK, remounting ...");
 
     res = f_mount(Sd.fs, drv, 1);
     if (res != FR_OK)
     {
-        ESP_LOGE(TAG, "FORMAT: remount failed (%d)", res);
+        SD_CARD_LOGE("FORMAT: remount failed (%d)", res);
         return ESP_FAIL;
     }
     Sd.mounted = true;
 
     Sd_Card_Ensure_Dirs();                    /* 重建 /music、/ui */
-    ESP_LOGI(TAG, "FORMAT: done, volume re-created at %s", SD_CARD_MOUNT_POINT);
+    SD_CARD_LOGI("FORMAT: done, volume re-created at %s", SD_CARD_MOUNT_POINT);
     return ESP_OK;
 }
 
@@ -1176,7 +1251,7 @@ static void Sd_Card_Force_Close_All(void)
     {
         if (Sd_Files[i].fp != NULL)
         {
-            ESP_LOGW(TAG, "force close unclosed file handle slot %d", i);
+            SD_CARD_LOGW("force close unclosed file handle slot %d", i);
             fclose(Sd_Files[i].fp);
             Sd_Files[i].fp = NULL;
         }
@@ -1197,7 +1272,7 @@ esp_err_t SD_Card_Init(void)
 {
     if (Sd.mounted)
     {
-        ESP_LOGW(TAG, "already initialized");
+        SD_CARD_LOGW("already initialized");
         return ESP_OK;
     }
 
@@ -1224,14 +1299,16 @@ esp_err_t SD_Card_Init(void)
             .mode         = 0,          /* SPI 模式 0（CPOL=0, CPHA=0） */
             .queueSize    = 1,
             .csManualCtrl = true,       /* SD 协议需要会话级 CS 控制 */
+            .priority     = SPI_PRIO_NORMAL,   /* 数据流优先级：低于 LCD 刷屏 */
+            .label        = "sd",
         };
         Sd.handle = Spi_Register_Device(&dev_cfg);
         if (Sd.handle == NULL)
         {
-            ESP_LOGE(TAG, "SPI device register failed (CS=%d)", SD_CARD_CS_GPIO);
+            SD_CARD_LOGE("SPI device register failed (CS=%d)", SD_CARD_CS_GPIO);
             return ESP_FAIL;
         }
-        ESP_LOGI(TAG, "SD device registered: CS=%d, init=%dkHz", SD_CARD_CS_GPIO,
+        SD_CARD_LOGI("SD device registered: CS=%d, init=%dkHz", SD_CARD_CS_GPIO,
                  SD_CARD_INIT_FREQ_HZ / 1000);
     }
 
@@ -1242,8 +1319,24 @@ esp_err_t SD_Card_Init(void)
     esp_err_t ret = Sd_Card_Init_Hw();
     if (ret != ESP_OK)
     {
-        /* 失败不释放总线：句柄保留，可再次调用重试 */
-        return ret;
+        /* 高速时钟（20MHz）建立失败时降级到 10MHz 重试一次：
+         * 卡/走线对时钟裕量不同，避免个别卡永远挂不上 */
+        bool retried = false;
+        if (Sd.current_freq_hz > SD_CARD_FALLBACK_FREQ_HZ)
+        {
+            SD_CARD_LOGW("init failed at %lu kHz, retry at %lu kHz",
+                     (unsigned long)(Sd.current_freq_hz / 1000),
+                     (unsigned long)(SD_CARD_FALLBACK_FREQ_HZ / 1000));
+            Sd.current_freq_hz = SD_CARD_FALLBACK_FREQ_HZ;
+            ret = Sd_Card_Init_Hw();
+            retried = true;
+        }
+        if (ret != ESP_OK)
+        {
+            SD_CARD_LOGE("SD init failed%s", retried ? " (fallback too)" : "");
+            /* 失败不释放总线：句柄保留，可再次调用重试 */
+            return ret;
+        }
     }
 
     /* 4) 注册自定义 diskio 并挂载 FATFS */
@@ -1257,7 +1350,7 @@ esp_err_t SD_Card_Init(void)
     Sd_Card_Ensure_Dirs();
     memset(Sd_Files, 0, sizeof(Sd_Files));
 
-    ESP_LOGI(TAG, "SD card mounted at \"%s\"", SD_CARD_MOUNT_POINT);
+    SD_CARD_LOGI("SD card mounted at \"%s\"", SD_CARD_MOUNT_POINT);
     return ESP_OK;
 }
 
@@ -1265,7 +1358,7 @@ esp_err_t SD_Card_Deinit(void)
 {
     if (!Sd.mounted)
     {
-        ESP_LOGW(TAG, "not initialized");
+        SD_CARD_LOGW("not initialized");
         return ESP_OK;
     }
 
@@ -1286,7 +1379,7 @@ esp_err_t SD_Card_Deinit(void)
     Sd.mounted = false;
     Sd.fs      = NULL;
 
-    ESP_LOGI(TAG, "SD card unmounted");
+    SD_CARD_LOGI("SD card unmounted");
     return ESP_OK;
 }
 
@@ -1306,18 +1399,18 @@ sd_card_file_handle_t SD_Card_Open(const char *path, const char *mode)
 {
     if (!Sd.mounted)
     {
-        ESP_LOGE(TAG, "SD card not mounted, call SD_Card_Init first");
+        SD_CARD_LOGE("SD card not mounted, call SD_Card_Init first");
         return NULL;
     }
     if (path == NULL || mode == NULL)
     {
-        ESP_LOGE(TAG, "invalid argument (path/mode NULL)");
+        SD_CARD_LOGE("invalid argument (path/mode NULL)");
         return NULL;
     }
     /* 校验路径必须位于本文件系统（FATFS）挂载点下，防止误用到其他文件系统 */
     if (!Sd_Is_Fat_Path(path))
     {
-        ESP_LOGE(TAG, "path is not under FATFS mount point \"%s\": %s",
+        SD_CARD_LOGE("path is not under FATFS mount point \"%s\": %s",
                  SD_CARD_MOUNT_POINT, path);
         return NULL;
     }
@@ -1334,14 +1427,14 @@ sd_card_file_handle_t SD_Card_Open(const char *path, const char *mode)
     }
     if (slot == NULL)
     {
-        ESP_LOGE(TAG, "too many open files (max %d)", SD_CARD_MAX_OPEN_FILES);
+        SD_CARD_LOGE("too many open files (max %d)", SD_CARD_MAX_OPEN_FILES);
         return NULL;
     }
 
     FILE *fp = fopen(path, mode);
     if (fp == NULL)
     {
-        ESP_LOGE(TAG, "fopen failed: %s (mode=%s)", path, mode);
+        SD_CARD_LOGE("fopen failed: %s (mode=%s)", path, mode);
         return NULL;
     }
 

@@ -1,6 +1,9 @@
 #ifndef I2C_DRIVER_H
 #define I2C_DRIVER_H
 
+/* ======================== 是否打开 I2C 调试打印 ======================== */
+#define I2C_DRIVER_DEBUG_LOGS    (false)
+
 #include <stdint.h>
 #include "driver/i2c_master.h"
 #include "esp_err.h"

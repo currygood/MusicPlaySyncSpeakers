@@ -22,8 +22,13 @@
 
 /* ======================== 私有变量 =============================================== */
 
+#if GPIO_DRIVER_DEBUG_LOGS
 /** 日志标签 */
 static const char *TAG = "GPIO_Driver";
+#define GPIO_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#else
+#define GPIO_LOGE(...) do { } while (0)
+#endif
 
 /* ======================== 基础操作实现 =========================================== */
 
@@ -58,14 +63,14 @@ esp_err_t Gpio_Init(gpio_num_t gpioNum, Gpio_Mode_t mode)
             ioConf.mode = GPIO_MODE_OUTPUT_OD;
             break;
         default:
-            ESP_LOGE(TAG, "Invalid GPIO mode");
+            GPIO_LOGE("Invalid GPIO mode");
             return ESP_ERR_INVALID_ARG;
     }
 
     esp_err_t ret = gpio_config(&ioConf);
     if(ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "GPIO %d init failed", gpioNum);
+        GPIO_LOGE("GPIO %d init failed", gpioNum);
     }
 
     return ret;
@@ -115,7 +120,7 @@ esp_err_t Gpio_Install_Isr_Service(int flags)
     esp_err_t ret = gpio_install_isr_service(flags);
     if(ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "GPIO ISR service install failed: %s", esp_err_to_name(ret));
+        GPIO_LOGE("GPIO ISR service install failed: %s", esp_err_to_name(ret));
     }
     return ret;
 }
@@ -130,7 +135,7 @@ esp_err_t Gpio_Set_Intr_Type(gpio_num_t gpioNum, gpio_int_type_t intrType)
     esp_err_t ret = gpio_set_intr_type(gpioNum, intrType);
     if(ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "GPIO %d set intr type failed: %s", gpioNum, esp_err_to_name(ret));
+        GPIO_LOGE("GPIO %d set intr type failed: %s", gpioNum, esp_err_to_name(ret));
     }
     return ret;
 }
@@ -145,7 +150,7 @@ esp_err_t Gpio_Isr_Handler_Add(gpio_num_t gpioNum, gpio_isr_t isrHandler, void *
     esp_err_t ret = gpio_isr_handler_add(gpioNum, isrHandler, args);
     if(ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "GPIO %d ISR handler add failed: %s", gpioNum, esp_err_to_name(ret));
+        GPIO_LOGE("GPIO %d ISR handler add failed: %s", gpioNum, esp_err_to_name(ret));
     }
     return ret;
 }
@@ -160,7 +165,7 @@ esp_err_t Gpio_Intr_Enable(gpio_num_t gpioNum)
     esp_err_t ret = gpio_intr_enable(gpioNum);
     if(ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "GPIO %d intr enable failed: %s", gpioNum, esp_err_to_name(ret));
+        GPIO_LOGE("GPIO %d intr enable failed: %s", gpioNum, esp_err_to_name(ret));
     }
     return ret;
 }

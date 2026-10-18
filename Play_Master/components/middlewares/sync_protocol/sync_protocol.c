@@ -17,7 +17,8 @@
  *     6144 足够（第十一阶段由 10240 降栈省内部 DRAM）。
  *   - 帧节奏：每帧 15ms，帧大小在 661/662 采样之间交替，保证平均 44.1kHz
  *     （44.1k×0.015=661.5 非整数）；
- *   - 独立于音源：push_pcm 线程安全非阻塞入环；暂停/停止时环满丢弃。
+ *   - 独立于音源：push_pcm 线程安全入环；播放中环满最多阻塞 30ms 做背压
+ *     （让解码端能跑在消费速率之前形成缓冲），暂停/停止时非阻塞丢弃。
  *
  * 本地最终出声使用 Amplifier_Play_Buffer()（第九阶段讨论决定），因此
  * 本模块不注册任何写者：经 Amplifier_Play_Buffer() 直接写 I2S。
@@ -37,6 +38,18 @@
 #include <string.h>
 
 #define TAG "SYNC_PROTOCOL"
+
+#if SYNC_PROTOCOL_DEBUG_LOGS
+#define SYNC_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+#define SYNC_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define SYNC_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#define SYNC_LOGD(...) ESP_LOGD(TAG, __VA_ARGS__)
+#else
+#define SYNC_LOGE(...) do { } while (0)
+#define SYNC_LOGW(...) do { } while (0)
+#define SYNC_LOGI(...) do { } while (0)
+#define SYNC_LOGD(...) do { } while (0)
+#endif
 
 /* ======================== 默认参数 ======================== */
 
@@ -306,11 +319,11 @@ static void sync_send_start(void)
     pl.d_ms      = s_master.cfg_delay_ms;
     if (sync_send_ctrl_ext(SYNC_MSG_START, &pl, sizeof(pl)) != ESP_OK)
     {
-        ESP_LOGW(TAG, "SYNC_START send failed");
+        SYNC_LOGW("SYNC_START send failed");
     }
     else
     {
-        ESP_LOGI(TAG, "SYNC_START sent: stream=%u t0=%lld d=%u ms",
+        SYNC_LOGI("SYNC_START sent: stream=%u t0=%lld d=%u ms",
                  pl.stream_id, (long long)pl.t0_us, pl.d_ms);
     }
 }
@@ -378,7 +391,7 @@ static void sync_handle_control_rx(void)
             if (s_master.slave_online == false)
             {
                 s_master.slave_online = true;
-                ESP_LOGI(TAG, "slave online (first PING)");
+                SYNC_LOGI("slave online (first PING)");
                 sync_emit_event(SYNC_EVT_SLAVE_SYNCED);
             }
             s_master.last_ping_us = (uint64_t)now_us;
@@ -390,9 +403,9 @@ static void sync_handle_control_rx(void)
             if (wifi_manager_mcast_send(s_master.control_chan, out, total,
                                         SYNC_CTRL_SEND_TIMEOUT_MS) != ESP_OK)
             {
-                ESP_LOGW(TAG, "PONG send failed");
+                SYNC_LOGW("PONG send failed");
             }
-            ESP_LOGD(TAG, "PING(t1=%" PRId64 ") -> PONG(t2=%" PRId64 ", t3=%" PRId64 ")",
+            SYNC_LOGD("PING(t1=%" PRId64 ") -> PONG(t2=%" PRId64 ", t3=%" PRId64 ")",
                      (int64_t)ping.t1_us, (int64_t)pong.t2_us, (int64_t)pong.t3_us);
         }
     }
@@ -403,7 +416,7 @@ static void sync_handle_control_rx(void)
             (uint64_t)SYNC_SLAVE_ONLINE_TIMEOUT_MS * 1000u)
     {
         s_master.slave_online = false;
-        ESP_LOGW(TAG, "slave lost (no PING in %u ms)", SYNC_SLAVE_ONLINE_TIMEOUT_MS);
+        SYNC_LOGW("slave lost (no PING in %u ms)", SYNC_SLAVE_ONLINE_TIMEOUT_MS);
         sync_emit_event(SYNC_EVT_SLAVE_LOST);
     }
 }
@@ -520,7 +533,7 @@ static void sync_tx_task(void *arg)
                 if (SYNC_PKT_BUF_BYTES < SYNC_AUDIO_HDR_SIZE +
                     nxt_frame * sizeof(int16_t))
                 {
-                    ESP_LOGE(TAG, "packet too large, drop");
+                    SYNC_LOGE("packet too large, drop");
                     s_master.dropped_pkts++;
                     s_master.frame_filled = 0;
                     continue;   /* 不应发生 */
@@ -595,7 +608,7 @@ static void sync_tx_task(void *arg)
         }
     }
 
-    ESP_LOGI(TAG, "SyncTx_Task exit");
+    SYNC_LOGI("SyncTx_Task exit");
     s_master.tx_task = NULL;   /* 自删前清句柄，deinit 不再重复删除 */
     vTaskDelete(NULL);
 }
@@ -633,7 +646,7 @@ static void sync_play_task(void *arg)
             cnt * s_master.cfg_frame_ms >= s_master.cfg_delay_ms)
         {
             s_master.state = SYNC_STATE_PLAYING;
-            ESP_LOGI(TAG, "state -> PLAYING (D=%u ms buffered)",
+            SYNC_LOGI("state -> PLAYING (D=%u ms buffered)",
                      s_master.cfg_delay_ms);
             xSemaphoreGive(s_lock);
             sync_emit_event(SYNC_EVT_STATE_CHANGED);
@@ -706,7 +719,7 @@ static void sync_play_task(void *arg)
         s_master.play_delta_us      = esp_timer_get_time() - play_at;
     }
 
-    ESP_LOGI(TAG, "SyncLocalPlay_Task exit");
+    SYNC_LOGI("SyncLocalPlay_Task exit");
     s_master.play_task = NULL; /* 自删前清句柄，deinit 不再重复删除 */
     vTaskDelete(NULL);
 }
@@ -796,7 +809,7 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
     if (s_master.inited)
     {
         xSemaphoreGive(s_lock);
-        ESP_LOGW(TAG, "already initialized, re-init ignored");
+        SYNC_LOGW("already initialized, re-init ignored");
         return ESP_OK;
     }
 
@@ -817,7 +830,7 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
                 / s_master.cfg_frame_ms + 2;
     if (s_master.cfg_delay_pkts < need_pkts)
     {
-        ESP_LOGW(TAG, "delay_queue_pkts %u < needed %u, clamp up",
+        SYNC_LOGW("delay_queue_pkts %u < needed %u, clamp up",
                  (unsigned)s_master.cfg_delay_pkts, (unsigned)need_pkts);
         s_master.cfg_delay_pkts = need_pkts;
     }
@@ -833,7 +846,7 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
         s_master.frame_buf == NULL || s_master.play_buf == NULL ||
         s_master.tx_pkt == NULL)
     {
-        ESP_LOGE(TAG, "buffer alloc failed");
+        SYNC_LOGE("buffer alloc failed");
         sync_free_all_buffers();
         xSemaphoreGive(s_lock);
         return ESP_ERR_NO_MEM;
@@ -866,13 +879,13 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
      * s_lock 是普通互斥量（非递归），故先放锁再复用 deinit 收尾 */
     if (tx_ok != pdPASS || play_ok != pdPASS)
     {
-        ESP_LOGE(TAG, "task create failed (tx=%d play=%d), rollback init",
+        SYNC_LOGE("task create failed (tx=%d play=%d), rollback init",
                  (int)tx_ok, (int)play_ok);
         (void)sync_protocol_master_deinit();
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "init ok: D=%u ms frame=%u ms dq_pkts=%u ingress=%u B",
+    SYNC_LOGI("init ok: D=%u ms frame=%u ms dq_pkts=%u ingress=%u B",
              s_master.cfg_delay_ms, s_master.cfg_frame_ms,
              s_master.cfg_delay_pkts, s_master.cfg_ingress_bytes);
     return ESP_OK;
@@ -911,7 +924,7 @@ esp_err_t sync_protocol_master_deinit(void)
     s_master.inited = false;
     s_master.deinit_pending = false;
     xSemaphoreGive(s_lock);
-    ESP_LOGI(TAG, "deinit ok");
+    SYNC_LOGI("deinit ok");
     return ESP_OK;
 }
 
@@ -967,7 +980,7 @@ esp_err_t sync_protocol_master_start(uint16_t stream_id,
         sync_emit_event(SYNC_EVT_STREAM_CHANGED);
     }
     sync_emit_event(SYNC_EVT_STATE_CHANGED);
-    ESP_LOGI(TAG, "start: stream=%u %luHz %uch", s_master.stream_id,
+    SYNC_LOGI("start: stream=%u %luHz %uch", s_master.stream_id,
              (unsigned long)s_master.sample_rate, s_master.channels);
     return ESP_OK;
 }
@@ -989,7 +1002,7 @@ esp_err_t sync_protocol_master_stop(void)
     s_master.state   = SYNC_STATE_STOPPED;
     xSemaphoreGive(s_lock);
     sync_emit_event(SYNC_EVT_STATE_CHANGED);
-    ESP_LOGI(TAG, "stop");
+    SYNC_LOGI("stop");
     return ESP_OK;
 }
 
@@ -1006,9 +1019,17 @@ esp_err_t sync_protocol_master_push_pcm(const int16_t *pcm, size_t samples)
         return ESP_ERR_INVALID_ARG;
     }
     bytes = samples * sizeof(int16_t);
-    if (xStreamBufferSend(s_master.ingress, pcm, bytes, 0) != bytes)
+    /* 播放中给上游 30ms 背压窗口：解码端允许跑在消费速率之前形成缓冲，
+     * 被抢占/读卡慢时用缓冲垫掉，避免 I2S/从节点欠载（卡顿根因）；
+     * 暂停/停止等非播放态保持"绝不阻塞调用方"语义，直接丢帧。 */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool playing = (s_master.started &&
+                    s_master.state == SYNC_STATE_PLAYING);
+    xSemaphoreGive(s_lock);
+    TickType_t wait = playing ? pdMS_TO_TICKS(30) : 0;
+    if (xStreamBufferSend(s_master.ingress, pcm, bytes, wait) != bytes)
     {
-        /* 非阻塞：上游太快时丢帧并计数，保持“绝不阻塞调用方”语义 */
+        /* 背压超时/非播放态丢帧计数（上游过快或下游长时间不消费） */
         s_master.dropped_pkts++;
     }
     return ESP_OK;
@@ -1032,7 +1053,7 @@ esp_err_t sync_protocol_master_pause(void)
     xSemaphoreGive(s_lock);
     sync_send_ctrl_basic(SYNC_CMD_PAUSE, 0);
     sync_emit_event(SYNC_EVT_STATE_CHANGED);
-    ESP_LOGI(TAG, "paused");
+    SYNC_LOGI("paused");
     return ESP_OK;
 }
 
@@ -1053,7 +1074,7 @@ esp_err_t sync_protocol_master_resume(void)
     xSemaphoreGive(s_lock);
     sync_send_ctrl_basic(SYNC_CMD_PLAY, 0);
     sync_emit_event(SYNC_EVT_STATE_CHANGED);
-    ESP_LOGI(TAG, "resumed");
+    SYNC_LOGI("resumed");
     return ESP_OK;
 }
 
@@ -1066,7 +1087,7 @@ esp_err_t sync_protocol_master_set_delay_ms(uint32_t delay_ms)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_master.cfg_delay_ms = delay_ms ? delay_ms : SYNC_CFG_DEFAULT_DELAY_MS;
     xSemaphoreGive(s_lock);
-    ESP_LOGI(TAG, "delay_ms -> %u", s_master.cfg_delay_ms);
+    SYNC_LOGI("delay_ms -> %u", s_master.cfg_delay_ms);
     return ESP_OK;
 }
 
@@ -1116,7 +1137,7 @@ esp_err_t sync_protocol_master_broadcast_cmd(sync_protocol_cmd_t cmd,
     esp_err_t r = sync_send_ctrl_basic(cmd, param);
     if (r == ESP_OK)
     {
-        ESP_LOGI(TAG, "broadcast cmd 0x%02X param %u", cmd, param);
+        SYNC_LOGI("broadcast cmd 0x%02X param %u", cmd, param);
     }
     return r;
 }

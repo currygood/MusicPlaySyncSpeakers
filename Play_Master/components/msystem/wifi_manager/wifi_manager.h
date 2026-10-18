@@ -27,6 +27,10 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "esp_wifi.h"          /* wifi_ap_record_t (ESP-IDF 6.0.1, 含 esp_wifi_types_generic.h) */
+
+/* ======================== 是否打开调试打印 ======================== */
+#define WIFI_MANAGER_DEBUG_LOGS    (false)
 
 /* ======================== 开发期兜底凭据 ======================== */
 /** 兜底 SSID：node_role NVS 未配网（ssid 为空）时使用，与 node_role 内置默认一致 */
@@ -85,6 +89,36 @@ esp_err_t             wifi_manager_stop(wifi_manager_handle_t h);
 /* 配网（UI 触摸屏）：仅用新凭据立即发起连接（持久化由 node_role 负责） */
 esp_err_t wifi_manager_set_sta(wifi_manager_handle_t h,
                                const char *ssid, const char *password);
+
+/* ======================== WiFi 扫描（配网 UI 用） ======================== */
+
+/** 扫描结果集（调用方 malloc/free，或用栈数组）
+ *  注意：AP 记录直接使用 ESP-IDF 的 wifi_ap_record_t（esp_wifi_types.h），
+ *  本模块不再重复定义以避免类型冲突。 */
+typedef struct {
+    wifi_ap_record_t *ap_list;   /* AP 记录数组（ESP-IDF 原生类型，count 条） */
+    uint16_t          count;     /* 有效记录数 */
+    uint16_t          capacity;  /* 数组容量（>= count） */
+} wifi_scan_result_t;
+
+/**
+ * @brief 启动一次 WiFi 扫描（阻塞约 3~5 秒，建议在独立任务调用）
+ *
+ * 扫描完成后结果通过 out 返回，调用方需 free(out->ap_list)。
+ * 扫描期间 STA 若已连接会短暂断开（ESP-IDF 行为），本模块会在
+ * 扫描结束后自动重连。
+ *
+ * @param h         wifi_manager 句柄（非 NULL）
+ * @param out       输出参数：扫描结果（非 NULL）
+ * @return ESP_OK 成功；其他见 esp_err
+ */
+esp_err_t wifi_manager_scan(wifi_manager_handle_t h, wifi_scan_result_t *out);
+
+/**
+ * @brief 释放扫描结果内存
+ * @param result   待释放的扫描结果（可为 NULL）
+ */
+void wifi_manager_scan_free(wifi_scan_result_t *result);
 
 /* 事件订阅（业务模块可选注册） */
 esp_err_t wifi_manager_register_event_cb(wifi_manager_handle_t h,

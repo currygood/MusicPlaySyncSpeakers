@@ -30,6 +30,9 @@
 #ifndef GPIO_DRIVER_H
 #define GPIO_DRIVER_H
 
+/* ======================== 是否打开 GPIO 调试打印 ======================== */
+#define GPIO_DRIVER_DEBUG_LOGS    (true)
+
 #include <stdint.h>
 #include <stdbool.h>
 #include "driver/gpio.h"

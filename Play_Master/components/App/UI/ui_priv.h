@@ -6,10 +6,26 @@
 #ifndef __UI_PRIV_H__
 #define __UI_PRIV_H__
 
+/* ======================== 是否打开 UI 模块调试打印 ======================== */
+#define UI_DEBUG_LOGS    (1)
+
+#include "esp_log.h"
 #include "lvgl.h"
 #include "ui.h"
 #include "ui_icons.h"   /* 控件图标字形宏（配合 ui_icons_16/24 字体使用） */
 #include "LCD_Touch.h"   /* LCD_WIDTH / LCD_HEIGHT 布局基准 */
+
+#if UI_DEBUG_LOGS
+#define UI_LOGE(...) ESP_LOGE("UI", __VA_ARGS__)
+#define UI_LOGW(...) ESP_LOGW("UI", __VA_ARGS__)
+#define UI_LOGI(...) ESP_LOGI("UI", __VA_ARGS__)
+#define UI_LOGD(...) ESP_LOGD("UI", __VA_ARGS__)
+#else
+#define UI_LOGE(...) do { } while (0)
+#define UI_LOGW(...) do { } while (0)
+#define UI_LOGI(...) do { } while (0)
+#define UI_LOGD(...) do { } while (0)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -100,6 +116,9 @@ void scr_player_apply_event(const music_event_t *evt);
 
 /** UI_Task 转发播放事件到本地列表（列表/当前曲变化时重建） */
 void scr_playlist_apply_event(const music_event_t *evt);
+
+/** UI_Task 转发 OTA 事件到设置页（进度/状态更新） */
+void scr_settings_apply_ota_event(const ota_update_event_info_t *info);
 
 /** 按 MusicPlay 当前状态重建本地列表（进入页面 / 事件回流时调用，UI_Task 上下文） */
 void scr_playlist_refresh(void);

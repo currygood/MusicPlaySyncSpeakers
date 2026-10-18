@@ -1,27 +1,8 @@
-/**
- * @file node_role.h
- * @brief 节点角色与运行参数持久化模块接口（NVS 唯一管理入口）
- *
- * 模块职责（对应分层设计 3.4.3 与《nvs存储.md》）：
- *   - NVS 持久化唯一入口：节点角色（主/从）与运行参数（WiFi 凭证、
- *     音频采样率、音量、播放模式、同步延迟、组播地址、OTA 服务器地址）；
- *   - 全局唯一实例，内存缓存一份配置，读走缓存；本模块只做持久化读写，
- *     不触发业务动作；
- *   - 主/从节点共用同一份结构；首次开机（NVS 无数据）按 defaults 落盘。
- *
- * 存储设计（见 docs/02-设计/nvs存储.md）：
- *   - 分区：默认 nvs 分区；命名空间 `node_role`；Key `cfg`（单 blob）；
- *   - blob 结构 = `node_role_cfg_t`（首字段 uint16_t version 结构版本号）；
- *   - 其余业务模块一律通过 node_role_get() 读取，不直接操作 NVS。
- *
- * 使用约定：
- *   - app_main 开机调用 node_role_init()；其余业务模块（wifi_manager 等）
- *     只读不写 NVS；
- *   - 各 API 线程安全；未调用 node_role_init() 前 get/set 返回
- *     ESP_ERR_INVALID_STATE。
- */
-#ifndef __NODE_ROLE_H__
-#define __NODE_ROLE_H__
+#ifndef NODE_ROLE_H
+#define NODE_ROLE_H
+
+/* ======================== 是否打开节点配置模块调试打印 ======================== */
+#define NODE_ROLE_DEBUG_LOGS    (1)
 
 #include <stdbool.h>
 #include <stdint.h>

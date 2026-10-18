@@ -20,8 +20,6 @@
 
 #include <stdio.h>
 
-static const char *TAG = "UI";
-
 /* ======================== 资源路径（烧录在 flash storage 分区，见 ui_priv.h） ======================== */
 #define PLAYER_COVER_PATH   UI_IMG_COVER
 
@@ -226,11 +224,11 @@ static void play_click_cb(lv_event_t *e)
 
     if (cfg->music == NULL)
     {
-        ESP_LOGI(TAG, "[占位] 播放/暂停 -> TODO: music_play_command(MUSIC_CMD_TOGGLE)（未注入句柄）");
+        UI_LOGI( "[占位] 播放/暂停 -> TODO: music_play_command(MUSIC_CMD_TOGGLE)（未注入句柄）");
         return;
     }
     ret = music_play_command(cfg->music, MUSIC_CMD_TOGGLE);
-    ESP_LOGI(TAG, "播放/暂停 -> music_play_command(TOGGLE): %s", esp_err_to_name(ret));
+    UI_LOGI( "播放/暂停 -> music_play_command(TOGGLE): %s", esp_err_to_name(ret));
 }
 
 static void prev_click_cb(lv_event_t *e)
@@ -241,11 +239,11 @@ static void prev_click_cb(lv_event_t *e)
 
     if (cfg->music == NULL)
     {
-        ESP_LOGI(TAG, "[占位] 上一首 -> TODO: music_play_command(MUSIC_CMD_PREV)（未注入句柄）");
+        UI_LOGI( "[占位] 上一首 -> TODO: music_play_command(MUSIC_CMD_PREV)（未注入句柄）");
         return;
     }
     ret = music_play_command(cfg->music, MUSIC_CMD_PREV);
-    ESP_LOGI(TAG, "上一首 -> music_play_command(PREV): %s", esp_err_to_name(ret));
+    UI_LOGI( "上一首 -> music_play_command(PREV): %s", esp_err_to_name(ret));
 }
 
 static void next_click_cb(lv_event_t *e)
@@ -256,11 +254,11 @@ static void next_click_cb(lv_event_t *e)
 
     if (cfg->music == NULL)
     {
-        ESP_LOGI(TAG, "[占位] 下一首 -> TODO: music_play_command(MUSIC_CMD_NEXT)（未注入句柄）");
+        UI_LOGI( "[占位] 下一首 -> TODO: music_play_command(MUSIC_CMD_NEXT)（未注入句柄）");
         return;
     }
     ret = music_play_command(cfg->music, MUSIC_CMD_NEXT);
-    ESP_LOGI(TAG, "下一首 -> music_play_command(NEXT): %s", esp_err_to_name(ret));
+    UI_LOGI( "下一首 -> music_play_command(NEXT): %s", esp_err_to_name(ret));
 }
 
 static void mode_click_cb(lv_event_t *e)
@@ -273,7 +271,7 @@ static void mode_click_cb(lv_event_t *e)
 
     if (cfg->music == NULL)
     {
-        ESP_LOGI(TAG, "[占位] 播放模式 -> TODO: music_play_set_mode()（未注入句柄）");
+        UI_LOGI( "[占位] 播放模式 -> TODO: music_play_set_mode()（未注入句柄）");
         return;
     }
 
@@ -282,7 +280,7 @@ static void mode_click_cb(lv_event_t *e)
     next = (v != NULL && v->mode == MUSIC_PLAY_MODE_SINGLE_LOOP)
                ? MUSIC_PLAY_MODE_SEQUENTIAL : MUSIC_PLAY_MODE_SINGLE_LOOP;
     ret  = music_play_set_mode(cfg->music, next);
-    ESP_LOGI(TAG, "播放模式 -> music_play_set_mode(%s): %s",
+    UI_LOGI( "播放模式 -> music_play_set_mode(%s): %s",
              (next == MUSIC_PLAY_MODE_SINGLE_LOOP) ? "SINGLE_LOOP" : "SEQUENTIAL",
              esp_err_to_name(ret));
 }
@@ -297,7 +295,7 @@ static void chip_click_cb(lv_event_t *e)
     if (cfg->music == NULL)
     {
         /* 未注入 MusicPlay 句柄：占位日志（无状态可切） */
-        ESP_LOGI(TAG, "[占位] 切换播放源 -> TODO: music_play_set_source()（未注入句柄）");
+        UI_LOGI( "[占位] 切换播放源 -> TODO: music_play_set_source()（未注入句柄）");
         return;
     }
 
@@ -306,7 +304,7 @@ static void chip_click_cb(lv_event_t *e)
     want = (music_play_get_source(cfg->music) == MUSIC_SOURCE_BT)
                ? MUSIC_SOURCE_LOCAL : MUSIC_SOURCE_BT;
     ret  = music_play_set_source(cfg->music, want);
-    ESP_LOGI(TAG, "chip -> music_play_set_source(%s): %s",
+    UI_LOGI( "chip -> music_play_set_source(%s): %s",
              (want == MUSIC_SOURCE_BT) ? "BT" : "LOCAL", esp_err_to_name(ret));
 }
 
@@ -318,7 +316,7 @@ static void list_click_cb(lv_event_t *e)
     /* 列表是本地源功能：蓝牙源时禁用（UI 界面设计 5.2） */
     if (s_srcBt)
     {
-        ESP_LOGI(TAG, "列表入口：蓝牙源下不可用");
+        UI_LOGI( "列表入口：蓝牙源下不可用");
         return;
     }
     if (cfg->music != NULL)
@@ -360,7 +358,7 @@ static void volume_cb(lv_event_t *e)
     {
         if ((++logCnt % 10) == 1)
         {
-            ESP_LOGI(TAG, "[占位] 音量 %d -> TODO: music_play_set_volume(%d)（未注入句柄）", val, val);
+            UI_LOGI( "[占位] 音量 %d -> TODO: music_play_set_volume(%d)（未注入句柄）", val, val);
         }
         if (code == LV_EVENT_RELEASED)
         {
@@ -372,7 +370,7 @@ static void volume_cb(lv_event_t *e)
     ret = music_play_set_volume(cfg->music, (uint8_t)val);
     if (ret != ESP_OK || (++logCnt % 10) == 1)
     {
-        ESP_LOGI(TAG, "音量 %d -> music_play_set_volume: %s", val, esp_err_to_name(ret));
+        UI_LOGI( "音量 %d -> music_play_set_volume: %s", val, esp_err_to_name(ret));
     }
     if (code == LV_EVENT_RELEASED)
     {
@@ -394,12 +392,12 @@ void scr_player_apply_event(const music_event_t *evt)
     {
     case MUSIC_EVT_SOURCE_CHANGED:
         player_apply_view(&evt->view);
-        ESP_LOGI(TAG, "music evt: source -> %s", (evt->view.source == MUSIC_SOURCE_BT) ? "BT" : "LOCAL");
+        UI_LOGI( "music evt: source -> %s", (evt->view.source == MUSIC_SOURCE_BT) ? "BT" : "LOCAL");
         break;
 
     case MUSIC_EVT_PLAY_STATE_CHANGED:
         player_apply_view(&evt->view);
-        ESP_LOGI(TAG, "music evt: state -> %d", (int)evt->view.state);
+        UI_LOGI( "music evt: state -> %d", (int)evt->view.state);
         break;
 
     case MUSIC_EVT_TRACK_CHANGED:
@@ -413,11 +411,11 @@ void scr_player_apply_event(const music_event_t *evt)
         {
             lv_slider_set_value(s_sliderVol, (int32_t)evt->view.volume, LV_ANIM_OFF);
         }
-        ESP_LOGI(TAG, "music evt: volume -> %u", (unsigned)evt->view.volume);
+        UI_LOGI( "music evt: volume -> %u", (unsigned)evt->view.volume);
         break;
 
     case MUSIC_EVT_EOF:
-        ESP_LOGI(TAG, "music evt: EOF");
+        UI_LOGI( "music evt: EOF");
         break;
 
     case MUSIC_EVT_PLAYLIST_CHANGED:
@@ -425,7 +423,7 @@ void scr_player_apply_event(const music_event_t *evt)
 
     case MUSIC_EVT_ERROR:
         player_apply_view(&evt->view);
-        ESP_LOGW(TAG, "music evt: ERROR (src=%d state=%d)",
+        UI_LOGW( "music evt: ERROR (src=%d state=%d)",
                  (int)evt->view.source, (int)evt->view.state);
         break;
 
@@ -456,14 +454,14 @@ static void cover_build(lv_obj_t *page)
         lv_image_set_src(cover, PLAYER_COVER_PATH);
         /* 用户图片尺寸不一定是 128：CONTAIN 等比缩放适配控件区域 */
         lv_image_set_inner_align(cover, LV_IMAGE_ALIGN_CONTAIN);
-        ESP_LOGI(TAG, "cover loaded: %s", PLAYER_COVER_PATH);
+        UI_LOGI( "cover loaded: %s", PLAYER_COVER_PATH);
     }
     else
     {
         lv_obj_t *icon = ui_label_create(cover, UI_ICON_MUSIC, &ui_icons_24,
                                          UI_COLOR_DISABLED);
         lv_obj_align(icon, LV_ALIGN_CENTER, 0, 0);
-        ESP_LOGW(TAG, "cover missing: %s（SPIFFS 未挂载/镜像未烧录/"
+        UI_LOGW( "cover missing: %s（SPIFFS 未挂载/镜像未烧录/"
                       "未开启 CONFIG_LV_USE_LODEPNG），使用占位图", PLAYER_COVER_PATH);
     }
 }

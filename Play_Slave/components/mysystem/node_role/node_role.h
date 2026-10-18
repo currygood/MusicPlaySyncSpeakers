@@ -79,7 +79,7 @@ typedef struct {
  *  要留结束符，超了会被静默截断）。
  *
  *  配网 UI 接入后，这里的值会被 node_role_set() 写进 NVS 的凭据覆盖。 */
-#define NODE_ROLE_DEFAULT_SSID          "败家之眼666"
+#define NODE_ROLE_DEFAULT_SSID          "败家之眼"
 #define NODE_ROLE_DEFAULT_PASSWORD      "Tgs200410"
 
 /** ⭐ WiFi 凭据从哪来 —— 开发期开关

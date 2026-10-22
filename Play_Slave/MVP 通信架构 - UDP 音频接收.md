@@ -381,7 +381,10 @@ int64_t play_at = ent.t_play_us + SYNC_RX_MARGIN_US;   /* 60ms */
 
 控制组播 239.0.0.1:5679 仍然保留：`SYNC_START` / `SYNC_HEARTBEAT` /
 `PING→PONG` 的代码都还在，但 **v2 的音频同步完全不用它**。
-后续做音量、暂停、切歌下发时继续走这条通道（小帧，组播很合适）。
+
+从节点现在在这里接收**音量**命令：主节点 LCD / 蓝牙调音量时发 4 字节基础帧
+`{ magic=0xAA55, cmd=0x05, param=0~100 }`，从节点的 `ctl_rx` 模块收到后
+直接 `Amplifier_Set_Volume()`。暂停、切歌等命令还没接，收到会被忽略。
 
 ---
 
@@ -519,8 +522,11 @@ I (xxx) UDP_AUDIO: rx=1000 lost=0 late=0 bad=0 dup=0 slip=0 level=214ms dev=0ms 
 3. **多从机没有实测**：协议支持 8 台，每台独立估计自己的 offset，互不影响；
    但回环、多 AP、多设备并发没有验证过。
 4. **从机地址是手动配置**：自动发现（从机上线广播 / mDNS）还没做。
-5. **控制命令没接**：音量/暂停/切歌仍走旧控制通道，从节点当前不处理；
-   切歌表现为 `stream_id` 变化 → 清缓冲重来，行为正确但少一次淡入。
+5. **控制命令只接了音量**：主节点调音量时，从节点经 `ctl_rx`
+   （`components/middlewares/ctl_rx/`）在控制通道 5679 上跟随。
+   暂停/切歌仍未接；切歌表现为 `stream_id` 变化 → 清缓冲重来，
+   行为正确但少一次淡入。另外从节点音量只作用于本次开机、不写回 NVS；
+   从节点后开机时要等主节点下一次调音量才会跟上。
 
 ---
 
@@ -530,7 +536,8 @@ I (xxx) UDP_AUDIO: rx=1000 lost=0 late=0 bad=0 dup=0 slip=0 level=214ms dev=0ms 
 | --- | --- |
 | `Play_Slave/components/middlewares/udp_audio/udp_audio.h` | 线格式、常量、API |
 | `Play_Slave/components/middlewares/udp_audio/udp_audio.c` | 接收任务 + 播放任务 |
-| `Play_Slave/main/app_main.c` | 装配：WiFi → 功放 → `udp_audio_start()` |
+| `Play_Slave/components/middlewares/ctl_rx/ctl_rx.{h,c}` | 控制通道接收：音量跟随主节点 |
+| `Play_Slave/main/app_main.c` | 装配：WiFi → 功放 → `ctl_rx_start()` → `udp_audio_start()` |
 | `Play_Master/components/middlewares/sync_protocol/sync_protocol.{h,c}` | 主节点 v2 发送端 |
 | `Play_Master/components/msystem/wifi_manager/wifi_manager.{h,c}` | 单播发送 API + 纯发送 socket |
 | `Play_Master/main/app_main.c` | 打开音频通道（`SYNC_UNICAST_PORT_AUDIO`，只发） |
@@ -544,8 +551,8 @@ I (xxx) UDP_AUDIO: rx=1000 lost=0 late=0 bad=0 dup=0 slip=0 level=214ms dev=0ms 
 
 1. **从机自动发现** —— 从机上线时往 5679 发一条"我上线了"，主节点收集；
    省掉手动配 IP 和 DHCP 静态绑定。
-2. **控制命令接回从节点** —— 音量、暂停、恢复不需要重新对齐时钟，
-   直接复用 5679 的小控制帧。
+2. **控制命令接回从节点** —— 音量已经接上（`ctl_rx`）；暂停、恢复、
+   切歌继续复用 5679 的小控制帧。
 3. **丢包重传（NACK）** —— 在 `lead_ms` 的 200ms 窗口内还有机会补，
    比 PLC 好得多。代价是从节点要发 NACK，主节点要留一份最近发送的帧。
 4. **多从机实测** —— 先验证 4 台，重点看 AP 的 airtime 和每台的残差。

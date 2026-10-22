@@ -177,11 +177,15 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
      * 软件音量：NS4168 是固定增益 D 类功放，音量只能通过衰减 PCM 实现。
      * 平方曲线（更接近人耳等响感知）：gain = (vol/100)^2。
      * 音量 100 原样直通（零开销），0 输出静音。
+     *
+     * 板级校准 AMPLIFIER_GAIN_TRIM_PERCENT 在这一步叠乘；主节点作为
+     * 响度基准，本文件里该宏固定 100（保留代码是为了和从节点对称）。
      */
     size_t samples = size / (sizeof(int16_t) * AMPLIFIER_CHANNEL_NUM);
     const int16_t *out = (const int16_t *)buffer;
 
-    if (Amplifier_Volume < AMPLIFIER_VOLUME_MAX)
+    if (Amplifier_Volume < AMPLIFIER_VOLUME_MAX ||
+        AMPLIFIER_GAIN_TRIM_PERCENT != 100)
     {
         uint16_t vol = (Amplifier_Volume > 0) ? Amplifier_Volume : 0;
         if (s_amp_scaled != NULL && vol > 0 && samples <=
@@ -189,6 +193,15 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
         {
             /* 定点增益：(vol/100)^2 * 32768，右移 15 位保证不溢出 */
             uint32_t gain = ((uint32_t)vol * vol * 32768) / 10000u;
+
+#if AMPLIFIER_GAIN_TRIM_PERCENT != 100
+            /* 板级校准只做衰减；上限钳在 32768（0dB）防止误配成 >100 后削波 */
+            gain = (gain * (uint32_t)AMPLIFIER_GAIN_TRIM_PERCENT) / 100u;
+            if (gain > 32768u)
+            {
+                gain = 32768u;
+            }
+#endif
             const int16_t *in = (const int16_t *)buffer;
 
             for (size_t i = 0; i < samples * AMPLIFIER_CHANNEL_NUM; i++)

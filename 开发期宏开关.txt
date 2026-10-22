@@ -83,3 +83,29 @@
     - 办法二：加一个和音量同款的开关。在 node_role.h 增加
       NODE_ROLE_WIFI_FROM_CODE，在 node_role_get() 里覆盖 wifi_ssid /
       wifi_password。目前尚未实现，需要时再改。
+
+
+三、板级响度校准（有宏开关）
+----------------------------
+开关：AMPLIFIER_GAIN_TRIM_PERCENT
+
+从节点：Play_Slave/components/middlewares/amplifier/amplifier.h
+    （AMPLIFIER_VOLUME_MIN 下方的“板级响度校准”区块）
+    当前值 50（≈ -6dB）
+
+主节点：Play_Master/components/middlewares/amplifier/amplifier.h
+    固定 100（响度基准）
+
+作用：
+    数字音量链路主从完全一致（同一份放大器代码、同一个平方曲线公式），
+    同一个 volume 数值听起来仍差几 dB，差在功放供电电压、喇叭灵敏度、
+    腔体这些模拟/声学环节。这个系数只衰减本板输出，不改变 volume 数值
+    的语义（0~100、LCD、协议、NVS 都不动）。
+        70 ≈ -3.1dB    50 ≈ -6.0dB    35 ≈ -9.1dB
+
+生效点：amplifier.c 的 Amplifier_Play_Buffer()
+    平方曲线 gain 算出之后叠乘。主节点为 100 时整段被 #if 编译掉，零开销。
+
+调法：
+    主从放一起播同一段内容，用同一个 volume 值听，把偏响的那块板调小，
+    直到听感一致。改宏 → 重新 build → 烧录对应的板子即可。

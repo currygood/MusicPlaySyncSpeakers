@@ -13,6 +13,7 @@
 #include "node_role.h"       /* NVS 运行参数（NVS 唯一入口） */
 #include "wifi_manager.h"    /* STA 连接 + 统一 UDP 组播通道 */
 #include "amplifier.h"       /* NS4168 功放 */
+#include "ctl_rx.h"          /* 控制通道：从节点音量跟随主节点 */
 #include "udp_audio.h"       /* 最小 UDP 音频接收播放（MVP，当前链路） */
 #include "debug.h"           /* 调试 / 自检函数（默认不调用） */
 
@@ -151,6 +152,13 @@ void app_main(void)
         goto idle;
     }
     Amplifier_Set_Volume(nr.volume);
+
+    /* 6.1 控制通道：主节点 LCD / 蓝牙调音量时，从节点同步跟随
+     *     （组播 239.0.0.1:5679，只处理 SYNC_CMD_VOLUME） */
+    if (ctl_rx_start(wifi) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "ctl_rx_start failed, 从节点音量不会跟随主节点");
+    }
 
 #if APP_BOOT_BEEP
     ESP_LOGI(TAG, "boot beep: 如果这一声听不到，先把功放供电查清楚再看 UDP");

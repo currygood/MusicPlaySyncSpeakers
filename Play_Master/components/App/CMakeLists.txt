@@ -8,7 +8,7 @@ foreach(child ${children})
         list(APPEND MID_INCLUDE_DIRS ${child})
     endif()
 endforeach()
-   
+
 # 2. 搜集所有的 .c 文件
 file(GLOB_RECURSE SOURCES "*.c")
  

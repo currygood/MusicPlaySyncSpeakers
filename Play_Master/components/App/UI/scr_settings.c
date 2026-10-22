@@ -17,6 +17,7 @@
 #include "node_role.h"
 #include "wifi_manager.h"
 #include "sync_protocol.h"
+#include "fw_version.h"
 #include "OTA_Update.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -608,15 +609,7 @@ static void ota_click_cb(lv_event_t *e)
     if (s_lblFwVersion != NULL)
     {
         char buf[48];
-        const char *localVer = OTA_Update_GetLocalVersion();
-        if (localVer != NULL && localVer[0] != '\0')
-        {
-            snprintf(buf, sizeof(buf), "版本: %s (检查中...)", localVer);
-        }
-        else
-        {
-            snprintf(buf, sizeof(buf), "版本: 检查中...");
-        }
+        snprintf(buf, sizeof(buf), "版本: " FW_VERSION " (检查中...)");
         lv_label_set_text(s_lblFwVersion, buf);
     }
 
@@ -647,7 +640,7 @@ void scr_settings_apply_ota_event(const ota_update_event_info_t *info)
     }
 
     char buf[64];
-    const char *localVer = OTA_Update_GetLocalVersion();
+    const char *localVer = FW_VERSION;
     const char *remoteVer = info->version;
 
     switch (info->event)
@@ -888,11 +881,7 @@ void scr_settings_build(lv_obj_t *page)
     /* ---- 5. 固件 ---- */
     panel = section_add(page, y, "固件", 44);
     {
-        char verBuf[48];
-        const char *v = OTA_Update_GetLocalVersion();
-        snprintf(verBuf, sizeof(verBuf), "版本: %s",
-                 (v != NULL && v[0] != '\0') ? v : "未知");
-        s_lblFwVersion = ui_label_create(panel, verBuf,
+        s_lblFwVersion = ui_label_create(panel, "版本: " FW_VERSION,
                               &ui_font_cn_16, UI_COLOR_TEXT_SUB);
     }
     lv_obj_set_pos(s_lblFwVersion, 8, 12);

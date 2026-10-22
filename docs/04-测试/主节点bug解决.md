@@ -292,3 +292,22 @@ i2s_channel_write() 调用:
 **根因2**：Xing头`total_frames`由编码器估写偏小（本例少3.7%）
 
 - 修改：`audio_decoder.c` — 读Xing的`audio_bytes`字段，与`fsize - frame_offset`交叉校验。偏差>3%按比例修正：`duration_ms × (fsize - frame_offset) / audio_bytes`
+
+
+
+
+
+## UI显示系统版本问题
+
+**Bug 原因**
+
+`OTA_Update_GetLocalVersion()` 内部读的是 `esp_app_desc_t.version`，这个值由 ESP-IDF 构建系统的 `PROJECT_VER` 决定。`CMakeLists.txt` 里写的是 `set(VERSION 0.1)`，但 ESP-IDF 只会认 `project(Play_Master VERSION 0.1)` 这种写法。单独 `set(VERSION 0.1)` 不生效，`PROJECT_VER` 为空，构建系统回退到 `git describe` 输出 commit hash（如 `754a35c-dirty`），所以显示 git hash 而非 `0.1`。
+
+**解决办法**
+
+绕开 ESP-IDF 的 `PROJECT_VER`，用 CMake 的 `file(WRITE)` 直接把 `${VERSION}` 写进一个头文件：
+
+1. `CMakeLists.txt` 加一行 `file(WRITE "${CMAKE_SOURCE_DIR}/components/App/UI/fw_version.h" "#define FW_VERSION \"${VERSION}\"")`
+2. `scr_settings.c` 里 `#include "fw_version.h"`，所有版本显示直接用 `FW_VERSION` 宏
+
+`FW_VERSION` 是编译期字符串字面量，不经过任何运行时读取，不受 git describe 影响。改 `CMakeLists.txt` 的 `VERSION` 后重新 CMake 即可同步。

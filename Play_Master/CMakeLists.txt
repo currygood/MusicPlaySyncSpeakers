@@ -10,4 +10,7 @@ set(VERSION 0.1)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
 idf_build_set_property(MINIMAL_BUILD ON)
-project(Play_Master VERSION 0.1)
+project(Play_Master)
+
+file(WRITE "${CMAKE_SOURCE_DIR}/components/App/UI/fw_version.h"
+     "#ifndef __FW_VERSION_H__\n#define __FW_VERSION_H__\n#define FW_VERSION \"${VERSION}\"\n#endif\n")

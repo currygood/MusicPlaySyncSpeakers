@@ -834,6 +834,10 @@ static void Music_Cmd_Local(music_play_handle_t h, music_cmd_t cmd)
         {
             Music_Pause_Local(h);
         }
+        else if (h->view.state == MUSIC_STATE_PAUSED)
+        {
+            Music_Resume_Local(h);
+        }
         else if (h->track_count > 0)
         {
             uint16_t idx = (h->view.track_index < h->track_count)
@@ -1576,7 +1580,20 @@ esp_err_t music_play_get_position_ms(music_play_handle_t player,
     {
         if (player->dec != NULL)
         {
-            return audio_decoder_get_position_ms(player->dec, position_ms);
+            if (audio_decoder_get_position_ms(player->dec, position_ms) != ESP_OK)
+            {
+                *position_ms = 0;
+                return ESP_FAIL;
+            }
+            if (*position_ms > player->cfg.sync_delay_ms)
+            {
+                *position_ms -= player->cfg.sync_delay_ms;
+            }
+            else
+            {
+                *position_ms = 0;
+            }
+            return ESP_OK;
         }
     }
     else if (player->view.source == MUSIC_SOURCE_BT &&

@@ -30,6 +30,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include "esp_timer.h"
 
 /* ======================== 私有宏定义 ============================================= */
 
@@ -54,6 +55,12 @@
  */
 #define I2S_PHY_MAGIC 0x49325350u /* 'I2SP' */
 
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+#define I2S_DMA_HEALTH_SLOW_THRESHOLD_MS  80    /**< 写入耗时 > 80ms 视为 DMA 异常 */
+#define I2S_DMA_HEALTH_MAX_CONSECUTIVE    3     /**< 连续 N 次异常触发主动恢复 */
+#define I2S_DMA_HEALTH_RECOVERY_COOLDOWN_US  (5 * 1000 * 1000)  /**< 恢复冷却：5秒内最多一次 */
+#endif
+
 /* ======================== 私有类型定义 =========================================== */
 
 /**
@@ -69,6 +76,11 @@ struct i2s_bus_phy_s {
     i2s_chan_handle_t chan;    /**< ESP-IDF 底层通道句柄 */
     i2s_pin_cfg_t pin_cfg;     /**< 引脚配置备份（用于日志和重配置） */
     i2s_bus_cfg_t bus_cfg;     /**< 音频格式与 DMA 配置备份 */
+
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+    int     dma_health_bad_count;      /**< DMA 健康监控：连续异常写入计数 */
+    int64_t dma_last_recovery_us;      /**< 上次主动恢复的时间戳（限流用） */
+#endif
 };
 
 /* ======================== 内部工具函数 =========================================== */
@@ -303,9 +315,48 @@ esp_err_t i2s_bus_phy_write(i2s_bus_handle_t bus, const uint8_t *buffer,
         return ESP_ERR_INVALID_ARG;
     }
 
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+    int64_t write_start_us = esp_timer_get_time();
+#endif
+
     esp_err_t ret = i2s_channel_write(bus->chan, buffer, size, bytes_written, timeout);
 
 #if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+    int64_t elapsed_ms = (esp_timer_get_time() - write_start_us) / 1000;
+
+    /*
+     * DMA 健康监控：经典 ESP32 的 legacy DMA 有时不会直接超时，
+     * 而是描述符环半卡不死、写入耗时异常偏高（>80ms），输出端表现为
+     * 底噪/嗡嗡声。连续 N 次异常写入后主动 flush 一次，在 DMA 彻底
+     * 卡死之前恢复健康。
+     */
+    if (ret == ESP_OK && elapsed_ms > I2S_DMA_HEALTH_SLOW_THRESHOLD_MS)
+    {
+        bus->dma_health_bad_count++;
+        if (bus->dma_health_bad_count >= I2S_DMA_HEALTH_MAX_CONSECUTIVE)
+        {
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - bus->dma_last_recovery_us >
+                I2S_DMA_HEALTH_RECOVERY_COOLDOWN_US)
+            {
+                I2S_LOGW("DMA health degraded (%d consecutive slow writes, "
+                         "%lld ms), proactive flush",
+                         bus->dma_health_bad_count, (long long)elapsed_ms);
+                if (i2s_channel_disable(bus->chan) == ESP_OK &&
+                    i2s_channel_enable(bus->chan) == ESP_OK)
+                {
+                    bus->dma_last_recovery_us = now_us;
+                    I2S_LOGW("DMA health recovered after proactive flush");
+                }
+            }
+            bus->dma_health_bad_count = 0;
+        }
+    }
+    else if (ret == ESP_OK)
+    {
+        bus->dma_health_bad_count = 0;
+    }
+
     /*
      * 经典 ESP32 的新版 I2S 驱动长跑后会"永久卡死"：
      * DMA 环里的描述符不再产生 EOF，i2s_channel_write() 拿不到空闲缓冲
@@ -315,6 +366,8 @@ esp_err_t i2s_bus_phy_write(i2s_bus_handle_t bus, const uint8_t *buffer,
      */
     if (ret == ESP_ERR_TIMEOUT)
     {
+        bus->dma_health_bad_count = 0;
+        bus->dma_last_recovery_us = esp_timer_get_time();
         I2S_LOGW("tx timeout, restarting channel and retrying...");
         if (i2s_channel_disable(bus->chan) == ESP_OK &&
             i2s_channel_enable(bus->chan) == ESP_OK)

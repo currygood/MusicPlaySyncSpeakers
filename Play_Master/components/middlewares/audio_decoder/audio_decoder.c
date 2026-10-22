@@ -273,6 +273,187 @@ static void Audio_Decoder_Probe_In_Task(struct audio_decoder_s *dec,
     }
 }
 
+/* ======================== Xing/VBRI 头解析（VBR 时长精算） ======================= */
+
+static uint32_t Audio_Decoder_Read_Be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+}
+
+static uint32_t Audio_Decoder_Parse_Xing_Duration(const uint8_t *frame_start,
+                                                  size_t frame_size,
+                                                  const mp3dec_frame_info_t *probe_fi,
+                                                  size_t file_size,
+                                                  int frame_offset)
+{
+    uint32_t duration_ms = 0;
+
+    if (frame_start == NULL || probe_fi == NULL || frame_size < 4)
+    {
+        return 0;
+    }
+
+    /* 帧头 4 字节解析 */
+    uint32_t header = Audio_Decoder_Read_Be32(frame_start);
+
+    int mpeg_ver    = (int)((header >> 19) & 3);  /* 11=MPEG1, 10=MPEG2, 00=MPEG2.5 */
+    int has_crc     = ((header >> 16) & 1) ? 0 : 1;   /* 0=有 CRC 2 字节 */
+
+    /* side_info: MPEG1 立体/单 = 32/17, MPEG2/2.5 立体/单 = 17/9 */
+    int side_info_size;
+    if (mpeg_ver == 3)
+    {
+        side_info_size = (probe_fi->channels == 1) ? 17 : 32;
+    }
+    else
+    {
+        side_info_size = (probe_fi->channels == 1) ? 9 : 17;
+    }
+
+    int xing_off = 4 + (has_crc ? 2 : 0) + side_info_size;
+    if (xing_off + 4 > (int)frame_size)
+    {
+#if AUDIO_DECODER_DEBUG_LOGS
+        AUDIO_DECODER_LOGI("xing: out of frame(off=%d frame=%d)", xing_off,
+                           (int)frame_size);
+#endif
+        return 0;
+    }
+
+    const uint8_t *xp = frame_start + xing_off;
+    uint32_t total_frames = 0;
+    uint32_t audio_bytes  = 0;
+
+    if (xp[0] == 'X' && xp[1] == 'i' && xp[2] == 'n' && xp[3] == 'g')
+    {
+#if AUDIO_DECODER_DEBUG_LOGS
+        AUDIO_DECODER_LOGI("xing: tag=Xing mpeg_ver=%d ch=%d crc=%d off=%d",
+                           mpeg_ver, probe_fi->channels, has_crc, xing_off);
+#endif
+        goto parse_xing;
+    }
+    if (xp[0] == 'I' && xp[1] == 'n' && xp[2] == 'f' && xp[3] == 'o')
+    {
+#if AUDIO_DECODER_DEBUG_LOGS
+        AUDIO_DECODER_LOGI("xing: tag=Info mpeg_ver=%d ch=%d crc=%d off=%d",
+                           mpeg_ver, probe_fi->channels, has_crc, xing_off);
+#endif
+        goto parse_xing;
+    }
+    if (xp[0] == 'V' && xp[1] == 'B' && xp[2] == 'R' && xp[3] == 'I')
+    {
+#if AUDIO_DECODER_DEBUG_LOGS
+        AUDIO_DECODER_LOGI("xing: tag=VBRI mpeg_ver=%d ch=%d crc=%d off=%d",
+                           mpeg_ver, probe_fi->channels, has_crc, xing_off);
+#endif
+        /* VBRI: "VBRI"(4B) + version(2B) + delay(2B) + quality(2B)
+         * + stream_bytes(4B) + total_frames(4B) + ... */
+        if (xing_off + 18 <= (int)frame_size)
+        {
+            total_frames = Audio_Decoder_Read_Be32(xp + 14);
+            audio_bytes  = Audio_Decoder_Read_Be32(xp + 10);
+        }
+        goto calc;
+    }
+
+#if AUDIO_DECODER_DEBUG_LOGS
+    AUDIO_DECODER_LOGI("xing: no tag found, off=%d bytes=[%02X %02X %02X %02X] "
+                       "mpeg_ver=%d ch=%d",
+                       xing_off, xp[0], xp[1], xp[2], xp[3],
+                       mpeg_ver, probe_fi->channels);
+#endif
+    return 0;   /* 无 Xing/VBRI 头 */
+
+parse_xing:
+    /* Xing/Info 头: tag(4B) + flags(4B) + frames(4B) + bytes(4B) + TOC(100B) + quality(4B) */
+    if (xing_off + 12 > (int)frame_size)
+    {
+#if AUDIO_DECODER_DEBUG_LOGS
+        AUDIO_DECODER_LOGI("xing: parse_xing OOB(off=%d frame=%d)", xing_off,
+                           (int)frame_size);
+#endif
+        return 0;
+    }
+    {
+        uint32_t flags = Audio_Decoder_Read_Be32(xp + 4);
+        int pos = 8;   /* 跳过 tag + flags */
+        if (flags & 1)     /* 总帧数字段 */
+        {
+            if (xing_off + pos + 4 <= (int)frame_size)
+            {
+                total_frames = Audio_Decoder_Read_Be32(xp + pos);
+            }
+            pos += 4;
+        }
+        if (flags & 2)     /* 总字节数字段（交叉校验 + bytes-only 兜底） */
+        {
+            if (xing_off + pos + 4 <= (int)frame_size)
+            {
+                audio_bytes = Audio_Decoder_Read_Be32(xp + pos);
+            }
+            pos += 4;
+        }
+#if AUDIO_DECODER_DEBUG_LOGS
+        AUDIO_DECODER_LOGI("xing: flags=0x%04lX frames=%lu audio_bytes=%lu",
+                           (unsigned long)flags % 0x10000UL,
+                           (unsigned long)total_frames,
+                           (unsigned long)audio_bytes);
+#endif
+    }
+
+calc:
+    if (total_frames > 0 && probe_fi->hz > 0)
+    {
+        uint32_t spf = (mpeg_ver == 3) ? 1152U : 576U;
+        duration_ms = (uint32_t)((uint64_t)total_frames * (uint64_t)spf * 1000ULL /
+                                 (uint64_t)probe_fi->hz);
+
+        /* 交叉校验：Xing 头的 total_bytes 与实际文件剩余音频大小比较，
+         * 偏差 >3% 时说明 total_frames 不精确，按文件比例修正 */
+        if (audio_bytes > 0 && file_size > (size_t)frame_offset)
+        {
+            size_t audio_in_file = file_size - (size_t)frame_offset;
+            if (audio_in_file > audio_bytes)
+            {
+                uint32_t leftover = (uint32_t)(audio_in_file - audio_bytes);
+                uint32_t pct = leftover * 100U / audio_bytes;
+                if (pct > 3)
+                {
+#if AUDIO_DECODER_DEBUG_LOGS
+                    AUDIO_DECODER_LOGI("xing: cross-check, audio_bytes=%lu "
+                                       "file_audio=%u leftover=%lu(%lu%%) "
+                                       "correcting",
+                                       (unsigned long)audio_bytes,
+                                       (unsigned)audio_in_file,
+                                       (unsigned long)leftover,
+                                       (unsigned long)pct);
+#endif
+                    duration_ms = (uint32_t)((uint64_t)duration_ms *
+                                             audio_in_file / audio_bytes);
+                }
+            }
+        }
+    }
+    else if (!total_frames && audio_bytes > 0 && probe_fi->bitrate_kbps > 0)
+    {
+        /* 仅有 bytes 字段（无总帧数），用首帧码率估算 */
+        duration_ms = (uint32_t)((uint64_t)audio_bytes * 8000ULL /
+                                 (uint64_t)probe_fi->bitrate_kbps);
+#if AUDIO_DECODER_DEBUG_LOGS
+        AUDIO_DECODER_LOGI("xing: bytes-only fallback, audio_bytes=%lu "
+                           "bitrate_kbps=%d",
+                           (unsigned long)audio_bytes,
+                           probe_fi->bitrate_kbps);
+#endif
+    }
+#if AUDIO_DECODER_DEBUG_LOGS
+    AUDIO_DECODER_LOGI("xing: result duration_ms=%lu", (unsigned long)duration_ms);
+#endif
+
+    return duration_ms;
+}
+
 /* ======================== 打开句柄注册表 ========================================= */
 
 static void Audio_Decoder_Register(struct audio_decoder_s *dec)
@@ -744,11 +925,43 @@ audio_decoder_handle_t audio_decoder_open(const char *path,
     dec->info.sample_rate = (uint32_t)dec->probe_fi.hz;
     dec->info.channels    = (uint8_t)dec->probe_fi.channels;
     dec->info.bitrate_bps = (uint32_t)dec->probe_fi.bitrate_kbps * 1000U;
-    if (dec->info.bitrate_bps > 0)
+
+    /* 优先解析 Xing/VBRI 头获取 VBR 精确时长（首帧已在 in_buf 中，零额外 I/O） */
     {
-        /* 估算：文件比特数 / 基准码率（不做整文件扫描） */
-        dec->info.duration_ms = (uint32_t)(((uint64_t)fsize * 8ULL * 1000ULL) /
-                                           dec->info.bitrate_bps);
+        const uint8_t *frame_start = dec->in_buf + dec->in_consumed -
+                                     (size_t)dec->probe_fi.frame_bytes +
+                                     (size_t)dec->probe_fi.frame_offset;
+        size_t frame_size = (size_t)dec->probe_fi.frame_bytes -
+                            (size_t)dec->probe_fi.frame_offset;
+#if AUDIO_DECODER_DEBUG_LOGS
+        AUDIO_DECODER_LOGI("xing: try parse, fsize=%lu frame_bytes=%d "
+                           "frame_offset=%d in_consumed=%u",
+                           (unsigned long)fsize, dec->probe_fi.frame_bytes,
+                           dec->probe_fi.frame_offset,
+                           (unsigned)dec->in_consumed);
+#endif
+        uint32_t xing_ms = Audio_Decoder_Parse_Xing_Duration(frame_start,
+                                                             frame_size,
+                                                             &dec->probe_fi,
+                                                             fsize,
+                                                             dec->probe_fi.frame_offset);
+        if (xing_ms > 0)
+        {
+            dec->info.duration_ms = xing_ms;
+        }
+        else if (dec->info.bitrate_bps > 0)
+        {
+            dec->info.duration_ms = (uint32_t)(((uint64_t)fsize * 8ULL * 1000ULL) /
+                                               dec->info.bitrate_bps);
+#if AUDIO_DECODER_DEBUG_LOGS
+            AUDIO_DECODER_LOGI("xing: fallback to estimation, duration_ms=%lu",
+                               (unsigned long)dec->info.duration_ms);
+#endif
+        }
+        else
+        {
+            dec->info.duration_ms = 0;
+        }
     }
 
     AUDIO_DECODER_LOGI("open %s : %luHz/%uch bitrate=%lubps duration=%lums",

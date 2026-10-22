@@ -67,6 +67,20 @@ static void node_role_fill_defaults(node_role_cfg_t *cfg)
     cfg->play_mode         = NODE_ROLE_DEFAULT_PLAY_MODE;
 }
 
+/** 音量来源开关（NODE_ROLE_VOLUME_FROM_CODE）：开启时用代码宏覆盖 volume。
+ *
+ *  和 WiFi 凭据用的是同一个套路 —— 只作用在「读」这一个边界，
+ *  **绝不碰 NVS**：配置照常能存进去，只是开关开着时读不出来。
+ *  把宏拨回 0 重新编译，NVS 里那份原样恢复。 */
+static void node_role_apply_volume_switch(node_role_cfg_t *cfg)
+{
+#if NODE_ROLE_VOLUME_FROM_CODE
+    cfg->volume = NODE_ROLE_DEFAULT_VOLUME;
+#else
+    (void)cfg;   /* 开关关闭时不做事，免掉 unused parameter 告警 */
+#endif
+}
+
 /** 初始化 NVS 分区（esp_wifi 与本模块共同依赖，与 bt_audio 一致） */
 static esp_err_t node_role_nvs_init(void)
 {
@@ -214,6 +228,9 @@ esp_err_t node_role_get(node_role_cfg_t *out)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     memcpy(out, &s_cache, sizeof(*out));
     xSemaphoreGive(s_lock);
+
+    /* 开发期开关在这里统一生效：覆盖刚拷出来的副本，s_cache 和 NVS 都不动。 */
+    node_role_apply_volume_switch(out);
 
     return ESP_OK;
 }

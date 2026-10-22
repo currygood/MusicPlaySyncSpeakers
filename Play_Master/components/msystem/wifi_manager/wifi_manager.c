@@ -438,40 +438,47 @@ static int wifi_mcast_socket_create(const char *group, uint16_t port,
 
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 
-    /* 加入组播组（监听所有接口） */
-    memset(&imreq, 0, sizeof(imreq));
-    if (inet_aton(group, &imreq.imr_multiaddr.s_addr) != 1)
+    /* 只有需要接收的通道才加组 + 绑定端口。
+     * 纯发送通道（音频单播）加了组却没人读，收进来的包会一直占着 lwIP 的
+     * pbuf 不释放 —— 这是之前 sendto 返回 ENOMEM、控制包发不出去的直接原因。
+     * 不加组、不绑端口时源端口由协议栈临时分配，sendto 照常工作。 */
+    if (rx_enable)
     {
+        /* 加入组播组（监听所有接口） */
+        memset(&imreq, 0, sizeof(imreq));
+        if (inet_aton(group, &imreq.imr_multiaddr.s_addr) != 1)
+        {
 #if WIFI_MANAGER_DEBUG_LOGS
-        ESP_LOGE(TAG, "invalid mcast group: \"%s\"", group);
+            ESP_LOGE(TAG, "invalid mcast group: \"%s\"", group);
 #endif
-        close(sock);
-        return -1;
-    }
-    imreq.imr_interface.s_addr = IPADDR_ANY;
-    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                   &imreq, sizeof(imreq)) < 0)
-    {
+            close(sock);
+            return -1;
+        }
+        imreq.imr_interface.s_addr = IPADDR_ANY;
+        if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                       &imreq, sizeof(imreq)) < 0)
+        {
 #if WIFI_MANAGER_DEBUG_LOGS
-        ESP_LOGE(TAG, "IP_ADD_MEMBERSHIP(\"%s\") failed, errno=%d",
-                 group, errno);
+            ESP_LOGE(TAG, "IP_ADD_MEMBERSHIP(\"%s\") failed, errno=%d",
+                     group, errno);
 #endif
-        close(sock);
-        return -1;
-    }
+            close(sock);
+            return -1;
+        }
 
-    /* 绑定端口（任意地址） */
-    memset(&saddr, 0, sizeof(saddr));
-    saddr.sin_family      = AF_INET;
-    saddr.sin_port        = htons(port);
-    saddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(sock, (struct sockaddr *)&saddr, sizeof(saddr)) < 0)
-    {
+        /* 绑定端口（任意地址） */
+        memset(&saddr, 0, sizeof(saddr));
+        saddr.sin_family      = AF_INET;
+        saddr.sin_port        = htons(port);
+        saddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(sock, (struct sockaddr *)&saddr, sizeof(saddr)) < 0)
+        {
 #if WIFI_MANAGER_DEBUG_LOGS
-        ESP_LOGE(TAG, "bind port %u failed, errno=%d", port, errno);
+            ESP_LOGE(TAG, "bind port %u failed, errno=%d", port, errno);
 #endif
-        close(sock);
-        return -1;
+            close(sock);
+            return -1;
+        }
     }
 
     /* 局域网组播 TTL=1；接收侧非阻塞，由 RX 任务轮询 */
@@ -1345,6 +1352,63 @@ esp_err_t wifi_manager_mcast_send(wifi_mcast_handle_t ch,
         {
 #if WIFI_MANAGER_DEBUG_LOGS
             ESP_LOGW(TAG, "mcast sendto failed ret=%d errno=%d", ret, errno);
+#endif
+            return ESP_FAIL;
+        }
+        if (timeout_ms == 0 || xTaskGetTickCount() >= deadline)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+esp_err_t wifi_manager_unicast_send(wifi_mcast_handle_t ch,
+                                    const char *ip, uint16_t port,
+                                    const void *data, size_t len,
+                                    uint32_t timeout_ms)
+{
+    struct sockaddr_in dest;
+    struct in_addr     addr;
+    TickType_t         deadline;
+    int                ret;
+
+    if (ch == NULL || ip == NULL || (data == NULL && len != 0))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ch->fd < 0)
+    {
+        return ESP_ERR_INVALID_STATE;   /* WiFi 未连接，通道无 socket */
+    }
+    if (inet_aton(ip, &addr) != 1)
+    {
+#if WIFI_MANAGER_DEBUG_LOGS
+        ESP_LOGW(TAG, "unicast: invalid ip \"%s\"", ip);
+#endif
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family      = AF_INET;
+    dest.sin_port        = htons(port);
+    dest.sin_addr        = addr;
+
+    deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+
+    for (;;)
+    {
+        ret = sendto(ch->fd, data, len, 0,
+                     (struct sockaddr *)&dest, sizeof(dest));
+        if (ret == (int)len)
+        {
+            return ESP_OK;
+        }
+        if (!(ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
+        {
+#if WIFI_MANAGER_DEBUG_LOGS
+            ESP_LOGW(TAG, "unicast sendto %s:%u failed ret=%d errno=%d",
+                     ip, port, ret, errno);
 #endif
             return ESP_FAIL;
         }

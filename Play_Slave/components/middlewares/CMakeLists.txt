@@ -17,6 +17,7 @@ idf_component_register(
     SRCS ${SOURCES}
     INCLUDE_DIRS ${MID_INCLUDE_DIRS}
     # bsp：底层通信（i2s_driver）；mysystem：wifi_manager 组播通道句柄；
-    # esp_timer：同步协议的时间基准（esp_timer_get_time）
-    REQUIRES bsp freertos mysystem esp_timer
+    # esp_timer：udp_audio 的播放时间基准（esp_timer_get_time）；
+    # lwip：udp_audio 直接用 socket()/bind()/recvfrom()，不经过 wifi_manager
+    REQUIRES bsp freertos mysystem esp_timer lwip
 )

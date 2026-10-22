@@ -40,7 +40,12 @@ static const char *TAG = "AMPLIFIER";  /* 日志标签 */
 static i2s_bus_handle_t  Amp_Phy        = NULL;
 static SemaphoreHandle_t Amp_WriteMutex = NULL;
 
-/* 当前软件音量（0~100），默认 80 */
+/* 当前软件音量（0~100）。
+ *
+ * ⚠️ 这里的初值**不决定开机音量** —— app_main 在 Amplifier_Init() 之后一定会调
+ * Amplifier_Set_Volume(nr.volume)，把它覆盖成 node_role 里的值。
+ * 想改音量请改 node_role.h 的 NODE_ROLE_DEFAULT_VOLUME（配合
+ * NODE_ROLE_VOLUME_FROM_CODE），改这里没有任何效果。 */
 static uint8_t Amplifier_Volume = 80;
 
 /* 软件音量衰减工作缓冲（PSRAM；NS4168 无硬件增益，只能衰减 PCM）。
@@ -182,11 +187,16 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
      * 软件音量：NS4168 是固定增益 D 类功放，没有硬件音量寄存器，
      * 音量只能通过衰减 PCM 实现。平方曲线（更接近人耳等响感知）：
      * gain = (vol/100)^2。音量 100 原样直通（零开销），0 输出静音。
+     *
+     * 板级校准 AMPLIFIER_GAIN_TRIM_PERCENT 在这一步叠乘。数字链路主从是
+     * 同一份代码、同一个公式，同一个 volume 听起来差多少，只能靠各板的
+     * 这个系数拉平（见 amplifier.h 的说明）。
      */
     size_t samples = size / (sizeof(int16_t) * AMPLIFIER_CHANNEL_NUM);
     const int16_t *out = (const int16_t *)buffer;
 
-    if (Amplifier_Volume < AMPLIFIER_VOLUME_MAX)
+    if (Amplifier_Volume < AMPLIFIER_VOLUME_MAX ||
+        AMPLIFIER_GAIN_TRIM_PERCENT != 100)
     {
         uint16_t vol = Amplifier_Volume;
         if (s_amp_scaled != NULL && vol == 0)
@@ -199,6 +209,15 @@ esp_err_t Amplifier_Play_Buffer(const uint8_t *buffer, size_t size, size_t *byte
         {
             /* 定点增益：(vol/100)^2 * 32768，右移 15 位保证不溢出 */
             uint32_t gain = ((uint32_t)vol * vol * 32768) / 10000u;
+
+#if AMPLIFIER_GAIN_TRIM_PERCENT != 100
+            /* 板级校准只做衰减；上限钳在 32768（0dB）防止误配成 >100 后削波 */
+            gain = (gain * (uint32_t)AMPLIFIER_GAIN_TRIM_PERCENT) / 100u;
+            if (gain > 32768u)
+            {
+                gain = 32768u;
+            }
+#endif
             const int16_t *in = (const int16_t *)buffer;
 
             for (size_t i = 0; i < samples * AMPLIFIER_CHANNEL_NUM; i++)

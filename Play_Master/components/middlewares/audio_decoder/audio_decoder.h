@@ -16,7 +16,7 @@
 #define AUDIO_DECODER_H
 
 /* ======================== 是否打开音频解码模块调试打印 ======================== */
-#define AUDIO_DECODER_DEBUG_LOGS    (false)
+#define AUDIO_DECODER_DEBUG_LOGS    (true)
 
 #include "esp_err.h"
 #include <stddef.h>

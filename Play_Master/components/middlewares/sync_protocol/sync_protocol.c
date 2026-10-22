@@ -67,8 +67,10 @@
 #define SYNC_TX_TASK_STACK  (4096)
 #define SYNC_TX_TASK_CORE   (0)
 
-/** SyncLocalPlay_Task：优先级/栈/核（任务表） */
-#define SYNC_PLAY_TASK_PRIO  (10)
+/** SyncLocalPlay_Task：优先级/栈/核（任务表）
+ *  优先级 12：高于 Audio_Decoder(10)，保证按时喂 I2S DMA，避免解码忙时
+ *  play task 被饿死在同核产生 I2S underrun → 嗡嗡嗡 */
+#define SYNC_PLAY_TASK_PRIO  (12)
 #define SYNC_PLAY_TASK_STACK (4096)
 #define SYNC_PLAY_TASK_CORE  (1)
 
@@ -629,7 +631,13 @@ static void sync_play_task(void *arg)
         }
         if (!s_master.started || s_master.state == SYNC_STATE_PAUSED)
         {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            if (s_master.play_buf != NULL)
+            {
+                memset(s_master.play_buf, 0, SYNC_FRAME_MAX_SAMPLES * 2 * sizeof(int16_t));
+                Amplifier_Play_Buffer((const uint8_t *)s_master.play_buf,
+                                      SYNC_FRAME_MAX_SAMPLES * 4, NULL, 100);
+            }
+            vTaskDelay(pdMS_TO_TICKS(15));
             continue;
         }
 
@@ -638,7 +646,13 @@ static void sync_play_task(void *arg)
         if (cnt == 0)
         {
             xSemaphoreGive(s_lock);
-            vTaskDelay(pdMS_TO_TICKS(2));
+            if (s_master.play_buf != NULL)
+            {
+                memset(s_master.play_buf, 0, SYNC_FRAME_MAX_SAMPLES * 2 * sizeof(int16_t));
+                Amplifier_Play_Buffer((const uint8_t *)s_master.play_buf,
+                                      SYNC_FRAME_MAX_SAMPLES * 4, NULL, 100);
+            }
+            vTaskDelay(pdMS_TO_TICKS(15));
             continue;
         }
         /* PREPARING → PLAYING：灌足 D 时长才允许出声 */

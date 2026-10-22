@@ -16,6 +16,7 @@
 #include "sd_card.h"
 #include "node_role.h"
 #include "wifi_manager.h"
+#include "sync_protocol.h"
 #include "OTA_Update.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -25,6 +26,7 @@
 static lv_obj_t *s_lblNetState;
 static lv_obj_t *s_lblNetIp;
 static lv_obj_t *s_lblMicState;
+static lv_obj_t *s_lblSyncState;  /* 同步播放状态标签 */
 static lv_obj_t *s_lblFwVersion;  /* 固件版本标签 */
 static lv_obj_t *s_btnOta;        /* "检查更新"按钮（OTA 期间禁用） */
 
@@ -558,20 +560,26 @@ static void ota_bg_task(void *arg)
 {
     (void)arg;
     esp_err_t err;
+    ota_update_event_info_t otaFinalEvt;
 
     UI_LOGI( "OTA background task started");
 
     OTA_Update_RegisterEventCallback(ota_ui_evt_cb, NULL);
 
     err = OTA_Update_CheckAndUpgrade();
+
+    memset(&otaFinalEvt, 0, sizeof(otaFinalEvt));
     if (err == ESP_OK)
     {
         UI_LOGI( "OTA check: firmware up to date");
+        otaFinalEvt.event = OTA_UPDATE_EVT_UP_TO_DATE;
     }
     else
     {
         UI_LOGW( "OTA check/upgrade failed: %s", esp_err_to_name(err));
+        otaFinalEvt.event = OTA_UPDATE_EVT_ABORTED;
     }
+    ui_on_ota_event(&otaFinalEvt);
 
     UI_LOGI( "OTA background task exiting");
     vTaskDelete(NULL);
@@ -741,6 +749,55 @@ static void settings_timer_cb(lv_timer_t *timer)
             lv_label_set_text_fmt(s_lblMicState, "状态: %s", call_state_name(st));
         }
     }
+
+    {
+        sync_protocol_master_status_t sync_st;
+        if (sync_protocol_master_get_status(&sync_st) == ESP_OK)
+        {
+            lv_color_t color = UI_COLOR_TEXT_SUB;
+            const char *text = "从节点: 未知";
+
+            if (sync_st.slave_online)
+            {
+                switch (sync_st.state)
+                {
+                case SYNC_STATE_IDLE:
+                    text = "从节点: 已连接（待播放）";
+                    color = UI_COLOR_OK;
+                    break;
+                case SYNC_STATE_PREPARING:
+                    text = "从节点: 准备中...";
+                    color = UI_COLOR_ACCENT;
+                    break;
+                case SYNC_STATE_PLAYING:
+                    text = "从节点: 同步播放中";
+                    color = UI_COLOR_OK;
+                    break;
+                case SYNC_STATE_PAUSED:
+                    text = "从节点: 已暂停";
+                    color = UI_COLOR_ACCENT;
+                    break;
+                case SYNC_STATE_STOPPED:
+                    text = "从节点: 已停止";
+                    color = UI_COLOR_TEXT_SUB;
+                    break;
+                case SYNC_STATE_ERROR:
+                    text = "从节点: 错误";
+                    color = UI_COLOR_ERR;
+                    break;
+                default:
+                    break;
+                }
+            }
+            else
+            {
+                text = "从节点: 等待连接...";
+            }
+
+            lv_label_set_text(s_lblSyncState, text);
+            lv_obj_set_style_text_color(s_lblSyncState, color, 0);
+        }
+    }
 }
 
 /* ======================== 构建辅助 ======================== */
@@ -813,9 +870,9 @@ void scr_settings_build(lv_obj_t *page)
 
     /* ---- 3. 同步播放 ---- */
     panel = section_add(page, y, "同步播放", 40);
-    lbl = ui_label_create(panel, "从节点: 未启用（第九阶段 sync_protocol 接入）",
+    s_lblSyncState = ui_label_create(panel, "从节点: 检测中...",
                           &ui_font_cn_16, UI_COLOR_TEXT_SUB);
-    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 0);
+    lv_obj_align(s_lblSyncState, LV_ALIGN_LEFT_MID, 8, 0);
     y += 20 + 40 + 8;
 
     /* ---- 4. 语音助手 ---- */
@@ -830,8 +887,14 @@ void scr_settings_build(lv_obj_t *page)
 
     /* ---- 5. 固件 ---- */
     panel = section_add(page, y, "固件", 44);
-    s_lblFwVersion = ui_label_create(panel, "版本: 待 OTA 接入（第十二阶段）",
-                          &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+    {
+        char verBuf[48];
+        const char *v = OTA_Update_GetLocalVersion();
+        snprintf(verBuf, sizeof(verBuf), "版本: %s",
+                 (v != NULL && v[0] != '\0') ? v : "未知");
+        s_lblFwVersion = ui_label_create(panel, verBuf,
+                              &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+    }
     lv_obj_set_pos(s_lblFwVersion, 8, 12);
     s_btnOta = text_btn(panel, 204, 7, 84, 30, "检查更新", ota_click_cb);
     y += 20 + 44 + 8;
@@ -842,7 +905,7 @@ void scr_settings_build(lv_obj_t *page)
         SD_Card_Is_Mounted() ? "SD 卡: 已挂载" : "SD 卡: 未挂载",
         &ui_font_cn_16, UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(lbl, 8, 6);
-    lbl = ui_label_create(panel, "LVGL 9.6 · 第八阶段界面联调",
+    lbl = ui_label_create(panel, "LVGL 9.6",
                           &ui_font_cn_16, UI_COLOR_DISABLED);
     lv_obj_set_pos(lbl, 8, 30);
 

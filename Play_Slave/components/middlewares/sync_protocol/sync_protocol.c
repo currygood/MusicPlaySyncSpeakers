@@ -100,8 +100,16 @@
 /** 到点前最后这段时间忙等，保证出声精度（对齐主节点 sync_play_task） */
 #define SP_PLAY_PRECISE_US          (2000)
 
-/** 落后主节点超过这么多帧就重锚游标（重连/长抖动后追不回来的场景） */
-#define SP_REANCHOR_LEAD            (8)
+/**
+ * 重锚容差（帧）。**它不是"允许落后多少帧"，而是"在稳态缓冲深度之上
+ * 还能再落后多少帧"** —— 稳态下读游标本来就该落后最新包 anchor_lead
+ * （= D / 帧长，D=200ms/15ms 时为 13）帧，这 13 帧就是缓冲深度本身。
+ *
+ * 所以判据必须是 `lead > anchor_lead + SP_REANCHOR_TOL_FRAMES`；若直接拿
+ * lead 和某个固定值比，就会出现"刚锚完立刻满足重锚条件"的死循环：
+ * 播放游标每帧重锚一次、永不前进，rx 一直涨但一声不出。
+ */
+#define SP_REANCHOR_TOL_FRAMES      (8)
 /** 连续补静音超过这么多帧（33×15ms≈500ms）→ 回 PREPARING 重新灌缓冲 */
 #define SP_UNDERRUN_RESYNC_FRAMES   (33)
 /** 音频流静默判定（与《项目文档》一致：500ms 无包） */
@@ -308,6 +316,28 @@ static void sp_jb_clear_locked(void)
 }
 
 /**
+ * @brief 稳态锚点深度：读游标应当落后最新包多少帧
+ *
+ * = D 折成帧数，并被 jb_slots 钳位。**锚点与重锚判据共用这一个函数**，
+ * 否则两者一旦不一致就会退化成"锚完立刻重锚"的死循环。
+ */
+static uint32_t sp_anchor_lead_locked(void)
+{
+    uint32_t lead;
+
+    if (s_slave.frame_ms == 0)
+    {
+        return 0;
+    }
+    lead = s_slave.delay_ms / s_slave.frame_ms;       /* D 折成帧数 */
+    if (lead >= s_slave.jb_slots)
+    {
+        lead = s_slave.jb_slots - 1;
+    }
+    return lead;
+}
+
+/**
  * @brief 把读游标锚定到「最新包往前 lead 帧」处
  *
  * 进入 PLAYING、以及落后过多需要重锚时调用。锚点选在 newest 之前
@@ -323,11 +353,7 @@ static void sp_anchor_locked(void)
         return;
     }
 
-    lead = s_slave.delay_ms / s_slave.frame_ms;       /* D 折成帧数 */
-    if (lead >= s_slave.jb_slots)
-    {
-        lead = s_slave.jb_slots - 1;
-    }
+    lead = sp_anchor_lead_locked();
 
     uint64_t back = (uint64_t)lead * s_slave.frame_ms * 1000ull;
 
@@ -1311,8 +1337,11 @@ static bool sp_play_next_locked(uint16_t *out_samples, int64_t *out_play_at,
     lead = sp_seq_diff(s_slave.newest_seq, s_slave.next_seq);
 
     /* 落后太多（断网重连 / 长抖动之后）→ 把游标重锚到最新包前面 lead 帧处。
-     * 不这样做的话，读游标会以每帧 15ms 的速度永远追不上已经跑到前面的流。 */
-    if (lead > SP_REANCHOR_LEAD)
+     * 不这样做的话，读游标会以每帧 15ms 的速度永远追不上已经跑到前面的流。
+     *
+     * 阈值 = 稳态锚点深度 + 容差：**不能直接用固定的 SP_REANCHOR_TOL_FRAMES
+     * 去比**，因为稳态下 lead 本来就等于锚点深度（D/帧长）。 */
+    if (lead > (int32_t)sp_anchor_lead_locked() + SP_REANCHOR_TOL_FRAMES)
     {
         sp_anchor_locked();
         return false;

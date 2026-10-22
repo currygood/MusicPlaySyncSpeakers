@@ -16,5 +16,7 @@
     "--query-driver=**",
     "--compile-commands-dir=f:\\EmbeddedProject\\MusicPlaySyncSpeakers\\Play_Master\\build"
 ],
-"idf.flashType": "UART"
+"idf.flashType": "UART",
+"idf.currentSetup": "D:\\v6.0.3\\v6.0.3\\esp-idf",
+"idf.port": "COM3"
 }

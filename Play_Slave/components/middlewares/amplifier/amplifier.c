@@ -40,7 +40,12 @@ static const char *TAG = "AMPLIFIER";  /* 日志标签 */
 static i2s_bus_handle_t  Amp_Phy        = NULL;
 static SemaphoreHandle_t Amp_WriteMutex = NULL;
 
-/* 当前软件音量（0~100），默认 80 */
+/* 当前软件音量（0~100）。
+ *
+ * ⚠️ 这里的初值**不决定开机音量** —— app_main 在 Amplifier_Init() 之后一定会调
+ * Amplifier_Set_Volume(nr.volume)，把它覆盖成 node_role 里的值。
+ * 想改音量请改 node_role.h 的 NODE_ROLE_DEFAULT_VOLUME（配合
+ * NODE_ROLE_VOLUME_FROM_CODE），改这里没有任何效果。 */
 static uint8_t Amplifier_Volume = 80;
 
 /* 软件音量衰减工作缓冲（PSRAM；NS4168 无硬件增益，只能衰减 PCM）。

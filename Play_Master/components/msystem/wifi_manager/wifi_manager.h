@@ -148,6 +148,25 @@ esp_err_t wifi_manager_mcast_open(wifi_manager_handle_t h,
 esp_err_t wifi_manager_mcast_send(wifi_mcast_handle_t ch,
                                   const void *data, size_t len,
                                   uint32_t timeout_ms);
+
+/**
+ * @brief 用通道自己的 socket 发一个**单播**包到指定 IP:port
+ *
+ * 音频数据面走这条路径：单播在 802.11 上有 ACK、重传和速率自适应，
+ * 比组播可靠得多（组播无 ACK、强制基本速率、受 DTIM 缓存影响）。
+ * socket 仍是通道自己的那个（绑定在 5678），只是目的地址改成对端 IP。
+ *
+ * @param ch          已打开的通道句柄（rx 不必开启）
+ * @param ip          目标 IP 字符串，如 "192.168.31.45"
+ * @param port        目标端口（从机音频端口 5680）
+ * @param data/len    载荷
+ * @param timeout_ms  队列满时的最长重试时间
+ */
+esp_err_t wifi_manager_unicast_send(wifi_mcast_handle_t ch,
+                                    const char *ip, uint16_t port,
+                                    const void *data, size_t len,
+                                    uint32_t timeout_ms);
+
 esp_err_t wifi_manager_mcast_recv(wifi_mcast_handle_t ch, /* 从 FIFO 阻塞取 */
                                   void *buf, size_t cap, size_t *len,
                                   uint32_t timeout_ms);

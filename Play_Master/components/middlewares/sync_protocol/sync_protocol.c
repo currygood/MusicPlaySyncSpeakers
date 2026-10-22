@@ -1,18 +1,24 @@
 /**
  * @file sync_protocol.c
- * @brief 音频同步协议模块实现（主节点侧）：PCM 汇聚 → 分包 → 组播发送 +
- *        本地延迟（D）播放 + 控制/时间同步通道处理
+ * @brief 音频同步协议模块实现（主节点侧）：PCM 汇聚 → 分包 → **单播**发送 +
+ *        本地延迟播放 + 控制通道处理
  *
  * 实现要点（对应《主音频节点软件架构分层设计.md》3.2.8 / 第 6 节任务表）：
  *   - SyncTx_Task：优先级 11 / 栈 4096 / Core 0。轮询入口环攒够一帧（约 15ms），
- *     打 esp_timer 时间戳 → 组播发送 → 推入本地延迟队列；同时处理控制通道
- *     （PING → PONG 应答、SYNC_START 一次下发、SYNC_HEARTBEAT 每秒下发、
- *      从节点在线超时检测）；本模块不持有 UDP socket（wifi_manager 通道句柄传入）。
+ *     算出基准播放时刻 t_play = t_tx + D → 逐台从机**单播** → 推入本地延迟队列；
+ *     同时处理控制通道（PING → PONG 应答、SYNC_START 一次下发、
+ *      SYNC_HEARTBEAT 每秒下发、从节点在线超时检测）。
+ *     本模块不持有 UDP socket（wifi_manager 通道句柄传入）。
+ *
+ * 为什么数据面用单播：802.11 的组播帧没有 ACK、没有重传、强制基本速率、
+ * 还要被 AP 按 DTIM 缓存；单播三者都有。8 台从机的总带宽约 5.6 Mbps，
+ * 在这个规模上组播省下的那点带宽毫无意义。
  *     栈内最大局部为延迟队列入队快照 sync_delay_entry_t（含 pcm[700] ≈ 1.4KB），
  *     组包缓冲已移到模块 PSRAM（tx_pkt），故 4KB 足够（第十一阶段内部 DRAM
  *     紧张，由 8KB 降下；帧/组包缓冲均在 PSRAM）。
- *   - SyncLocalPlay_Task：优先级 10 / 栈 6144 / Core 1。按 t_play = t_tx + D
- *     出队，单声道 → 立体声（L/R 写入同一份）后经 amplifier 写 I2S。
+ *   - SyncLocalPlay_Task：优先级 10 / 栈 6144 / Core 1。按
+ *     t_play + SYNC_RX_MARGIN_US 出队（与从节点的换算公式一致，否则会比
+ *     从机早出声 60ms），单声道 → 立体声（L/R 写入同一份）后经 amplifier 写 I2S。
  *     栈内最大局部为出队快照 sync_delay_entry_t（含 pcm[700] ≈ 1.4KB），
  *     6144 足够（第十一阶段由 10240 降栈省内部 DRAM）。
  *   - 帧节奏：每帧 15ms，帧大小在 661/662 采样之间交替，保证平均 44.1kHz
@@ -57,10 +63,26 @@
 #define SYNC_CFG_DEFAULT_DELAY_MS        (200)
 /** 每包 PCM 时长（cfg->frame_duration_ms 为 0 时使用） */
 #define SYNC_CFG_DEFAULT_FRAME_MS        (15)
-/** 本地延迟队列默认容量（须 ≥ D / 每包时长，200/15≈13.3） */
-#define SYNC_CFG_DEFAULT_DELAY_PKTS      (16)
+/** 本地延迟队列默认容量。
+ *  队列里压着的帧 = 提前量 D + 接收余量（260ms）/ 每包时长 ≈ 18 帧 */
+#define SYNC_CFG_DEFAULT_DELAY_PKTS      (24)
 /** PCM 入口环默认字节容量 */
 #define SYNC_CFG_DEFAULT_INGRESS_BYTES   (24576)
+
+/**
+ * 单播目标从机的**编译期默认列表**。
+ *
+ * 单播必须知道对端 IP。正式的"从机上线自动发现"还没做，现阶段请在路由器上
+ * 给从机做 DHCP 静态绑定，然后改这里（运行时也可以用
+ * sync_protocol_master_set_slaves() 覆盖）。
+ *
+ * 列表为空时音频只在本机播放，不往网络上发。
+ */
+static const char *const SYNC_DEFAULT_SLAVE_IPS[] = {
+    "192.168.31.45",
+};
+#define SYNC_DEFAULT_SLAVE_COUNT \
+    ((uint8_t)(sizeof(SYNC_DEFAULT_SLAVE_IPS) / sizeof(SYNC_DEFAULT_SLAVE_IPS[0])))
 
 /** SyncTx_Task：优先级/栈/核（任务表） */
 #define SYNC_TX_TASK_PRIO   (11)
@@ -106,6 +128,7 @@ typedef struct {
     uint16_t stream_id;
     uint16_t seq;
     uint64_t t_tx_us;              /* 主节点发送时刻（esp_timer） */
+    uint64_t t_play_us;            /* 基准播放时刻 = t_tx + D，发给从节点的就是这个 */
     uint16_t frame_samples;        /* 本帧 mono 采样数（661/662） */
     int16_t  pcm[SYNC_FRAME_MAX_SAMPLES];
 } sync_delay_entry_t;
@@ -130,6 +153,10 @@ typedef struct {
     uint32_t cfg_ingress_bytes;
     wifi_mcast_handle_t audio_chan;
     wifi_mcast_handle_t control_chan;
+
+    /* 单播目标（拷贝进模块自己的缓冲，调用方的字符串不必常驻） */
+    char     slave_ips[SYNC_MAX_SLAVES][16];
+    uint8_t  slave_count;
 
     /* 入口环 */
     StreamBufferHandle_t  ingress;
@@ -179,6 +206,34 @@ static SemaphoreHandle_t s_lock = NULL;   /* 保护 state/参数/队列元数据
 static uint8_t  s_io_buf[SYNC_IO_BUF_BYTES];
 
 /* ======================== 内部工具 ======================== */
+
+/** 把调用方的字符串列表拷进模块自己的缓冲（调用方必须持锁） */
+static esp_err_t sync_set_slaves_locked(const char *const *ips, uint8_t count)
+{
+    if (ips == NULL || count == 0)
+    {
+        s_master.slave_count = 0;
+        return ESP_OK;
+    }
+    if (count > SYNC_MAX_SLAVES)
+    {
+        count = SYNC_MAX_SLAVES;
+    }
+
+    s_master.slave_count = 0;
+    for (uint8_t i = 0; i < count; i++)
+    {
+        if (ips[i] == NULL || ips[i][0] == '\0')
+        {
+            continue;
+        }
+        strncpy(s_master.slave_ips[s_master.slave_count], ips[i],
+                sizeof(s_master.slave_ips[0]) - 1);
+        s_master.slave_ips[s_master.slave_count][sizeof(s_master.slave_ips[0]) - 1] = '\0';
+        s_master.slave_count++;
+    }
+    return ESP_OK;
+}
 
 static void sync_snapshot(sync_protocol_master_status_t *out)
 {
@@ -502,14 +557,21 @@ static void sync_tx_task(void *arg)
             if (now_us >= (int64_t)s_master.next_slot_us)
             {
                 sync_delay_entry_t ent;
-                int64_t t_tx = esp_timer_get_time();
+                int64_t t_tx   = esp_timer_get_time();
+                int64_t t_play = t_tx + (int64_t)s_master.cfg_delay_ms * 1000;
 
                 /* 发送前校验：stop/start/resume 会 sync_reset_stream（流代号自增），
                  * 若本帧所属的流已被复位则直接丢弃。否则会把上一路流的帧补发到
-                 * 组播，并在 start_sent 已被清零时补发一条 t0 属于旧流的
-                 * SYNC_START（第十一阶段实测：stop 之后仍补发一帧 + SYNC_START） */
+                 * 网络，并在 start_sent 已被清零时补发一条 t0 属于旧流的
+                 * SYNC_START（第十一阶段实测：stop 之后仍补发一帧 + SYNC_START）
+                 *
+                 * 顺便把单播目标表拷到栈上：发送在锁外做，不能持锁发。 */
+                char    slave_ips[SYNC_MAX_SLAVES][16];
+                uint8_t slave_count;
                 xSemaphoreTake(s_lock, portMAX_DELAY);
                 bool stream_ok = sync_stream_valid_locked(stream_gen);
+                slave_count = s_master.slave_count;
+                memcpy(slave_ips, s_master.slave_ips, sizeof(slave_ips));
                 xSemaphoreGive(s_lock);
                 if (stream_ok == false)
                 {
@@ -518,15 +580,15 @@ static void sync_tx_task(void *arg)
                 }
 
                 memset(&ent, 0, sizeof(ent));
-                ent.stream_id    = s_master.stream_id;
-                ent.seq          = s_master.tx_seq;
-                ent.t_tx_us      = (uint64_t)t_tx;
-                ent.frame_samples= (uint16_t)nxt_frame;
+                ent.stream_id     = s_master.stream_id;
+                ent.seq           = s_master.tx_seq;
+                ent.t_tx_us       = (uint64_t)t_tx;
+                ent.t_play_us     = (uint64_t)t_play;
+                ent.frame_samples = (uint16_t)nxt_frame;
                 memcpy(ent.pcm, s_master.frame_buf,
                        nxt_frame * sizeof(int16_t));
 
-                /* 组播发送（音频通道）：组包缓冲在模块 PSRAM（tx_pkt），
-                 * 不占 sync_tx_task 栈（第十一阶段栈由 8KB 降到 4KB） */
+                /* 组包：缓冲在模块 PSRAM（tx_pkt），不占 sync_tx_task 栈 */
                 uint8_t *pkt = s_master.tx_pkt;
                 sync_audio_pkt_hdr_t *hdr = (sync_audio_pkt_hdr_t *)pkt;
                 size_t pkt_len;
@@ -539,22 +601,44 @@ static void sync_tx_task(void *arg)
                     continue;   /* 不应发生 */
                 }
                 memset(pkt, 0, SYNC_PKT_BUF_BYTES);
-                hdr->magic        = SYNC_MAGIC;
-                hdr->stream_id    = s_master.stream_id;
-                hdr->seq          = s_master.tx_seq;
-                hdr->timestamp_us = (uint64_t)t_tx;
-                hdr->data_len     = (uint16_t)(nxt_frame * sizeof(int16_t));
+                hdr->magic       = SYNC_MAGIC;
+                hdr->version     = SYNC_PROTO_VERSION;
+                hdr->flags       = (s_master.tx_seq == 0)
+                                       ? SYNC_AUDIO_FLAG_STREAM_START : 0;
+                hdr->stream_id   = s_master.stream_id;
+                hdr->seq         = s_master.tx_seq;
+                hdr->t_play_us   = (uint64_t)t_play;
+                hdr->payload_len = (uint16_t)(nxt_frame * sizeof(int16_t));
+                hdr->lead_ms     = (uint16_t)s_master.cfg_delay_ms;
                 memcpy(pkt + SYNC_AUDIO_HDR_SIZE, s_master.frame_buf,
                        nxt_frame * sizeof(int16_t));
                 pkt_len = SYNC_AUDIO_HDR_SIZE + nxt_frame * sizeof(int16_t);
-                if (wifi_manager_mcast_send(s_master.audio_chan, pkt, pkt_len, 20) != ESP_OK)
+
+                /* 单播给每一台从机：同一份 PCM，一份一份发。
+                 * 单播在 802.11 上有 ACK/重传/速率自适应；组播都没有。
+                 * timeout 传 0：只尝试一次。帧周期只有 15ms，某台从机离线时
+                 * 不能为它反复重试而拖住整条流的节奏；丢的这一帧由从机 PLC 补。 */
+                if (slave_count == 0)
                 {
-                    s_master.dropped_pkts++;
+                    if (s_master.tx_pkts == 0)
+                    {
+                        SYNC_LOGW("no slave configured, audio is local only");
+                    }
+                }
+                for (uint8_t i = 0; i < slave_count; i++)
+                {
+                    if (wifi_manager_unicast_send(s_master.audio_chan,
+                                                  slave_ips[i],
+                                                  SYNC_UNICAST_PORT_AUDIO,
+                                                  pkt, pkt_len, 0) != ESP_OK)
+                    {
+                        s_master.dropped_pkts++;
+                    }
                 }
 
-                /* 组播发送可能阻塞（最长 20ms），期间 stop/start/resume 仍可能复位
-                 * 本流：入延迟队列 + 起始帧判定必须在锁内再校验一次；SYNC_START
-                 * 也在锁内发出，保证与 stop 串行（stop 之后不再补发 SYNC_START） */
+                /* 单播发送期间 stop/start/resume 仍可能复位本流：入延迟队列 +
+                 * 起始帧判定必须在锁内再校验一次；SYNC_START 也在锁内发出，
+                 * 保证与 stop 串行（stop 之后不再补发） */
                 xSemaphoreTake(s_lock, portMAX_DELAY);
                 if (sync_stream_valid_locked(stream_gen) == false)
                 {
@@ -662,11 +746,15 @@ static void sync_play_task(void *arg)
             continue;
         }
 
-        /* 取队首快照（不在此出队，避免提前失队；t_play 后真正 pop） */
+        /* 取队首快照（不在此出队，避免提前失队；t_play 后真正 pop）
+         *
+         * 出声时刻 = t_play_us + SYNC_RX_MARGIN_US，与从节点同一公式：
+         * 从节点为了让抖动最大的包也能按时到齐，会把它算出的偏移再往后
+         * 推 UDIO_MARGIN_US；主节点不跟着推，就会比从节点早出声 60ms，
+         * 同一间屋子能听出回声。两边的余量宏必须保持一致。 */
         sync_delay_entry_t ent;
         memcpy(&ent, &s_master.delay_q[s_master.delay_head], sizeof(ent));
-        int64_t play_at = (int64_t)ent.t_tx_us +
-                          (int64_t)s_master.cfg_delay_ms * 1000;
+        int64_t play_at = (int64_t)ent.t_play_us + SYNC_RX_MARGIN_US;
         xSemaphoreGive(s_lock);
 
         int64_t now_us = esp_timer_get_time();
@@ -715,7 +803,7 @@ static void sync_play_task(void *arg)
                 s_master.dropped_pkts++;
             }
         }
-        s_master.last_played_pts_us = (int64_t)ent.t_tx_us;
+        s_master.last_played_pts_us = (int64_t)ent.t_play_us;
         s_master.play_delta_us      = esp_timer_get_time() - play_at;
     }
 
@@ -814,6 +902,19 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
     }
 
     memset(&s_master, 0, sizeof(s_master));
+
+    /* 单播目标从机表：cfg 里给了就用 cfg 的，否则用编译期默认列表
+     * （见文件头的 SYNC_DEFAULT_SLAVE_IPS 说明） */
+    if (cfg->slave_ips != NULL && cfg->slave_count > 0)
+    {
+        (void)sync_set_slaves_locked(cfg->slave_ips, cfg->slave_count);
+    }
+    else
+    {
+        (void)sync_set_slaves_locked(SYNC_DEFAULT_SLAVE_IPS,
+                                     SYNC_DEFAULT_SLAVE_COUNT);
+    }
+
     s_master.cfg_delay_ms      = cfg->sync_delay_ms ? cfg->sync_delay_ms
                                                     : SYNC_CFG_DEFAULT_DELAY_MS;
     s_master.cfg_frame_ms      = cfg->frame_duration_ms ? cfg->frame_duration_ms
@@ -825,9 +926,11 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
     s_master.audio_chan        = cfg->audio_chan;
     s_master.control_chan      = cfg->control_chan;
 
-    /* 本地延迟队列容量下限：必须装下一整段 D（再加 2 帧余量） */
-    need_pkts = (s_master.cfg_delay_ms + s_master.cfg_frame_ms - 1)
-                / s_master.cfg_frame_ms + 2;
+    /* 本地延迟队列容量下限：必须装下 D + 接收余量（再加 2 帧余量）。
+     * 主节点的出声时刻是 t_play + MARGIN，比"t_play + D 的时刻"还晚 60ms，
+     * 少算这 60ms 队列会在稳态下溢，表现为周期性丢帧。 */
+    need_pkts = (s_master.cfg_delay_ms + SYNC_RX_MARGIN_US / 1000
+                 + s_master.cfg_frame_ms - 1) / s_master.cfg_frame_ms + 2;
     if (s_master.cfg_delay_pkts < need_pkts)
     {
         SYNC_LOGW("delay_queue_pkts %u < needed %u, clamp up",
@@ -885,9 +988,10 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
         return ESP_ERR_NO_MEM;
     }
 
-    SYNC_LOGI("init ok: D=%u ms frame=%u ms dq_pkts=%u ingress=%u B",
+    SYNC_LOGI("init ok: D=%u ms frame=%u ms dq_pkts=%u ingress=%u B slaves=%u",
              s_master.cfg_delay_ms, s_master.cfg_frame_ms,
-             s_master.cfg_delay_pkts, s_master.cfg_ingress_bytes);
+             s_master.cfg_delay_pkts, s_master.cfg_ingress_bytes,
+             (unsigned)s_master.slave_count);
     return ESP_OK;
 }
 
@@ -1121,6 +1225,25 @@ esp_err_t sync_protocol_master_set_channels(uint8_t channels)
     s_master.channels = channels;
     xSemaphoreGive(s_lock);
     return ESP_OK;
+}
+
+esp_err_t sync_protocol_master_set_slaves(const char *const *ips, uint8_t count)
+{
+    if (!s_master.inited)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ips == NULL && count != 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t r;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    r = sync_set_slaves_locked(ips, count);
+    SYNC_LOGI("slave list updated: %u target(s)", (unsigned)s_master.slave_count);
+    xSemaphoreGive(s_lock);
+    return r;
 }
 
 esp_err_t sync_protocol_master_broadcast_cmd(sync_protocol_cmd_t cmd,

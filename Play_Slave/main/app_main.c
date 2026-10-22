@@ -13,8 +13,11 @@
 #include "node_role.h"       /* NVS 运行参数（NVS 唯一入口） */
 #include "wifi_manager.h"    /* STA 连接 + 统一 UDP 组播通道 */
 #include "amplifier.h"       /* NS4168 功放 */
-#include "sync_protocol.h"   /* 音频同步协议（从节点侧） */
+#include "udp_audio.h"       /* 最小 UDP 音频接收播放（MVP，当前链路） */
 #include "debug.h"           /* 调试 / 自检函数（默认不调用） */
+
+/* MVP 阶段只跑 udp_audio 这一条路径；从节点工程里未使用的 sync_protocol
+ * 已删除（2026-10-22，历史见 git）。主节点工程的同名模块是 v2 单播发送端。 */
 
 static const char *TAG = "MAIN";
 
@@ -34,59 +37,37 @@ static bool wait_wifi_ip(wifi_manager_handle_t wifi, uint32_t timeout_ms)
     return wifi_manager_is_connected(wifi);
 }
 
-/**
- * @brief 打开两个组播通道（音频 5678 只收；控制 5679 收发，PING 从这里出去）
- */
-static esp_err_t open_mcast_channels(wifi_manager_handle_t wifi,
-                                     const char *group,
-                                     wifi_mcast_handle_t *audio_out,
-                                     wifi_mcast_handle_t *ctrl_out)
+/** 开机自检"滴"一声 —— 用来把"功放到底响不响"和 UDP 链路**分开**
+ *
+ *  它绕开网络，直接调 Amplifier_Play_Buffer()，所以只有两种结果：
+ *    响   → 功放 / I2S / 喇叭 / 供电都正常，问题在收包那一侧
+ *    不响 → 问题在功放供电或接线，跟 UDP 代码没有关系
+ *           （见《功放模块独立供电》那篇：UVLO 欠压保护是静默的，不报错）
+ *
+ *  2026-10-18：靠它确认了功放供电没接 —— 接上之后 UDP 链路立刻出声。
+ *  默认关掉，下次"收到了但没声音"时再临时打开，一分钟就能分清是硬件还是代码。 */
+#define APP_BOOT_BEEP   (0)
+
+#if APP_BOOT_BEEP
+static void app_boot_beep(void)
 {
-    wifi_mcast_cfg_t mc;
-    esp_err_t        ret;
-    int              attempt;
+    int16_t    chunk[512];
+    const int  period = 44100 / 800;    /* 55 采样/周期 */
+    const int  half   = period / 2;     /* 27 采样/半周期 */
+    int        phase  = 0;
 
-    /* 拿到 IP 之前 open 可能失败（要绑定本地接口），所以带重试 */
-    for (attempt = 0; attempt < 3; attempt++)
+    for (int c = 0; c < 26; c++)        /* 26 × 11.6ms ≈ 300ms */
     {
-        memset(&mc, 0, sizeof(mc));
-        mc.group          = group;
-        mc.port           = SYNC_PROTOCOL_MCAST_PORT_AUDIO;
-        mc.rx_enable      = true;
-        mc.rx_fifo_bytes  = 16384;      /* 15ms 一包 ≈ 1340B，16KB ≈ 12 包余量 */
-        ret = wifi_manager_mcast_open(wifi, &mc, audio_out);
-        if (ret == ESP_OK)
+        for (int i = 0; i < 512; i++)
         {
-            break;
+            chunk[i] = ((phase % period) < half) ? 6000 : -6000;
+            phase++;
         }
-        ESP_LOGW(TAG, "open audio mcast failed (%s), retry %d/3",
-                 esp_err_to_name(ret), attempt + 1);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        Amplifier_Play_Buffer((const uint8_t *)chunk, sizeof(chunk),
+                              NULL, 200);
     }
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "音频组播通道 %s:%d 打开失败：%s",
-                 group, SYNC_PROTOCOL_MCAST_PORT_AUDIO, esp_err_to_name(ret));
-        return ret;
-    }
-
-    memset(&mc, 0, sizeof(mc));
-    mc.group         = group;
-    mc.port          = SYNC_PROTOCOL_MCAST_PORT_CTRL;
-    mc.rx_enable     = true;
-    mc.rx_fifo_bytes = 4096;
-    ret = wifi_manager_mcast_open(wifi, &mc, ctrl_out);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "控制组播通道 %s:%d 打开失败：%s",
-                 group, SYNC_PROTOCOL_MCAST_PORT_CTRL, esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "mcast open: %s:%d (audio) / %s:%d (control)",
-             group, SYNC_PROTOCOL_MCAST_PORT_AUDIO, group, SYNC_PROTOCOL_MCAST_PORT_CTRL);
-    return ESP_OK;
 }
+#endif
 
 void app_main(void)
 {
@@ -128,10 +109,9 @@ void app_main(void)
         nr.volume        = NODE_ROLE_DEFAULT_VOLUME;
         nr.sync_delay_ms = NODE_ROLE_DEFAULT_SYNC_DELAY_MS;
     }
-    ESP_LOGI(TAG, "node: role=%u ssid=%s vol=%u%% D=%ums group=%s",
+    ESP_LOGI(TAG, "node: role=%u ssid=%s vol=%u%% D=%ums",
              nr.role, nr.wifi_ssid, nr.volume,
-             (unsigned)(nr.sync_delay_ms ? nr.sync_delay_ms : NODE_ROLE_DEFAULT_SYNC_DELAY_MS),
-             nr.multicast_group[0] ? nr.multicast_group : SYNC_PROTOCOL_MCAST_GROUP);
+             (unsigned)(nr.sync_delay_ms ? nr.sync_delay_ms : NODE_ROLE_DEFAULT_SYNC_DELAY_MS));
 
     /* 4. 状态 LED（本阶段只是初始化到确定状态，播放联动留待后续） */
     StatusLed_Init();
@@ -160,21 +140,11 @@ void app_main(void)
     else
     {
         ESP_LOGW(TAG, "30s 内没拿到 IP，继续往下走：wifi_manager 会一直重连，"
-                      "连上后组播通道内部自动重建");
+                      "连上后 UDP 接收任务自己会建 socket");
     }
 
-    /* 6. 两个组播通道（socket 由 wifi_manager 持有，模块内自动跟随重连重建） */
-    const char *group = nr.multicast_group[0] ? nr.multicast_group
-                                              : SYNC_PROTOCOL_MCAST_GROUP;
-    wifi_mcast_handle_t audio_chan = NULL;
-    wifi_mcast_handle_t ctrl_chan  = NULL;
-    if (open_mcast_channels(wifi, group, &audio_chan, &ctrl_chan) != ESP_OK)
-    {
-        ESP_LOGE(TAG, "组播通道不可用，音频同步链路未启动");
-        goto idle;
-    }
-
-    /* 7. 功放 + 软件音量（NS4168 无硬件增益，音量靠衰减 PCM 实现） */
+    /* 6. 功放 + 软件音量（NS4168 无硬件增益，音量靠衰减 PCM 实现）
+     *    必须先于 udp_audio_start：接收任务收到包就要往这里写。 */
     if (Amplifier_Init() != ESP_OK)
     {
         ESP_LOGE(TAG, "Amplifier_Init failed");
@@ -182,22 +152,22 @@ void app_main(void)
     }
     Amplifier_Set_Volume(nr.volume);
 
-    /* 8. 音频同步（从节点侧）：起接收/心跳/播放三个任务 */
-    sync_protocol_slave_cfg_t scfg = {
-        .sync_delay_ms   = nr.sync_delay_ms ? nr.sync_delay_ms
-                                            : NODE_ROLE_DEFAULT_SYNC_DELAY_MS,
-        .ping_interval_ms = 1000,
-        .jitter_slots     = 24,          /* 24×15ms = 360ms */
-        .write_ahead_us   = 0,           /* 即时写：写时刻即出声时刻（见 sync_protocol.c） */
-        .audio_chan       = audio_chan,
-        .control_chan     = ctrl_chan,
-    };
-    if (sync_protocol_slave_init(&scfg) != ESP_OK)
+#if APP_BOOT_BEEP
+    ESP_LOGI(TAG, "boot beep: 如果这一声听不到，先把功放供电查清楚再看 UDP");
+    app_boot_beep();
+#endif
+
+    /* 7. 接收链路：单播 UDP → jitter buffer → 按 t_play_us 对齐出声。
+     *    数据面只走单播；时钟偏移由"最小单程延迟"单向估计，从节点不回包。 */
+    ESP_ERROR_CHECK(udp_audio_start(UDIO_DEFAULT_PORT));
+
     {
-        ESP_LOGE(TAG, "sync_protocol_slave_init failed");
-        goto idle;
+        char   ip[16] = {0};
+        size_t iplen  = sizeof(ip);
+        wifi_manager_get_ip(wifi, ip, &iplen);
+        ESP_LOGI(TAG, "audio ready: 发送到 udp://%s:%d (proto v%d)",
+                 ip[0] ? ip : "<slave-ip>", UDIO_DEFAULT_PORT, UDIO_VERSION);
     }
-    ESP_ERROR_CHECK(sync_protocol_slave_start());
 
 idle:
     /* app_main 返回后任务被删除，同步任务必须已经跑起来 —— 主循环只负责挂着 */

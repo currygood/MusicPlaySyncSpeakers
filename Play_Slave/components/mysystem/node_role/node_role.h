@@ -54,7 +54,24 @@ typedef struct {
 /** 默认同步延迟 D（ms） */
 #define NODE_ROLE_DEFAULT_SYNC_DELAY_MS (200)
 /** 默认音量（0-100） */
-#define NODE_ROLE_DEFAULT_VOLUME        (80)
+#define NODE_ROLE_DEFAULT_VOLUME        (15)
+
+/** ⭐ 音量从哪来 —— 开发期开关
+ *
+ *   1 = 用上面的 NODE_ROLE_DEFAULT_VOLUME  ← 当前（改了立刻生效，**不用擦 NVS**）
+ *   0 = 用 NVS 里存的那份
+ *
+ *  为什么必须有它：node_role_init() 首次开机就把整份配置（含音量）写进了 NVS，
+ *  之后每次开机都从 NVS 读回来。只改宏、不改 NVS，音量永远是旧的。
+ *  同一类坑在 WiFi 凭据上也踩过一次。
+ *
+ *  作用点在 node_role_get()：所有读取者拿到的都是开关生效之后的值，
+ *  **NVS 里存的内容不受影响**，把开关拨回 0 重新编译，旧值原样回来。
+ *
+ *  ⚠️ 改 amplifier.c 里的 `static uint8_t Amplifier_Volume` 初值是**没有用**的：
+ *  app_main 随后会调 Amplifier_Set_Volume(nr.volume) 把它覆盖掉。
+ *  音量只有一个权威来源 —— 本模块的 NODE_ROLE_DEFAULT_VOLUME。 */
+#define NODE_ROLE_VOLUME_FROM_CODE      (0)
 /** 默认播放模式（0 顺序、1 单曲循环） */
 #define NODE_ROLE_DEFAULT_PLAY_MODE     (0)
 

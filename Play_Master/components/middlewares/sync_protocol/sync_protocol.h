@@ -4,22 +4,23 @@
  *
  * 架构依据（《主音频节点软件构架分层设计.md》3.2.8）：
  *   - 汇聚 bt_audio（A2DP/HFP 下行）与 audio_decoder（SD 卡）的 PCM，
- *     打时间戳后经 wifi_manager 组播通道发到从节点，并按
- *     t_play_master = t_tx + D 交回本机播放（主从同拍）；
- *   - 本模块不持有 UDP socket：音频组播通道（239.0.0.1:5678）与控制组播
- *     通道（239.0.0.1:5679）由 App 经 wifi_manager_mcast_open() 创建后传入；
+ *     算出每帧的**基准播放时刻** t_play = t_tx + D，逐台从机单播发出；
+ *     同一份 t_play 也决定本机什么时候出声，主从同拍；
+ *   - 本模块不持有 UDP socket：音频通道（用于单播）与控制组播通道
+ *     （239.0.0.1:5679）由 App 经 wifi_manager_mcast_open() 创建后传入；
  *   - 源无关：不感知蓝牙/SD/解码器类型，只认 stream_id + sample_rate + channels；
- *   - 最终出声（主节点本地播放）按第九阶段讨论决定：直接经 amplifier 的
- *     Amplifier_Play_Buffer() 与从节点同一时刻写 I2S。
+ *   - 最终出声（主节点本地播放）直接经 amplifier 的 Amplifier_Play_Buffer()
+ *     与从节点同一时刻写 I2S。
  *
- * 组播协议（与《音频同步协议.md》一致，主从共用）：
- *   音频包（239.0.0.1:5678）：
- *     Magic(0xAA55,2) | StreamID(2) | Seq(2) | Timestamp(8,us) | DataLen(2) | PCM
- *     注意 Timestamp 采用 64bit 微秒，避免 32bit 约 71 分钟回绕（讨论定案）；
+ * 数据面协议 v2（与 Play_Slave 的 udp_audio 逐字节一致，主从共用）：
+ *   音频包（单播到从机 5680）：
+ *     Magic(0xAA55,2) | Ver(1) | Flags(1) | StreamID(2) | Seq(2) |
+ *     t_play_us(8) | PayloadLen(2) | LeadMs(2) | PCM
+ *   接收端用 t_play_us 直接对齐出声时刻；时钟偏移由"最小单程延迟"单向估计，
+ *   从节点**不需要回任何包**（PING/PONG 只在控制通道保留，已不参与音频同步）。
+ *   t_play_us / 时间戳一律 64bit 微秒，避免 32bit 约 71 分钟回绕。
  *   控制命令（239.0.0.1:5679）：Magic + Cmd + Param
- *   时间同步扩展帧：PING/PONG、SYNC_START(0x12)、SYNC_HEARTBEAT(0x13)，
- *     命令码沿用《项目文档》建议的 0x12/0x13，PING/PONG 定 0x20/0x21；
- *     0x10/0x11 预留（SYNC_PREPARE/SYNC_READY）。
+ *   控制扩展帧：SYNC_START(0x12)、SYNC_HEARTBEAT(0x13)、PING(0x20)/PONG(0x21)。
  */
 #ifndef SYNC_PROTOCOL_H
 #define SYNC_PROTOCOL_H
@@ -40,34 +41,65 @@ extern "C" {
 
 /* ======================== 组播通道常量 ========================================== */
 
-/** 音频组播组（音频同步协议：UDP 239.0.0.1） */
+/** 音频组播组（**仅控制通道仍在用**：START/HEARTBEAT/PONG 这类小控制帧） */
 #define SYNC_PROTOCOL_MCAST_GROUP       "239.0.0.1"
-/** 音频数据端口（音频同步协议格局） */
-#define SYNC_PROTOCOL_MCAST_PORT_AUDIO  5678
-/** 控制命令/时间同步端口（音频同步协议格局） */
+/** 控制命令/时间同步端口 */
 #define SYNC_PROTOCOL_MCAST_PORT_CTRL   5679
+
+/**
+ * 音频数据面的单播端口。
+ *
+ * 音频**不再走组播**：单播在 802.11 上有 ACK、重传和按客户端自适应速率，
+ * 组播则无 ACK、强制基本速率、还会被 AP 按 DTIM 缓存。
+ * 从节点在 5680 上监听（见 Play_Slave 的 udp_audio.h）。
+ */
+#define SYNC_UNICAST_PORT_AUDIO         5680
+
+/** 单播从机数量上限。8 台 × 706kbps ≈ 5.6Mbps，再往上就该重新考虑组播了 */
+#define SYNC_MAX_SLAVES                 8
 
 /* ======================== 一线格式定义（主从共用，勿改动） ====================== */
 
 /** 所有包共同 Magic 标志：0xAA55，用于过滤干扰 */
 #define SYNC_MAGIC 0xAA55u
 
+/** 音频包协议版本。改动线格式必须递增，接收端会丢弃版本不符的包 */
+#define SYNC_PROTO_VERSION 2u
+
+/** 音频包头 flags */
+#define SYNC_AUDIO_FLAG_STREAM_START 0x01u
+
 /**
- * @brief 音频数据包头部（16 字节）
+ * @brief 音频数据包头部（20 字节，与 Play_Slave 的 udio_hdr_t 逐字节一致）
  *
- * 相比《音频同步协议.md》v0.1 的 10 字节头，增加了 stream_id(2) 且
- * timestamp 扩为 64bit（iso：0xAA55 | stream_id | seq | ts(8) | len）。
+ * 与 v1 的差别：`timestamp_us`（发送时刻）换成 `t_play_us`（**基准播放时刻**），
+ * 并补上 version / flags / lead_ms。接收端靠 t_play_us 直接对齐出声时刻，
+ * 不需要再做"发送时刻 + D"的换算。
+ *
+ * 字段布局保证 t_play_us 落在 8 字节边界上，避免 32 位平台的非对齐访问。
  */
 typedef struct __attribute__((packed)) {
     uint16_t magic;         /**< 0xAA55 */
+    uint8_t  version;       /**< SYNC_PROTO_VERSION */
+    uint8_t  flags;         /**< SYNC_AUDIO_FLAG_* */
     uint16_t stream_id;     /**< 一次音频流唯一标识（主节点重启/切歌检测） */
-    uint16_t seq;           /**< 序列号，0~65535 循环，用于丢包检测 */
-    uint64_t timestamp_us;  /**< 主节点发送时刻，esp_timer_get_time()，微秒 */
-    uint16_t data_len;      /**< PCM 数据字节数（单声道 16bit），最大 1472-16 */
+    uint16_t seq;           /**< 序列号，0~65535 循环 */
+    uint64_t t_play_us;     /**< 该帧的基准播放时刻（主节点 esp_timer，微秒） */
+    uint16_t payload_len;   /**< PCM 数据字节数（单声道 16bit） */
+    uint16_t lead_ms;       /**< 提前量 D（ms）。从节点换算时钟偏移要用，必须填 */
 } sync_audio_pkt_hdr_t;
 
 /** 音频包固定头部长度 */
 #define SYNC_AUDIO_HDR_SIZE ((uint16_t)sizeof(sync_audio_pkt_hdr_t))
+
+/**
+ * 接收端抖动余量（微秒），**必须与 Play_Slave 的 UDIO_MARGIN_US 相同**。
+ *
+ * 主节点本地播放也要加这个值：从节点为了让抖动最大的包也能按时到齐，
+ * 必然比"最早到达时刻"再晚一段；主节点不加，就会比从节点早出声，
+ * 同一间屋子能听出回声。
+ */
+#define SYNC_RX_MARGIN_US 60000
 
 /** 基础控制命令包（与控制通道 5679） */
 typedef struct __attribute__((packed)) {
@@ -151,8 +183,13 @@ typedef struct {
     uint32_t     frame_duration_ms; /* 每包 PCM 时长（毫秒），默认 15ms */
     uint32_t     delay_queue_pkts; /* 本地延迟队列容量，> D/帧时长 */
     uint32_t     ingress_bytes;    /* PCM 入环字节容量（16~32KB 起步） */
-    wifi_mcast_handle_t audio_chan;   /* 音频通道（239.0.0.1:5678，只发） */
+    wifi_mcast_handle_t audio_chan;   /* 音频 socket（用于**单播**，rx 可关） */
     wifi_mcast_handle_t control_chan; /* 控制通道（239.0.0.1:5679，收发） */
+
+    /* 单播目标从机列表。传 NULL / count=0 时用模块内置的编译期默认列表；
+     * 运行时还可以用 sync_protocol_master_set_slaves() 覆盖。 */
+    const char *const *slave_ips;
+    uint8_t            slave_count;
 } sync_protocol_master_cfg_t;
 
 /* ======================== 状态快照 ================================================ */
@@ -213,6 +250,14 @@ esp_err_t sync_protocol_master_resume(void);
 esp_err_t sync_protocol_master_set_delay_ms(uint32_t delay_ms);
 esp_err_t sync_protocol_master_set_sample_rate(uint32_t sample_rate);
 esp_err_t sync_protocol_master_set_channels(uint8_t channels);
+
+/**
+ * @brief 运行时设置单播目标从机列表（最多 SYNC_MAX_SLAVES 个）
+ *
+ * 当前从机地址是手动配置的（路由器上做 DHCP 静态绑定，或在这里改）。
+ * 自动发现（从机上线广播 / 主节点收集）留待后续，见架构文档"下一步"。
+ */
+esp_err_t sync_protocol_master_set_slaves(const char *const *ips, uint8_t count);
 
 esp_err_t sync_protocol_master_broadcast_cmd(sync_protocol_cmd_t cmd,
                                              uint8_t param);

@@ -425,9 +425,10 @@ static void App_MusicPlay_Task(void *arg)
         ESP_LOGW(TAG, "[MusicPlay] SD_Card_Init failed, 本地列表将为空");
     }
 
-    /* 2) 组播通道：音频只发(5678) / 控制收发(5679)，MusicPlay 经 cfg 传入 */
+    /* 2) 通道：音频通道只用来**单播**发数据（绑定本机端口，不收）；
+     *    控制走组播 239.0.0.1:5679，收发 */
     mc.group         = SYNC_PROTOCOL_MCAST_GROUP;
-    mc.port          = SYNC_PROTOCOL_MCAST_PORT_AUDIO;
+    mc.port          = SYNC_UNICAST_PORT_AUDIO;
     mc.rx_enable     = false;
     err = wifi_manager_mcast_open(s_app.wifi, &mc, &s_app.audio_chan);
     if (err != ESP_OK)

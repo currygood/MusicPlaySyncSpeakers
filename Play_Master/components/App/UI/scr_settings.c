@@ -1,8 +1,13 @@
 /**
  * @file scr_settings.c
- * @brief 设置页（Tab 3，可滚动；UI 界面设计 5.5）
+ * @brief 设置页（Tab 3，固定 4 页，右上角箭头翻页；UI 界面设计 5.5）
  *
  * 分区：播放源 / 网络 / 同步播放 / 语音助手 / 固件 / 关于。
+ * 内容区 320×176 不再纵向滚动，按下列分组固定摆放，每页都完整可见：
+ *   第 1 页 播放源 + 网络
+ *   第 2 页 同步播放（汇总 + 最多 8 台从机，行高 19 = 字体行高）
+ *   第 3 页 语音助手 + 固件
+ *   第 4 页 关于
  * 第八阶段数据来源：
  *   - 真实：SD 卡状态（SD_Card_Is_Mounted()）；
  *   - 句柄注入后真实：WiFi 状态/IP（wifi_manager 查询，1s 轮询）、
@@ -27,9 +32,29 @@
 static lv_obj_t *s_lblNetState;
 static lv_obj_t *s_lblNetIp;
 static lv_obj_t *s_lblMicState;
-static lv_obj_t *s_lblSyncState;  /* 同步播放状态标签 */
+static lv_obj_t *s_lblSyncState;  /* 同步播放汇总标签（已连接 N 台 / 状态） */
 static lv_obj_t *s_lblFwVersion;  /* 固件版本标签 */
 static lv_obj_t *s_btnOta;        /* "检查更新"按钮（OTA 期间禁用） */
+
+/* "已连接从机"列表：行数固定，按发现数量显示/隐藏，避免运行时创建/删除
+ * LVGL 对象造成堆碎片。每行 = 状态点 + 文本（名字 / IP / RSSI / 离线）。
+ * 行距 19 = ui_font_cn_16 的 line_height；同步页顶部只留一行汇总，
+ * 23 + 8×19 = 175，正好占满 176 的内容区。 */
+#define SYNC_ROW_H     19
+#define SYNC_LIST_TOP  23
+static lv_obj_t *s_syncDots[SYNC_MAX_SLAVES];
+static lv_obj_t *s_syncRows[SYNC_MAX_SLAVES];
+
+/* 设置页内翻页：4 个固定页面容器 + 右上角箭头（LVGL 对象只在构建时创建） */
+#define SETTINGS_PAGE_COUNT  4
+#define PAGER_BTN_W          26
+#define PAGER_BTN_H          20
+#define PAGER_Y              1
+#define PAGER_LEFT_X         236
+#define PAGER_RIGHT_X        286
+static lv_obj_t *s_setPages[SETTINGS_PAGE_COUNT];
+static lv_obj_t *s_lblPageNum;
+static int       s_setPage;
 
 /* WiFi 配网对话框状态 */
 static lv_obj_t   *s_wifiDlg       = NULL;   /* 配网主对话框 */
@@ -745,50 +770,119 @@ static void settings_timer_cb(lv_timer_t *timer)
 
     {
         sync_protocol_master_status_t sync_st;
-        if (sync_protocol_master_get_status(&sync_st) == ESP_OK)
-        {
-            lv_color_t color = UI_COLOR_TEXT_SUB;
-            const char *text = "从节点: 未知";
+        sync_slave_info_t infos[SYNC_MAX_SLAVES];
+        uint8_t known = 0;
+        uint8_t online = 0;
+        uint8_t shown = 0;
+        const char *state_text = "待机";
+        bool status_ok = (sync_protocol_master_get_status(&sync_st) == ESP_OK);
+        bool list_ok = (sync_protocol_master_get_slaves(infos, SYNC_MAX_SLAVES,
+                                                        &known) == ESP_OK);
 
-            if (sync_st.slave_online)
+        if (!list_ok)
+        {
+            known = 0;
+        }
+        if (status_ok)
+        {
+            switch (sync_st.state)
             {
-                switch (sync_st.state)
-                {
-                case SYNC_STATE_IDLE:
-                    text = "从节点: 已连接（待播放）";
-                    color = UI_COLOR_OK;
-                    break;
-                case SYNC_STATE_PREPARING:
-                    text = "从节点: 准备中...";
-                    color = UI_COLOR_ACCENT;
-                    break;
-                case SYNC_STATE_PLAYING:
-                    text = "从节点: 同步播放中";
-                    color = UI_COLOR_OK;
-                    break;
-                case SYNC_STATE_PAUSED:
-                    text = "从节点: 已暂停";
-                    color = UI_COLOR_ACCENT;
-                    break;
-                case SYNC_STATE_STOPPED:
-                    text = "从节点: 已停止";
-                    color = UI_COLOR_TEXT_SUB;
-                    break;
-                case SYNC_STATE_ERROR:
-                    text = "从节点: 错误";
-                    color = UI_COLOR_ERR;
-                    break;
-                default:
-                    break;
-                }
+            case SYNC_STATE_IDLE:      state_text = "待机";       break;
+            case SYNC_STATE_PREPARING: state_text = "准备中";     break;
+            case SYNC_STATE_PLAYING:   state_text = "同步播放中"; break;
+            case SYNC_STATE_PAUSED:    state_text = "已暂停";     break;
+            case SYNC_STATE_STOPPED:   state_text = "已停止";     break;
+            case SYNC_STATE_ERROR:     state_text = "错误";       break;
+            default:                   state_text = "未知";       break;
+            }
+        }
+        for (uint8_t i = 0; i < known; i++)
+        {
+            if (infos[i].online)
+            {
+                online++;
+            }
+        }
+
+        if (!status_ok)
+        {
+            lv_label_set_text(s_lblSyncState, "同步服务未启动");
+            lv_obj_set_style_text_color(s_lblSyncState, UI_COLOR_DISABLED, 0);
+        }
+        else if (known == 0)
+        {
+            if (sync_st.slave_targets > 0)
+            {
+                lv_label_set_text_fmt(s_lblSyncState,
+                                      "正在扫描从机...（已配置 %u 个）",
+                                      (unsigned)sync_st.slave_targets);
             }
             else
             {
-                text = "从节点: 等待连接...";
+                lv_label_set_text(s_lblSyncState, "正在扫描从机...");
             }
+            lv_obj_set_style_text_color(s_lblSyncState, UI_COLOR_TEXT_SUB, 0);
+        }
+        else if (online == 0)
+        {
+            lv_label_set_text_fmt(s_lblSyncState, "已发现 %u 个 · 暂时无连接",
+                                  (unsigned)known);
+            lv_obj_set_style_text_color(s_lblSyncState, UI_COLOR_TEXT_SUB, 0);
+        }
+        else
+        {
+            lv_label_set_text_fmt(s_lblSyncState, "已连接 %u/%u · %s",
+                                  (unsigned)online, (unsigned)known, state_text);
+            lv_obj_set_style_text_color(s_lblSyncState, UI_COLOR_OK, 0);
+        }
 
-            lv_label_set_text(s_lblSyncState, text);
-            lv_obj_set_style_text_color(s_lblSyncState, color, 0);
+        /* 在线优先、离线排后面；离线条目保留并灰显（与 Sonos/HEOS 一致） */
+        for (uint8_t pass = 0; pass < 2; pass++)
+        {
+            bool want_online = (pass == 0);
+            for (uint8_t i = 0; i < known && shown < SYNC_MAX_SLAVES; i++)
+            {
+                if (infos[i].online != want_online)
+                {
+                    continue;
+                }
+
+                lv_obj_t *row = s_syncRows[shown];
+                lv_obj_t *dot = s_syncDots[shown];
+                const char *name = (infos[i].name[0] != '\0') ? infos[i].name
+                                                              : "从机";
+
+                if (infos[i].online)
+                {
+                    lv_label_set_text_fmt(row, "%s  %s  %d dBm", name,
+                                          infos[i].ip, (int)infos[i].rssi);
+                    lv_obj_set_style_text_color(row, UI_COLOR_TEXT, 0);
+                    lv_obj_set_style_bg_color(dot, UI_COLOR_OK, 0);
+                }
+                else
+                {
+                    uint32_t sec = infos[i].last_seen_ms / 1000u;
+                    if (sec > 999u)
+                    {
+                        sec = 999u;
+                    }
+                    lv_label_set_text_fmt(row, "%s  %s  失联 %us", name,
+                                          infos[i].ip, (unsigned)sec);
+                    lv_obj_set_style_text_color(row, UI_COLOR_DISABLED, 0);
+                    lv_obj_set_style_bg_color(dot, UI_COLOR_DISABLED, 0);
+                }
+
+                lv_obj_set_pos(dot, 8, SYNC_LIST_TOP + shown * SYNC_ROW_H + 5);
+                lv_obj_set_pos(row, 24, SYNC_LIST_TOP + shown * SYNC_ROW_H);
+                lv_obj_set_hidden(dot, false);
+                lv_obj_set_hidden(row, false);
+                shown++;
+            }
+        }
+        for (uint8_t i = shown; i < SYNC_MAX_SLAVES; i++)
+        {
+            lv_obj_set_hidden(s_syncDots[i], true);
+            lv_obj_set_hidden(s_syncRows[i], true);
         }
     }
 }
@@ -830,28 +924,113 @@ static lv_obj_t *text_btn(lv_obj_t *parent, int x, int y, int w, int h,
     return btn;
 }
 
+/* ======================== 设置页内翻页 ======================== */
+
+/** 设置页内的一页：占满内容区、不滚动、默认隐藏 */
+static lv_obj_t *set_page_add(lv_obj_t *parent)
+{
+    lv_obj_t *p = lv_obj_create(parent);
+
+    lv_obj_remove_style_all(p);
+    lv_obj_set_pos(p, 0, 0);
+    lv_obj_set_size(p, LCD_WIDTH, UI_CONTENT_H);
+    lv_obj_set_scrollable(p, false);
+    lv_obj_set_hidden(p, true);
+    return p;
+}
+
+/** 翻页箭头按钮：视觉 26×20，点击区域外扩 6px，手指更容易点中 */
+static lv_obj_t *pager_btn_add(lv_obj_t *parent, int x, const char *sym,
+                               lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_t *lbl;
+
+    lv_obj_remove_style_all(btn);
+    lv_obj_set_pos(btn, x, PAGER_Y);
+    lv_obj_set_size(btn, PAGER_BTN_W, PAGER_BTN_H);
+    lv_obj_set_style_bg_color(btn, UI_COLOR_PANEL, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn, 4, 0);
+    lv_obj_set_style_border_color(btn, UI_COLOR_BORDER, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_bg_color(btn, UI_COLOR_PRIMARY, LV_STATE_PRESSED);
+    lv_obj_set_ext_click_area(btn, 6);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+    lbl = ui_label_create(btn, sym, &ui_font_cn_16, UI_COLOR_TEXT);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+/** 切到第 idx 页（越界循环，右翻到底回到第 1 页） */
+static void settings_show_page(int idx)
+{
+    int i;
+
+    if (idx < 0)
+    {
+        idx = SETTINGS_PAGE_COUNT - 1;
+    }
+    else if (idx >= SETTINGS_PAGE_COUNT)
+    {
+        idx = 0;
+    }
+    s_setPage = idx;
+
+    for (i = 0; i < SETTINGS_PAGE_COUNT; i++)
+    {
+        lv_obj_set_hidden(s_setPages[i], i != idx);
+    }
+    if (s_lblPageNum != NULL)
+    {
+        lv_label_set_text_fmt(s_lblPageNum, "%d/%d", idx + 1, SETTINGS_PAGE_COUNT);
+    }
+}
+
+static void pager_prev_cb(lv_event_t *e)
+{
+    (void)e;
+    settings_show_page(s_setPage - 1);
+}
+
+static void pager_next_cb(lv_event_t *e)
+{
+    (void)e;
+    settings_show_page(s_setPage + 1);
+}
+
 void scr_settings_build(lv_obj_t *page)
 {
     const ui_cfg_t *cfg = ui_cfg();
     lv_obj_t *panel;
     lv_obj_t *lbl;
-    int y = 4;
+    lv_obj_t *p;
+    int y;
+    int i;
 
-    /* 页面允许竖向滚动（内容高约 500 > 176），隐藏滚动条保持整洁 */
-    lv_obj_set_scrollable(page, true);
+    /* 内容区不再整体滚动：固定 4 页，右上角箭头翻页 */
+    lv_obj_set_scrollable(page, false);
     lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
 
-    /* ---- 1. 播放源 ---- */
-    panel = section_add(page, y, "播放源", 44);
+    for (i = 0; i < SETTINGS_PAGE_COUNT; i++)
+    {
+        s_setPages[i] = set_page_add(page);
+    }
+
+    /* ---- 第 1 页：播放源 + 网络 ---- */
+    p = s_setPages[0];
+    y = 4;
+
+    panel = section_add(p, y, "播放源", 44);
     text_btn(panel, 8, 6, 70, 32, "蓝牙", src_bt_click_cb);
     text_btn(panel, 86, 6, 70, 32, "本地", src_local_click_cb);
     lbl = ui_label_create(panel, "蓝牙连接期间自动优先蓝牙模式",
                           &ui_font_cn_16, UI_COLOR_DISABLED);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 166, 0);
-    y += 20 + 44 + 8;
+    y += 20 + 44 + 8;   /* = 76 */
 
-    /* ---- 2. 网络 ---- */
-    panel = section_add(page, y, "网络", 70);
+    panel = section_add(p, y, "网络", 70);
     s_lblNetState = ui_label_create(panel,
         (cfg->wifi != NULL) ? "状态: --" : "状态: 未接线（传入 wifi 句柄后生效）",
         &ui_font_cn_16, UI_COLOR_TEXT_SUB);
@@ -859,37 +1038,61 @@ void scr_settings_build(lv_obj_t *page)
     s_lblNetIp = ui_label_create(panel, "IP: --", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblNetIp, 8, 40);
     text_btn(panel, 204, 20, 84, 30, "WiFi 配网", wifi_cfg_click_cb);
-    y += 20 + 70 + 8;
 
-    /* ---- 3. 同步播放 ---- */
-    panel = section_add(page, y, "同步播放", 40);
-    s_lblSyncState = ui_label_create(panel, "从节点: 检测中...",
+    /* ---- 第 2 页：同步播放 / 已连接从机 ----
+     * 本页不放分区标题（高度刚好 176）：顶部一行汇总，下面 8 行从机，
+     * 行距取字体行高 19，23 + 8×19 = 175。 */
+    p = s_setPages[1];
+    s_lblSyncState = ui_label_create(p, "正在扫描从机...",
                           &ui_font_cn_16, UI_COLOR_TEXT_SUB);
-    lv_obj_align(s_lblSyncState, LV_ALIGN_LEFT_MID, 8, 0);
-    y += 20 + 40 + 8;
+    lv_obj_set_pos(s_lblSyncState, 8, 2);
+    lv_obj_set_width(s_lblSyncState, 220);   /* 右侧给翻页按钮留位 */
+    lv_label_set_long_mode(s_lblSyncState, LV_LABEL_LONG_MODE_DOTS);
 
-    /* ---- 4. 语音助手 ---- */
-    panel = section_add(page, y, "语音助手", 58);
+    for (i = 0; i < SYNC_MAX_SLAVES; i++)
+    {
+        lv_obj_t *dot = lv_obj_create(p);
+        lv_obj_t *row;
+
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_scrollable(dot, false);
+        lv_obj_set_size(dot, 8, 8);
+        lv_obj_set_style_radius(dot, 4, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(dot, UI_COLOR_DISABLED, 0);
+        lv_obj_set_hidden(dot, true);
+        s_syncDots[i] = dot;
+
+        row = ui_label_create(p, "", &ui_font_cn_16, UI_COLOR_TEXT);
+        lv_obj_set_pos(row, 24, SYNC_LIST_TOP + i * SYNC_ROW_H);
+        lv_obj_set_width(row, LCD_WIDTH - 24 - 8);
+        lv_label_set_long_mode(row, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_hidden(row, true);
+        s_syncRows[i] = row;
+    }
+
+    /* ---- 第 3 页：语音助手 + 固件 ---- */
+    p = s_setPages[2];
+    y = 4;
+
+    panel = section_add(p, y, "语音助手", 58);
     s_lblMicState = ui_label_create(panel,
         (cfg->call_phone != NULL) ? "状态: --" : "状态: 未接线（传入 call_phone 句柄后生效）",
         &ui_font_cn_16, UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblMicState, 8, 8);
     lbl = ui_label_create(panel, "唤醒词: 你好小智", &ui_font_cn_16, UI_COLOR_DISABLED);
     lv_obj_set_pos(lbl, 8, 32);
-    y += 20 + 58 + 8;
+    y += 20 + 58 + 8;   /* = 90 */
 
-    /* ---- 5. 固件 ---- */
-    panel = section_add(page, y, "固件", 44);
-    {
-        s_lblFwVersion = ui_label_create(panel, "版本: " FW_VERSION,
-                              &ui_font_cn_16, UI_COLOR_TEXT_SUB);
-    }
+    panel = section_add(p, y, "固件", 44);
+    s_lblFwVersion = ui_label_create(panel, "版本: " FW_VERSION,
+                          &ui_font_cn_16, UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblFwVersion, 8, 12);
     s_btnOta = text_btn(panel, 204, 7, 84, 30, "检查更新", ota_click_cb);
-    y += 20 + 44 + 8;
 
-    /* ---- 6. 关于 ---- */
-    panel = section_add(page, y, "关于", 56);
+    /* ---- 第 4 页：关于 ---- */
+    p = s_setPages[3];
+    panel = section_add(p, 4, "关于", 56);
     lbl = ui_label_create(panel,
         SD_Card_Is_Mounted() ? "SD 卡: 已挂载" : "SD 卡: 未挂载",
         &ui_font_cn_16, UI_COLOR_TEXT_SUB);
@@ -898,5 +1101,13 @@ void scr_settings_build(lv_obj_t *page)
                           &ui_font_cn_16, UI_COLOR_DISABLED);
     lv_obj_set_pos(lbl, 8, 30);
 
+    /* ---- 翻页控件：最后创建，保证绘制在 4 个页面容器之上 ---- */
+    pager_btn_add(page, PAGER_LEFT_X, "←", pager_prev_cb);
+    pager_btn_add(page, PAGER_RIGHT_X, "→", pager_next_cb);
+    s_lblPageNum = ui_label_create(page, "1/4", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+    lv_obj_set_pos(s_lblPageNum, PAGER_LEFT_X + PAGER_BTN_W,
+                   PAGER_Y + 1);
+
+    settings_show_page(0);
     lv_timer_create(settings_timer_cb, 1000, NULL);
 }

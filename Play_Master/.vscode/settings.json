@@ -18,5 +18,5 @@
 ],
 "idf.flashType": "UART",
 "idf.currentSetup": "D:\\v6.0.3\\v6.0.3\\esp-idf",
-"idf.port": "COM3"
+"idf.port": "COM8"
 }

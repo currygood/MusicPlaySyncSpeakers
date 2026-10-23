@@ -17,10 +17,11 @@
  *     Magic(0xAA55,2) | Ver(1) | Flags(1) | StreamID(2) | Seq(2) |
  *     t_play_us(8) | PayloadLen(2) | LeadMs(2) | PCM
  *   接收端用 t_play_us 直接对齐出声时刻；时钟偏移由"最小单程延迟"单向估计，
- *   从节点**不需要回任何包**（PING/PONG 只在控制通道保留，已不参与音频同步）。
+ *   音频同步本身不需要从节点回包（PING/PONG 只在控制通道保留，已不参与音频同步）。
  *   t_play_us / 时间戳一律 64bit 微秒，避免 32bit 约 71 分钟回绕。
  *   控制命令（239.0.0.1:5679）：Magic + Cmd + Param
- *   控制扩展帧：SYNC_START(0x12)、SYNC_HEARTBEAT(0x13)、PING(0x20)/PONG(0x21)。
+ *   控制扩展帧：SYNC_START(0x12)、SYNC_HEARTBEAT(0x13)、PING(0x20)/PONG(0x21)、
+ *   ANNOUNCE(0x30，从节点 → 主节点，用于发现和在线检测)。
  */
 #ifndef SYNC_PROTOCOL_H
 #define SYNC_PROTOCOL_H
@@ -127,7 +128,58 @@ typedef enum {
     SYNC_MSG_HEARTBEAT  = 0x13,  /**< 基准：SYNC_HEARTBEAT */
     SYNC_MSG_PING       = 0x20,  /**< 从节点 → 主节点（时钟探测） */
     SYNC_MSG_PONG       = 0x21,  /**< 主节点 → 从节点（PING 应答） */
+    SYNC_MSG_ANNOUNCE   = 0x30,  /**< 从节点 → 主节点（上线公告 / 周期心跳） */
 } sync_protocol_msg_type_t;
+
+/* ======================== 从节点发现（ANNOUNCE） ================================= */
+
+/** ANNOUNCE 载荷版本。线格式改动时递增，主节点丢弃版本不符的公告 */
+#define SYNC_ANNOUNCE_VERSION   1u
+
+/**
+ * 配对令牌：主节点只接受令牌相同的从节点。
+ *
+ * 作用不是安全加密，而是防止同一局域网里"别人家的同款从节点"被自动
+ * 拉进本机的播放组。默认值必须与 Play_Slave 的 ctl_rx.c 保持一致；
+ * 将来做配网/配对 UI 时改成 NVS 字段即可。
+ */
+#define SYNC_ANNOUNCE_TOKEN     0x53594E43u   /* "SYNC" */
+
+/** 多久收不到公告判定从节点离线（公告周期 3s，连续丢 3 包） */
+#define SYNC_SLAVE_OFFLINE_TIMEOUT_MS   10000u
+
+/**
+ * @brief 从节点公告载荷（SYNC_MSG_ANNOUNCE，控制通道 5679）
+ *
+ * 从节点每 3 秒发一次，主节点据此维护"已连接从机"表：
+ *   - MAC 是设备身份，IP 可能因 DHCP 变化，所以按 MAC 做 upsert；
+ *   - IP 放在载荷里而不是取 recvfrom 源地址，是因为 wifi_manager 的
+ *     组播接收接口为了兼容旧调用没有暴露源地址；
+ *   - name 是 UTF-8 设备名（默认 "从机-XXXX"，由 MAC 末两字节生成）。
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t  ver;           /**< SYNC_ANNOUNCE_VERSION */
+    uint8_t  mac[6];        /**< STA MAC，设备唯一身份 */
+    uint8_t  ip[4];         /**< 当前 IPv4 地址（网络字节序，和 inet_pton 一致） */
+    uint16_t audio_port;    /**< 音频接收端口（当前 5680） */
+    uint8_t  volume;        /**< 当前音量 0~100 */
+    int8_t   rssi;          /**< 从节点侧 WiFi RSSI（dBm），主节点无法单边测量 */
+    uint8_t  flags;         /**< 保留，当前为 0 */
+    uint32_t token;         /**< SYNC_ANNOUNCE_TOKEN */
+    char     name[16];      /**< UTF-8 设备名，不足补 0，不保证 NUL 结尾 */
+} sync_announce_payload_t;
+
+/** 主节点维护的一台从节点（UI / 诊断用快照） */
+typedef struct {
+    uint8_t  mac[6];        /**< 设备 MAC */
+    char     name[20];      /**< 设备名（已保证 NUL 结尾） */
+    char     ip[16];        /**< 点分十进制 IP */
+    uint16_t audio_port;    /**< 音频接收端口 */
+    uint8_t  volume;        /**< 从节点上报的音量 */
+    int8_t   rssi;          /**< 从节点上报的 RSSI */
+    bool     online;        /**< 最近 SYNC_SLAVE_OFFLINE_TIMEOUT_MS 内收到过公告 */
+    uint32_t last_seen_ms;  /**< 距最近一次公告的毫秒数（离线后继续增长） */
+} sync_slave_info_t;
 
 /** PING 载荷：t1 = 从节点发送时刻（从节点时间轴） */
 typedef struct __attribute__((packed)) {
@@ -207,6 +259,8 @@ typedef struct {
     int64_t          play_delta_us;  /* 本机出队播放与 t_play_master 的偏差（µs） */
     bool             slave_online;
     int32_t          last_slave_offset_us; /* 主节点无法单边计算，恒为 0，从机阶段填写 */
+    uint8_t          slave_targets;   /* 当前单播目标数（发现后 = 在线从机数） */
+    uint8_t          slaves_online;   /* ANNOUNCE 在线从机数 */
 } sync_protocol_master_status_t;
 
 /* ======================== 事件回调 ================================================ */
@@ -254,10 +308,25 @@ esp_err_t sync_protocol_master_set_channels(uint8_t channels);
 /**
  * @brief 运行时设置单播目标从机列表（最多 SYNC_MAX_SLAVES 个）
  *
- * 当前从机地址是手动配置的（路由器上做 DHCP 静态绑定，或在这里改）。
- * 自动发现（从机上线广播 / 主节点收集）留待后续，见架构文档"下一步"。
+ * 手动设置只在"还没收到过任何 ANNOUNCE"时长期有效；一旦从节点开始公告，
+ * 单播目标会由发现表按在线状态自动重建，手动表只作为过渡（最长 3 秒）。
  */
 esp_err_t sync_protocol_master_set_slaves(const char *const *ips, uint8_t count);
+
+/**
+ * @brief 读取"已发现从机"快照（供 LCD 设置页 1s 轮询）
+ *
+ * 表按 MAC 去重、按发现顺序排列；离线条目会保留（灰显用），最多
+ * SYNC_MAX_SLAVES 条。新设备在表满时会顶掉最早离线的条目。
+ *
+ * @param out       输出数组，调用方分配
+ * @param capacity  out 的容量（通常传 SYNC_MAX_SLAVES）
+ * @param count     输出实际条数（可为 NULL）
+ * @return ESP_OK；未初始化/参数非法返回错误
+ */
+esp_err_t sync_protocol_master_get_slaves(sync_slave_info_t *out,
+                                          uint8_t capacity,
+                                          uint8_t *count);
 
 esp_err_t sync_protocol_master_broadcast_cmd(sync_protocol_cmd_t cmd,
                                              uint8_t param);

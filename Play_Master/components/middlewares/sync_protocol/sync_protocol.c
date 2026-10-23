@@ -76,9 +76,9 @@
 /**
  * 单播目标从机的**编译期默认列表**。
  *
- * 单播必须知道对端 IP。正式的"从机上线自动发现"还没做，现阶段请在路由器上
- * 给从机做 DHCP 静态绑定，然后改这里（运行时也可以用
- * sync_protocol_master_set_slaves() 覆盖）。
+ * 单播必须知道对端 IP。新从节点固件会每 3 秒在控制通道发 ANNOUNCE，
+ * 主节点收到后按 MAC 维护运行时从机表，并自动用"在线从机 IP"覆盖这里；
+ * 静态列表只在**还没收到过任何公告**时兜底（兼容旧固件 / 从机没上电）。
  *
  * 列表为空时音频只在本机播放，不往网络上发。
  */
@@ -139,6 +139,12 @@ typedef struct {
     int16_t  pcm[SYNC_FRAME_MAX_SAMPLES];
 } sync_delay_entry_t;
 
+/** 从节点表条目：对外快照 + 内部单调时间基准 */
+typedef struct {
+    sync_slave_info_t info;
+    uint64_t          last_seen_us;   /* 最近一次合法 ANNOUNCE 的 esp_timer */
+} sync_slave_entry_t;
+
 /** 模块单例 */
 typedef struct {
     bool inited;
@@ -197,6 +203,12 @@ typedef struct {
     uint64_t last_heartbeat_us;
     bool     start_sent;
 
+    /* 从节点发现（ANNOUNCE，控制通道 5679） */
+    sync_slave_entry_t slaves[SYNC_MAX_SLAVES];
+    uint8_t  slave_known;          /* 表内条目数（0~SYNC_MAX_SLAVES） */
+    bool     announce_seen;        /* 收到过合法公告后，单播目标改为按在线表重建 */
+    uint64_t last_sweep_us;        /* 离线扫描节流（1s） */
+
     /* 事件 */
     sync_protocol_event_cb_t event_cb;
     void                    *event_ctx;
@@ -207,6 +219,7 @@ typedef struct {
 
 static sync_master_t s_master;
 static SemaphoreHandle_t s_lock = NULL;   /* 保护 state/参数/队列元数据 */
+static SemaphoreHandle_t s_push_lock = NULL; /* 串行化入口环的生产者（解码/蓝牙） */
 
 /* 内部 IO 中转（避免任务栈过大） */
 static uint8_t  s_io_buf[SYNC_IO_BUF_BYTES];
@@ -241,6 +254,199 @@ static esp_err_t sync_set_slaves_locked(const char *const *ips, uint8_t count)
     return ESP_OK;
 }
 
+/* ---------------- 从节点发现（ANNOUNCE） ---------------- */
+
+/** 是否有在线从机（须持 s_lock） */
+static bool sync_any_slave_online_locked(void)
+{
+    for (uint8_t i = 0; i < s_master.slave_known; i++)
+    {
+        if (s_master.slaves[i].info.online)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief 用"在线从机表"重建单播目标（须持 s_lock）
+ *
+ * 收到第一份合法公告之前保持编译期/运行时配置的静态列表，保证旧固件
+ * （不发公告）和没插从机的场景行为不变；收到公告之后，发现表成为唯一
+ * 权威——离线从机不再浪费单播带宽，回来后由下一份公告自动加回。
+ */
+static void sync_rebuild_targets_locked(void)
+{
+    const char *ips[SYNC_MAX_SLAVES];
+    uint8_t count = 0;
+
+    if (!s_master.announce_seen)
+    {
+        return;
+    }
+    for (uint8_t i = 0; i < s_master.slave_known; i++)
+    {
+        if (s_master.slaves[i].info.online)
+        {
+            ips[count++] = s_master.slaves[i].info.ip;
+        }
+    }
+    (void)sync_set_slaves_locked(count ? ips : NULL, count);
+}
+
+/**
+ * @brief 处理一条 SYNC_MSG_ANNOUNCE（在 SyncTx_Task 上下文调用）
+ *
+ * 按 MAC upsert：IP 变化时直接覆盖（DHCP 换地址后仍能继续收音频）。
+ * 表满时顶掉"最久没消息的离线条目"；全部在线则忽略新设备，避免把
+ * 正在播的从机挤掉。
+ */
+static void sync_announce_handle(const sync_ctrl_ext_t *ext, size_t pkt_len)
+{
+    sync_announce_payload_t a;
+    char ip[16];
+    char name[sizeof(s_master.slaves[0].info.name)];
+    int64_t now_us;
+    int idx = -1;
+    bool became_online = false;
+
+    if (ext->len != sizeof(a) ||
+        pkt_len < sizeof(sync_ctrl_ext_t) + sizeof(a))
+    {
+        return;
+    }
+    memcpy(&a, ext->data, sizeof(a));
+    if (a.ver != SYNC_ANNOUNCE_VERSION || a.token != SYNC_ANNOUNCE_TOKEN)
+    {
+        return;
+    }
+    if (a.audio_port == 0 ||
+        (a.ip[0] | a.ip[1] | a.ip[2] | a.ip[3]) == 0)
+    {
+        return;
+    }
+
+    snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
+             (unsigned)a.ip[0], (unsigned)a.ip[1],
+             (unsigned)a.ip[2], (unsigned)a.ip[3]);
+
+    /* 设备名：载荷里是定长字段，先补 NUL；空名字回退到 MAC 后缀 */
+    memset(name, 0, sizeof(name));
+    memcpy(name, a.name, sizeof(a.name));
+    if (name[0] == '\0')
+    {
+        snprintf(name, sizeof(name), "从机-%02X%02X", a.mac[4], a.mac[5]);
+    }
+
+    now_us = esp_timer_get_time();
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    for (uint8_t i = 0; i < s_master.slave_known; i++)
+    {
+        if (memcmp(s_master.slaves[i].info.mac, a.mac, sizeof(a.mac)) == 0)
+        {
+            idx = (int)i;
+            break;
+        }
+    }
+
+    if (idx < 0)
+    {
+        if (s_master.slave_known < SYNC_MAX_SLAVES)
+        {
+            idx = (int)s_master.slave_known++;
+        }
+        else
+        {
+            /* 表满：挑最久没消息的离线条目复用；全在线则不接纳新设备 */
+            uint64_t oldest = UINT64_MAX;
+            for (uint8_t i = 0; i < s_master.slave_known; i++)
+            {
+                if (!s_master.slaves[i].info.online &&
+                    s_master.slaves[i].last_seen_us < oldest)
+                {
+                    oldest = s_master.slaves[i].last_seen_us;
+                    idx = (int)i;
+                }
+            }
+            if (idx < 0)
+            {
+                xSemaphoreGive(s_lock);
+                SYNC_LOGW("slave table full (%u online), ignore %s",
+                          (unsigned)s_master.slave_known, ip);
+                return;
+            }
+            memset(&s_master.slaves[idx], 0, sizeof(s_master.slaves[idx]));
+        }
+    }
+
+    sync_slave_entry_t *e = &s_master.slaves[idx];
+    memcpy(e->info.mac, a.mac, sizeof(a.mac));
+    snprintf(e->info.name, sizeof(e->info.name), "%s", name);
+    snprintf(e->info.ip, sizeof(e->info.ip), "%s", ip);
+    e->info.audio_port = a.audio_port;
+    e->info.volume     = (a.volume > 100) ? 100 : a.volume;
+    e->info.rssi       = a.rssi;
+    became_online      = !e->info.online;
+    e->info.online     = true;
+    e->last_seen_us    = (uint64_t)now_us;
+
+    s_master.announce_seen = true;
+    s_master.slave_online  = sync_any_slave_online_locked();
+    /* 每份公告都重建：从机可能在保持在线的情况下换了 IP（DHCP 续租），
+     * 只在新上线时重建会让主节点继续往旧地址发。8 条字符串，开销可忽略。 */
+    sync_rebuild_targets_locked();
+    uint8_t volume  = e->info.volume;
+    uint8_t targets = s_master.slave_count;
+
+    xSemaphoreGive(s_lock);
+
+    if (became_online)
+    {
+        SYNC_LOGI("slave online: %s ip=%s rssi=%d vol=%u (targets=%u)",
+                  name, ip, (int)a.rssi, (unsigned)volume,
+                  (unsigned)targets);
+    }
+}
+
+/** 离线扫描：1s 一次，超时标离线并重建单播目标（SyncTx_Task 上下文） */
+static void sync_slaves_sweep(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    bool changed = false;
+
+    if (now_us - (int64_t)s_master.last_sweep_us < 1000000)
+    {
+        return;
+    }
+    s_master.last_sweep_us = (uint64_t)now_us;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (uint8_t i = 0; i < s_master.slave_known; i++)
+    {
+        sync_slave_entry_t *e = &s_master.slaves[i];
+        if (e->info.online &&
+            (uint64_t)now_us - e->last_seen_us >
+                (uint64_t)SYNC_SLAVE_OFFLINE_TIMEOUT_MS * 1000u)
+        {
+            e->info.online = false;
+            changed = true;
+            SYNC_LOGW("slave lost: %s (%s)", e->info.name, e->info.ip);
+        }
+    }
+    if (changed)
+    {
+        sync_rebuild_targets_locked();
+    }
+    if (s_master.announce_seen)
+    {
+        s_master.slave_online = sync_any_slave_online_locked();
+    }
+    xSemaphoreGive(s_lock);
+}
+
 static void sync_snapshot(sync_protocol_master_status_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -258,6 +464,15 @@ static void sync_snapshot(sync_protocol_master_status_t *out)
     out->play_delta_us = s_master.play_delta_us;
     out->slave_online  = s_master.slave_online;
     out->last_slave_offset_us = 0;   /* 主节点不能单边计算 offset */
+    out->slave_targets = s_master.slave_count;
+    out->slaves_online = 0;
+    for (uint8_t i = 0; i < s_master.slave_known; i++)
+    {
+        if (s_master.slaves[i].info.online)
+        {
+            out->slaves_online++;
+        }
+    }
 }
 
 /* ---------------- 事件回调 ---------------- */
@@ -437,6 +652,11 @@ static void sync_handle_control_rx(void)
             continue;
         }
         sync_ctrl_ext_t *ext = (sync_ctrl_ext_t *)buf;
+        if (ext->type == SYNC_MSG_ANNOUNCE)
+        {
+            sync_announce_handle(ext, len);
+            continue;
+        }
         if (ext->type == SYNC_MSG_PING && ext->len == sizeof(sync_ping_payload_t))
         {
             sync_ping_payload_t  ping;
@@ -449,7 +669,7 @@ static void sync_handle_control_rx(void)
             pong.t1_us = ping.t1_us;
             pong.t2_us = (uint64_t)now_us;
             pong.t3_us = (uint64_t)esp_timer_get_time();   /* 发出时刻 */
-            if (s_master.slave_online == false)
+            if (!s_master.announce_seen && s_master.slave_online == false)
             {
                 s_master.slave_online = true;
                 SYNC_LOGI("slave online (first PING)");
@@ -471,8 +691,10 @@ static void sync_handle_control_rx(void)
         }
     }
 
-    /* 从节点在线超时检测（如已超过一个 PING 周期未收到） */
-    if (s_master.slave_online &&
+    /* 从节点在线超时检测（如已超过一个 PING 周期未收到）。
+     * 收到过 ANNOUNCE 之后，在线状态由发现表的超时逻辑接管，
+     * 旧的 PING 超时不能再来改 slave_online。 */
+    if (!s_master.announce_seen && s_master.slave_online &&
         ((uint64_t)esp_timer_get_time() - s_master.last_ping_us) >
             (uint64_t)SYNC_SLAVE_ONLINE_TIMEOUT_MS * 1000u)
     {
@@ -480,6 +702,9 @@ static void sync_handle_control_rx(void)
         SYNC_LOGW("slave lost (no PING in %u ms)", SYNC_SLAVE_ONLINE_TIMEOUT_MS);
         sync_emit_event(SYNC_EVT_SLAVE_LOST);
     }
+
+    /* 公告超时扫描（1s 节流，在 TX 任务上下文执行） */
+    sync_slaves_sweep();
 }
 
 /* ======================== 任务实现 ======================== */
@@ -535,7 +760,22 @@ static void sync_tx_task(void *arg)
             {
                 break;
             }
-            size_t frames = got / (s_master.channels * 2);
+            size_t unit = (size_t)s_master.channels * 2;
+            if (unit != 0 && (got % unit) != 0)
+            {
+                /* 环里读出了半个采样：采样边界已无法恢复。与其把错位字节
+                 * 拼成满量程噪声、一直响到用户手动暂停再播放，不如丢掉
+                 * 整条流重新积累（最多一次 D 的静音缺口）。
+                 * 生产端已按整采样写入，正常情况不会走到这里。 */
+                SYNC_LOGE("ingress misaligned (got=%u unit=%u), reset buffer",
+                          (unsigned)got, (unsigned)unit);
+                xSemaphoreTake(s_push_lock, portMAX_DELAY);
+                xStreamBufferReset(s_master.ingress);
+                xSemaphoreGive(s_push_lock);
+                s_master.frame_filled = 0;
+                break;
+            }
+            size_t frames = got / unit;
             const int16_t *src = (const int16_t *)s_io_buf;
             int16_t *dst = &s_master.frame_buf[s_master.frame_filled];
             if (s_master.channels == 2)
@@ -704,6 +944,40 @@ static void sync_tx_task(void *arg)
 }
 
 /**
+ * @brief 非播放态喂一帧全零 PCM，保证 I2S DMA 永远有数据可播
+ *
+ * 为什么不能"写一帧静音 + 固定 vTaskDelay(15ms)"：
+ *   Amplifier_Play_Buffer() 在 DMA 满时本身就会阻塞约一帧（15.8ms），
+ *   再睡 15ms 会让喂入速度只有实时的一半 —— DMA 缓冲（约 46ms）被抽干后
+ *   数据脚浮空，NS4168 放大成嗡嗡声。这个缺陷会让"喂静音"的修复在
+ *   换歌/解码间隙较长时失效（实测一曲将尽时持续嗡嗡）。
+ *
+ * 这里把**阻塞写本身当作节拍源**：
+ *   - 写满一帧（耗时接近一帧时长）→ 说明 DMA 已被喂饱，不再睡；
+ *   - 写得很快（DMA 还有余量）→ 让出 1 tick，避免高优先级任务空转。
+ */
+static void sync_feed_silence(void)
+{
+    int64_t t0;
+    int64_t frame_us = (int64_t)s_master.cfg_frame_ms * 1000;
+
+    if (s_master.play_buf == NULL)
+    {
+        vTaskDelay(1);
+        return;
+    }
+
+    memset(s_master.play_buf, 0, SYNC_FRAME_MAX_SAMPLES * 2 * sizeof(int16_t));
+    t0 = esp_timer_get_time();
+    (void)Amplifier_Play_Buffer((const uint8_t *)s_master.play_buf,
+                                SYNC_FRAME_MAX_SAMPLES * 4, NULL, 100);
+    if (esp_timer_get_time() - t0 < frame_us / 2)
+    {
+        vTaskDelay(1);
+    }
+}
+
+/**
  * @brief SyncLocalPlay_Task：本地延迟队列到点出队，
  *        单声道 → 立体声（L/R 写同一份）后经 amplifier 落 I2S
  */
@@ -719,13 +993,7 @@ static void sync_play_task(void *arg)
         }
         if (!s_master.started || s_master.state == SYNC_STATE_PAUSED)
         {
-            if (s_master.play_buf != NULL)
-            {
-                memset(s_master.play_buf, 0, SYNC_FRAME_MAX_SAMPLES * 2 * sizeof(int16_t));
-                Amplifier_Play_Buffer((const uint8_t *)s_master.play_buf,
-                                      SYNC_FRAME_MAX_SAMPLES * 4, NULL, 100);
-            }
-            vTaskDelay(pdMS_TO_TICKS(15));
+            sync_feed_silence();
             continue;
         }
 
@@ -734,13 +1002,7 @@ static void sync_play_task(void *arg)
         if (cnt == 0)
         {
             xSemaphoreGive(s_lock);
-            if (s_master.play_buf != NULL)
-            {
-                memset(s_master.play_buf, 0, SYNC_FRAME_MAX_SAMPLES * 2 * sizeof(int16_t));
-                Amplifier_Play_Buffer((const uint8_t *)s_master.play_buf,
-                                      SYNC_FRAME_MAX_SAMPLES * 4, NULL, 100);
-            }
-            vTaskDelay(pdMS_TO_TICKS(15));
+            sync_feed_silence();
             continue;
         }
         /* PREPARING → PLAYING：灌足 D 时长才允许出声 */
@@ -756,11 +1018,13 @@ static void sync_play_task(void *arg)
         }
 
         /* PREPARING 阶段只攒 D 缓冲、不出队播放，否则队列永远灌不满、
-         * 状态卡在 PREPARING（第九阶段自环测试 [D] 暴露） */
+         * 状态卡在 PREPARING（第九阶段自环测试 [D] 暴露）。
+         * 但攒缓冲期间 I2S 不能断粮：解码/开卡可能要几百 ms，DMA 46ms
+         * 就放空了，所以这里同样喂静音帧。 */
         if (s_master.state == SYNC_STATE_PREPARING)
         {
             xSemaphoreGive(s_lock);
-            vTaskDelay(pdMS_TO_TICKS(2));
+            sync_feed_silence();
             continue;
         }
 
@@ -907,6 +1171,14 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
     {
         s_lock = xSemaphoreCreateMutex();
         if (s_lock == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_push_lock == NULL)
+    {
+        s_push_lock = xSemaphoreCreateMutex();
+        if (s_push_lock == NULL)
         {
             return ESP_ERR_NO_MEM;
         }
@@ -1130,7 +1402,13 @@ esp_err_t sync_protocol_master_stop(void)
 
 esp_err_t sync_protocol_master_push_pcm(const int16_t *pcm, size_t samples)
 {
-    size_t bytes;
+    size_t   unit;
+    size_t   bytes;
+    size_t   total;
+    size_t   off = 0;
+    bool     playing;
+    uint32_t gen;
+    int64_t  deadline_us;
 
     if (!s_master.inited)
     {
@@ -1140,16 +1418,87 @@ esp_err_t sync_protocol_master_push_pcm(const int16_t *pcm, size_t samples)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    bytes = samples * sizeof(int16_t);
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    playing = (s_master.started && s_master.state == SYNC_STATE_PLAYING);
+    unit    = (size_t)s_master.channels * sizeof(int16_t);
+    gen     = s_master.stream_gen;
+    xSemaphoreGive(s_lock);
+
+    if (unit == 0)
+    {
+        unit = sizeof(int16_t);   /* 还没 start()：按单声道对齐即可 */
+    }
+
+    total = samples * sizeof(int16_t);
+    /*
+     * 入口环是**字节流**，没有消息边界。只要写进去的字节数不是通道整数倍
+     * （比如立体声写进 3 字节），环里所有采样的边界就永久错位一格，之后
+     * 消费端把相邻两字节拼成 int16，主节点和从节点都会持续播放满量程噪声，
+     * 只能靠暂停→播放（sync_reset_stream → xStreamBufferReset）恢复。
+     *
+     * xStreamBufferSend() 带超时返回时**只写 xSpace 字节**（部分写入），而
+     * 空闲空间 = xLength + xTail - xHead - 1：缓冲区长度是偶数、读写游标
+     * 一直按整采样走，所以空闲空间恒为**奇数**——一旦走这条部分写入路径，
+     * 就必然写进非整采样字节。因此这里绝不能依赖 xStreamBufferSend 的
+     * 超时语义：先把空闲空间向下取整到整采样，再按整采样块发送。
+     */
+    bytes = total - (total % unit);
+    if (bytes == 0)
+    {
+        return ESP_OK;
+    }
+
     /* 播放中给上游 30ms 背压窗口：解码端允许跑在消费速率之前形成缓冲，
      * 被抢占/读卡慢时用缓冲垫掉，避免 I2S/从节点欠载（卡顿根因）；
      * 暂停/停止等非播放态保持"绝不阻塞调用方"语义，直接丢帧。 */
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    bool playing = (s_master.started &&
-                    s_master.state == SYNC_STATE_PLAYING);
-    xSemaphoreGive(s_lock);
-    TickType_t wait = playing ? pdMS_TO_TICKS(30) : 0;
-    if (xStreamBufferSend(s_master.ingress, pcm, bytes, wait) != bytes)
+    deadline_us = esp_timer_get_time() + (playing ? 30 * 1000 : 0);
+
+    while (off < bytes)
+    {
+        size_t sent  = 0;
+        size_t space;
+        size_t room;
+
+        /* 换流/复位后旧通道的尾巴不能再混进新流 */
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        bool stale = (s_master.stream_gen != gen);
+        xSemaphoreGive(s_lock);
+        if (stale)
+        {
+            break;
+        }
+
+        /* 生产者互斥：free-space 判定和写入必须是原子的，否则两个生产者
+         * （本地解码 / 蓝牙）交错时仍可能写出非整采样字节。 */
+        xSemaphoreTake(s_push_lock, portMAX_DELAY);
+        space = xStreamBufferSpacesAvailable(s_master.ingress);
+        room  = space - (space % unit);
+        if (room > 0)
+        {
+            size_t chunk = bytes - off;
+            if (chunk > room)
+            {
+                chunk = room;
+            }
+            sent = xStreamBufferSend(s_master.ingress,
+                                     (const uint8_t *)pcm + off, chunk, 0);
+        }
+        xSemaphoreGive(s_push_lock);
+
+        if (sent == 0)
+        {
+            if (!playing || esp_timer_get_time() >= deadline_us)
+            {
+                break;   /* 背压超时/非播放态：丢弃剩余部分 */
+            }
+            vTaskDelay(1);
+            continue;
+        }
+        off += sent;
+    }
+
+    if (off != total)
     {
         /* 背压超时/非播放态丢帧计数（上游过快或下游长时间不消费） */
         s_master.dropped_pkts++;
@@ -1292,6 +1641,47 @@ esp_err_t sync_protocol_master_get_status(sync_protocol_master_status_t *status)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     sync_snapshot(status);
     xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
+esp_err_t sync_protocol_master_get_slaves(sync_slave_info_t *out,
+                                          uint8_t capacity,
+                                          uint8_t *count)
+{
+    int64_t now_us;
+    uint8_t n;
+
+    if (out == NULL || capacity == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_master.inited)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    now_us = esp_timer_get_time();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    n = s_master.slave_known;
+    if (n > capacity)
+    {
+        n = capacity;
+    }
+    for (uint8_t i = 0; i < n; i++)
+    {
+        uint64_t age_us;
+        out[i] = s_master.slaves[i].info;
+        age_us = (uint64_t)now_us - s_master.slaves[i].last_seen_us;
+        out[i].last_seen_ms = (age_us > (uint64_t)UINT32_MAX * 1000u)
+                                  ? UINT32_MAX
+                                  : (uint32_t)(age_us / 1000u);
+    }
+    xSemaphoreGive(s_lock);
+
+    if (count != NULL)
+    {
+        *count = n;
+    }
     return ESP_OK;
 }
 

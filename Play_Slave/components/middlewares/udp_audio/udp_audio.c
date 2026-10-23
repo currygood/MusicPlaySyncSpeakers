@@ -120,6 +120,12 @@
  *  不在零点附近，会有一个直流台阶（"啪"一声）。128 点 ≈ 2.9ms，听不出。 */
 #define UA_FADE_IN_SAMPLES          (128)
 
+/** 非播放态喂静音用的帧长：441 采样 = 10ms @44.1k。
+ *  与 UDIO_SAMPLE_RATE 无关地取 10ms，是为了在 preroll 期间也能及时
+ *  响应"数据到齐、可以开播"（最多晚 10ms）。 */
+#define UA_SILENCE_SAMPLES          (441)
+#define UA_SILENCE_US               (10000)
+
 /* ======================== 环形槽位 ======================== */
 
 typedef struct {
@@ -597,6 +603,37 @@ static void ua_write_plc(int16_t *last_good, size_t n, uint32_t timeout)
                           NULL, timeout);
 }
 
+/**
+ * @brief 非播放态喂一帧静音，避免 I2S DMA 放空
+ *
+ * 从机 I2S 通道在 Amplifier_Init() 后就一直使能，BCLK/WS 持续运行。
+ * 播放任务在"还没 preroll 完 / 断流后重新等"的阶段如果什么都不写，
+ * DMA 46ms 内就会放空，数据脚浮空被 NS4168 放大成**持续嗡嗡声**——
+ * 主节点暂停、换歌、从机刚上电但主节点还没发流时都会遇到。
+ *
+ * 这里和主节点用同一套节拍策略：阻塞写本身就是节拍源。
+ * 写满一帧（耗时接近 10ms）就不再睡；写很快（DMA 有余量）才让出 1 tick。
+ */
+static void ua_write_silence(int16_t *buf, uint32_t timeout)
+{
+    int64_t t0;
+
+    if (buf == NULL)
+    {
+        vTaskDelay(1);
+        return;
+    }
+
+    memset(buf, 0, UA_SILENCE_SAMPLES * sizeof(int16_t));
+    t0 = esp_timer_get_time();
+    Amplifier_Play_Buffer((const uint8_t *)buf,
+                          UA_SILENCE_SAMPLES * sizeof(int16_t), NULL, timeout);
+    if (esp_timer_get_time() - t0 < UA_SILENCE_US / 2)
+    {
+        vTaskDelay(1);
+    }
+}
+
 /** 尝试完成 preroll。成功时输出起始 seq、冻结用的 offset、以及该帧的写入时刻 */
 static bool ua_try_start(uint16_t *read_seq, int64_t *offset_us, int64_t *start_at)
 {
@@ -697,7 +734,10 @@ static void ua_play_task(void *arg)
 
             if (!ua_try_start(&read_seq, &offset_us, &start_at))
             {
-                vTaskDelay(pdMS_TO_TICKS(20));
+                /* 还没攒够 preroll（或主节点暂停/换歌中）：继续喂静音。
+                 * 这里千万不能只 sleep —— DMA 放空后 BCLK 还在跑，
+                 * 数据脚浮空就是持续嗡嗡声（从机侧"一直噪音"的根因）。 */
+                ua_write_silence(slip_buf, 100);
                 continue;
             }
 

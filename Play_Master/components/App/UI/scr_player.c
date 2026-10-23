@@ -2,7 +2,7 @@
  * @file scr_player.c
  * @brief 播放页（Tab 1，默认主页；UI 界面设计 5.2）
  *
- * 布局：顶区 128px（左封面 128×128 + 右信息列）+ 控制行 48px。
+ * 布局：顶区信息列（封面已移除，标题/副标题/进度/音量居中铺满）+ 控制行 48px。
  * 数据接线（第十一阶段，MusicPlay 已实现）：
  *   - 控制：music_play_command(TOGGLE/NEXT/PREV)、music_play_set_mode()、
  *     music_play_set_volume()；按键只做按压动效、绝不本地翻转状态，等
@@ -19,9 +19,6 @@
 #include "esp_log.h"
 
 #include <stdio.h>
-
-/* ======================== 资源路径（烧录在 flash storage 分区，见 ui_priv.h） ======================== */
-#define PLAYER_COVER_PATH   UI_IMG_COVER
 
 /* ======================== 控件句柄（第十一阶段真实数据接入） ======================== */
 static lv_obj_t *s_lblPlayIcon;   /* 播放/暂停图标（view->state 决定） */
@@ -436,49 +433,16 @@ void scr_player_apply_event(const music_event_t *evt)
 
 /* ======================== 页面构建 ======================== */
 
-/** 封面：SD 资源存在用 PNG，否则深色面板 + 音符图标占位（8.4 容错） */
-static void cover_build(lv_obj_t *page)
-{
-    lv_obj_t *cover = lv_image_create(page);
-
-    lv_obj_remove_style_all(cover);
-    lv_obj_set_pos(cover, 0, 0);
-    lv_obj_set_size(cover, UI_COVER_SIZE, UI_COVER_SIZE);
-    lv_obj_set_style_bg_color(cover, UI_COLOR_PANEL, 0);
-    lv_obj_set_style_bg_opa(cover, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(cover, 8, 0);
-    lv_obj_set_style_clip_corner(cover, true, 0);
-
-    if (ui_img_file_ok(PLAYER_COVER_PATH))
-    {
-        lv_image_set_src(cover, PLAYER_COVER_PATH);
-        /* 用户图片尺寸不一定是 128：CONTAIN 等比缩放适配控件区域 */
-        lv_image_set_inner_align(cover, LV_IMAGE_ALIGN_CONTAIN);
-        UI_LOGI( "cover loaded: %s", PLAYER_COVER_PATH);
-    }
-    else
-    {
-        lv_obj_t *icon = ui_label_create(cover, UI_ICON_MUSIC, &ui_icons_24,
-                                         UI_COLOR_DISABLED);
-        lv_obj_align(icon, LV_ALIGN_CENTER, 0, 0);
-        UI_LOGW( "cover missing: %s（SPIFFS 未挂载/镜像未烧录/"
-                      "未开启 CONFIG_LV_USE_LODEPNG），使用占位图", PLAYER_COVER_PATH);
-    }
-}
-
 void scr_player_build(lv_obj_t *page)
 {
     const ui_cfg_t *cfg = ui_cfg();
-    const int colX = UI_COVER_SIZE + 4;         /* 右信息列起点 x=132 */
-    const int colW = LCD_WIDTH - colX - 4;      /* 184 */
+    /* 封面已移除：右信息列横向铺满整屏（左右各留 12px 边距），内容居中变长 */
+    const int colX = 12;                    /* 信息列起点 x=12 */
+    const int colW = LCD_WIDTH - 24;        /* 宽 296，居中铺满 */
     lv_obj_t *chip;
-    lv_obj_t *listBtn;
     lv_obj_t *lbl;
 
-    /* ---- 顶区左：封面 128×128 ---- */
-    cover_build(page);
-
-    /* ---- 顶区右：源 chip + 列表入口 ---- */
+    /* ---- 顶区：源 chip + 列表入口（封面已移除，chip 居左） ---- */
     chip = lv_button_create(page);
     lv_obj_remove_style_all(chip);
     lv_obj_set_pos(chip, colX, 4);
@@ -493,10 +457,11 @@ void scr_player_build(lv_obj_t *page)
     s_lblSrcChip = ui_label_create(chip, "本地", &ui_font_cn_16, UI_COLOR_ACCENT);
     lv_obj_center(s_lblSrcChip);
 
+    /* 列表入口按钮放大 1/3：32×26 -> 43×35 */
     s_btnList = lv_button_create(page);
     lv_obj_remove_style_all(s_btnList);
-    lv_obj_set_pos(s_btnList, LCD_WIDTH - 4 - 32, 4);
-    lv_obj_set_size(s_btnList, 32, 26);
+    lv_obj_set_pos(s_btnList, LCD_WIDTH - 12 - 43, 4);
+    lv_obj_set_size(s_btnList, 43, 35);
     lv_obj_set_style_bg_color(s_btnList, UI_COLOR_PANEL, 0);
     lv_obj_set_style_bg_opa(s_btnList, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_btnList, 8, 0);
@@ -505,17 +470,19 @@ void scr_player_build(lv_obj_t *page)
     s_lblListIcon = ui_label_create(s_btnList, UI_ICON_LIST, &ui_icons_16, UI_COLOR_TEXT);
     lv_obj_center(s_lblListIcon);
 
-    /* ---- 顶区右：标题 / 副标题（随 MUSIC_EVT_TRACK_* 更新） ---- */
+    /* ---- 标题 / 副标题（随 MUSIC_EVT_TRACK_* 更新，居中变长） ---- */
     s_lblTitle = ui_label_create(page, "无曲目", &ui_font_cn_16, UI_COLOR_TEXT);
     lv_label_set_long_mode(s_lblTitle, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
     lv_obj_set_pos(s_lblTitle, colX, 38);
     lv_obj_set_width(s_lblTitle, colW);
+    lv_obj_set_style_text_align(s_lblTitle, LV_TEXT_ALIGN_CENTER, 0);
 
     s_lblSub = ui_label_create(page, "本地音乐", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblSub, colX, 60);
     lv_obj_set_width(s_lblSub, colW);
+    lv_obj_set_style_text_align(s_lblSub, LV_TEXT_ALIGN_CENTER, 0);
 
-    /* ---- 顶区右：进度条 + 时间（500ms 轮询；时长未知时整段隐藏） ---- */
+    /* ---- 进度条 + 时间（500ms 轮询；时长未知时整段隐藏） ---- */
     s_barProgress = lv_bar_create(page);
     lv_obj_set_pos(s_barProgress, colX, 82);
     lv_obj_set_size(s_barProgress, colW, 8);
@@ -528,8 +495,10 @@ void scr_player_build(lv_obj_t *page)
 
     s_lblTime = ui_label_create(page, "00:00 / 00:00", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblTime, colX, 94);
+    lv_obj_set_width(s_lblTime, colW);
+    lv_obj_set_style_text_align(s_lblTime, LV_TEXT_ALIGN_CENTER, 0);
 
-    /* ---- 顶区右：音量 ---- */
+    /* ---- 音量（居中变长） ---- */
     lbl = ui_label_create(page, UI_ICON_VOLUME, &ui_icons_16, UI_COLOR_ACCENT);
     lv_obj_set_pos(lbl, colX, 112);
 

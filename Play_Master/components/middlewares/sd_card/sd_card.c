@@ -214,11 +214,17 @@ static esp_err_t Sd_Wait_Not_Busy(void)
 
 /* ======================== 会话（bus 占用 + CS 手动） =========================== */
 
-/** 会话配置：普通优先级 + 默认预算/防饿死（见 spi_driver.h 仲裁说明） */
+/** 会话配置：音频读卡提为 HIGH 优先级（与 LCD 同级竞争）+ 默认预算/防饿死
+ *  （见 spi_driver.h 仲裁说明）。
+ *  根因：SD 卡与 LCD 共用 SPI2 总线。原 NORMAL(<HIGH) 优先级下，UI 切页/滚动
+ *  整屏重绘（8 行 flush × 22 次）会以 HIGH 优先级连续占住总线，把 SD 音频读卡
+ *  长时间饿死 → PCM 断供 → 音乐卡顿。提为 HIGH 后，SD 读卡（短事务，一扇区
+ *  几十 µs）与 LCD 刷屏（长事务）按 session_budget_ms 轮换，读卡不再被饿死，
+ *  UI 滚动仅轻微变慢，音乐保持连续。 */
 #define SD_SESSION_BUDGET_MS     10
 #define SD_SESSION_STARVATION_MS 500
 static const spi_session_cfg_t Sd_SessionCfg = {
-    .priority          = SPI_PRIO_NORMAL,
+    .priority          = SPI_PRIO_HIGH,
     .session_budget_ms = SD_SESSION_BUDGET_MS,
     .starvation_ms     = SD_SESSION_STARVATION_MS,
 };
@@ -1299,7 +1305,7 @@ esp_err_t SD_Card_Init(void)
             .mode         = 0,          /* SPI 模式 0（CPOL=0, CPHA=0） */
             .queueSize    = 1,
             .csManualCtrl = true,       /* SD 协议需要会话级 CS 控制 */
-            .priority     = SPI_PRIO_NORMAL,   /* 数据流优先级：低于 LCD 刷屏 */
+            .priority     = SPI_PRIO_HIGH,   /* 与 LCD 同级：音频读卡不被滚动刷屏饿死 */
             .label        = "sd",
         };
         Sd.handle = Spi_Register_Device(&dev_cfg);

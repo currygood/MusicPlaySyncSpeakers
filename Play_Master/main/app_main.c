@@ -86,7 +86,11 @@ static const char *TAG = "AppMain";
  *  boot 任务必须高于解码(10)/同步(11)：解码节流在"恰好追平"时余量 <1ms
  *  不再 vTaskDelay（连续不让步），prio 5 的 boot 任务会被饿死——实测表现
  *  为 CallPhone 60s 内既不就绪也不失败，UI 只能陪等满 60s 超时后才出屏 */
-#define APP_BOOT_TASK_PRIO      11
+#define APP_BOOT_TASK_PRIO      10
+#define APP_MUSIC_TASK_PRIO     11
+#define APP_CALL_TASK_PRIO      10
+#define APP_LIGHT_TASK_PRIO     9
+
 #define APP_MUSIC_TASK_STACK    4096
 #define APP_CALL_TASK_STACK     4096
 #define APP_LIGHT_TASK_STACK    3072
@@ -741,10 +745,10 @@ void app_main(void)
      *    （等蓝牙）→ LightControl（等 WiFi）。
      */
     (void)App_Boot_Task_Create(App_UI_Task, "UI_Task",
-                               APP_UI_TASK_STACK, APP_UI_TASK_PRIO, 1, 0);
+                               APP_UI_TASK_STACK, APP_UI_TASK_PRIO, 0, 0);
 
     (void)App_Boot_Task_Create(App_MusicPlay_Task, "mp_boot",
-                               APP_MUSIC_TASK_STACK, APP_BOOT_TASK_PRIO, 1,
+                               APP_MUSIC_TASK_STACK, APP_MUSIC_TASK_PRIO, 1,
                                APP_EVT_MUSIC_FAILED);
     App_Wait_Bits(APP_EVT_MUSIC_READY | APP_EVT_MUSIC_FAILED,
                   APP_DEP_WAIT_MS, "music_play ready");
@@ -752,7 +756,7 @@ void app_main(void)
     App_Log_Heap("after mp_boot");
 
     (void)App_Boot_Task_Create(App_CallPhone_Task, "cp_boot",
-                               APP_CALL_TASK_STACK, APP_BOOT_TASK_PRIO, 1,
+                               APP_CALL_TASK_STACK, APP_CALL_TASK_PRIO, 1,
                                APP_EVT_CALL_FAILED);
     App_Wait_Bits(APP_EVT_CALL_READY | APP_EVT_CALL_FAILED,
                   APP_DEP_WAIT_MS, "call_phone ready");
@@ -760,7 +764,7 @@ void app_main(void)
     App_Log_Heap("after cp_boot");
 
     (void)App_Boot_Task_Create(App_LightControl_Task, "lc_boot",
-                               APP_LIGHT_TASK_STACK, APP_BOOT_TASK_PRIO, 0,
+                               APP_LIGHT_TASK_STACK, APP_LIGHT_TASK_PRIO, 0,
                                APP_EVT_LIGHT_FAILED);
     App_Wait_Bits(APP_EVT_LIGHT_READY | APP_EVT_LIGHT_FAILED,
                   APP_DEP_WAIT_MS, "light_control ready");

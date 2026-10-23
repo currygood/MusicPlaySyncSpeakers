@@ -66,8 +66,12 @@
 /** 本地延迟队列默认容量。
  *  队列里压着的帧 = 提前量 D + 接收余量（260ms）/ 每包时长 ≈ 18 帧 */
 #define SYNC_CFG_DEFAULT_DELAY_PKTS      (24)
-/** PCM 入口环默认字节容量 */
-#define SYNC_CFG_DEFAULT_INGRESS_BYTES   (24576)
+/** PCM 入口环默认字节容量。
+ *  44.1kHz×16bit mono：24KB≈278ms，64KB≈741ms。
+ *  加大到 64KB 用于吸收 UI 切页/滚动整屏重绘抢占解码任务造成的欠载窗口
+ *  （约几十~200ms），播放节奏不再"变慢→追帧"抖动。缓冲经 sync_alloc_psram
+ *  落 8MB PSRAM，不占内部 DRAM，也不影响主从同步误差（误差由 D 决定）。 */
+#define SYNC_CFG_DEFAULT_INGRESS_BYTES   (65536)
 
 /**
  * 单播目标从机的**编译期默认列表**。

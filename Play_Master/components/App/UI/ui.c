@@ -275,8 +275,10 @@ esp_err_t ui_init(const ui_cfg_t *cfg)
 #endif
 
     /* 3) 主题 + 页面构建在 ui_run() 里做：LVGL 的 widget/style 都是几百字节的
-     *    小块 malloc，配置 SPIRAM_MALLOC_ALWAYSINTERNAL=4096 时会优先吃内部
-     *    DRAM；先让 UI 任务栈（app_main 最先创建）占住，页面构建不足时落 PSRAM */
+     *    小块 malloc。sdkconfig 里 SPIRAM_MALLOC_ALWAYSINTERNAL=0，即所有普通
+     *    malloc 优先落 PSRAM（仅 PSRAM 耗尽或显式 MALLOC_CAP_DMA/INTERNAL 才走
+     *    内部），故 LVGL 对象/图片缓存均走 PSRAM；内部 DRAM 留给 flush 缓冲、
+     *    任务栈与 DMA。先让 UI 任务栈（app_main 最先创建）占住内部堆。 */
 
     /* 4) 灯控/播放事件队列（PSRAM：内部 DRAM 留给任务栈与 DMA） */
     s_lightEvtQueue = xQueueCreateWithCaps(8, sizeof(light_event_t), MALLOC_CAP_SPIRAM);

@@ -7,7 +7,7 @@
 #define __UI_PRIV_H__
 
 /* ======================== 是否打开 UI 模块调试打印 ======================== */
-#define UI_DEBUG_LOGS    (1)
+#define UI_DEBUG_LOGS    (false)
 
 #include "esp_log.h"
 #include "lvgl.h"
@@ -55,13 +55,11 @@ extern const lv_font_t ui_icons_24;     /* 控件图标 24px（Tab 栏/大按钮
 #define UI_STATUSBAR_H   24
 #define UI_TABBAR_H      40
 #define UI_CONTENT_H     (LCD_HEIGHT - UI_STATUSBAR_H - UI_TABBAR_H)  /* 176 */
-#define UI_COVER_SIZE    128
 
 /* ======================== UI 图片资源（烧录进 flash storage 分区） ======================== */
 /* main/CMakeLists.txt: spiffs_create_partition_image(storage ../storage FLASH_IN_PROJECT)
- * 将仓库 Play_Master/storage/ui_img/ 下的三张 PNG 随固件烧录，UI 不再读 SD 卡。 */
+ * 将仓库 Play_Master/storage/ui_img/ 下的 PNG 随固件烧录，UI 不再读 SD 卡。 */
 #define UI_IMG_MOUNT_POINT  "/storage"                      /* SPIFFS 挂载点 */
-#define UI_IMG_COVER        "F:/ui_img/Music_Album.png"     /* lv_fs 'F' 盘符 */
 #define UI_IMG_LIGHT_ON     "F:/ui_img/Light_On.png"
 #define UI_IMG_LIGHT_OFF    "F:/ui_img/Light_Off.png"
 

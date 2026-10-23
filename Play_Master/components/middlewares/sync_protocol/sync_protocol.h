@@ -182,7 +182,7 @@ typedef struct {
     uint32_t     sync_delay_ms;    /* D，默认 200ms */
     uint32_t     frame_duration_ms; /* 每包 PCM 时长（毫秒），默认 15ms */
     uint32_t     delay_queue_pkts; /* 本地延迟队列容量，> D/帧时长 */
-    uint32_t     ingress_bytes;    /* PCM 入环字节容量（16~32KB 起步） */
+    uint32_t     ingress_bytes;    /* PCM 入环字节容量（默认 64KB，PSRAM） */
     wifi_mcast_handle_t audio_chan;   /* 音频 socket（用于**单播**，rx 可关） */
     wifi_mcast_handle_t control_chan; /* 控制通道（239.0.0.1:5679，收发） */
 

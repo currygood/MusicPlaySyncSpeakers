@@ -18,5 +18,7 @@ idf_component_register(
     INCLUDE_DIRS ${MID_INCLUDE_DIRS}
     # Middlewares 的传感器通常需要调用 BSP 层的底层通信逻辑
     # sync_protocol 依赖 msystem（wifi_manager 组播通道）与 esp_timer（时间戳）
-    REQUIRES bsp freertos fatfs sdmmc esp_driver_sdspi esp_driver_spi nvs_flash bt msystem esp_timer
+    # esp_coex：bt_audio 在 A2DP 开流时置位 A2DP_STREAMING，让软件共存把射频
+    #           优先让给经典蓝牙（否则 WiFi 每 15ms 单播会挤掉 A2DP 收包）
+    REQUIRES bsp freertos fatfs sdmmc esp_driver_sdspi esp_driver_spi nvs_flash bt msystem esp_timer esp_coex
 )

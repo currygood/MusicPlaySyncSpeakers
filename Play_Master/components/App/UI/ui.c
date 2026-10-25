@@ -292,10 +292,9 @@ esp_err_t ui_init(const ui_cfg_t *cfg)
 
     s_inited = true;
     /* 固件版本标记：串口出现 multi-screen 才说明跑的是多 screen 新固件 */
-    UI_LOGI( "ui init ok (multi-screen v2): wifi=%s, light=%s, call_phone=%s, music=%s",
+    UI_LOGI( "ui init ok (multi-screen v2): wifi=%s, light=%s, music=%s",
              (s_cfg.wifi       != NULL) ? "wired" : "placeholder",
              (s_cfg.light      != NULL) ? "wired" : "placeholder",
-             (s_cfg.call_phone != NULL) ? "wired" : "placeholder",
              (s_cfg.music      != NULL) ? "wired" : "placeholder");
     UI_LOGI( "free heap: internal=%lu B, psram=%lu B",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),

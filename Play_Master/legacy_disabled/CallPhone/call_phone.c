@@ -37,6 +37,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_afe_config.h"
 #include "esp_afe_sr_iface.h"
 #include "esp_afe_sr_models.h"
@@ -97,6 +98,28 @@
 #define CP_TASK_STACK             6144
 #define CP_TASK_CORE              1
 
+/** AFE 运算档位。
+ *
+ *  HIGH_PERF 是为 AEC/NS 这类"多算法串联"准备的档位，本模块只跑唤醒词检测
+ *  （aec/se/ns/vad/agc 全部关闭），高精度档位换不来任何效果，却要多花近一倍 CPU。
+ *
+ *  Core1 上同时还跑着实时链路：SyncPlay(12) / SyncTx(11) / bt_audio(11) /
+ *  audio_decoder(10) / MusicPlay(9)。唤醒检测是这一核上**唯一没有硬截止时间**
+ *  的任务，一旦它把空闲时间吃干净，音频每一环就失去全部抖动余量 ——
+ *  所以这里必须主动降档。 */
+#define CP_AFE_MODE               AFE_MODE_LOW_COST
+
+/** 单帧处理超预算时的让出时间（tick）。
+ *
+ *  唤醒检测的一帧是 16ms 音频。如果处理一帧要 ≥16ms，就说明 Core1 已经被
+ *  这个任务占满：此时 IDLE1 永远得不到执行，任务看门狗会持续报警，其余
+ *  实时任务也只剩"抢占"这一条路。
+ *
+ *  所以一旦检测到超预算，就主动 delay 1 tick（10ms）把 CPU 占用压到 60~70%
+ *  以下，给 IDLE1 和音频链路留出确定的余量。代价是唤醒词按约一半的帧率处理
+ *  （"你好小智"跨越 500ms 以上，仍能命中），换来的是整机不再"卡死"。 */
+#define CP_OVERRUN_YIELD_TICKS    1
+
 /** esp-sr 模型分区标签（构建时由 esp-sr 组件把 srmodels.bin 烧进该分区） */
 #define CP_MODEL_PARTITION        "model"
 
@@ -109,11 +132,13 @@ typedef enum {
     CP_CMD_START_LISTEN,   /* 开始监听唤醒词 */
     CP_CMD_STOP_LISTEN,    /* 停止监听 */
     CP_CMD_HANGUP,         /* 主动结束当前语音（等价挂断） */
+    CP_CMD_SET_SUSPEND,    /* 播放态抑制：暂停/恢复唤醒检测（见 call_phone_set_suspended） */
     CP_CMD_DESTROY,        /* 销毁模块（任务内释放资源后退出） */
 } call_phone_cmd_t;
 
 typedef struct {
     call_phone_cmd_t cmd;
+    bool             suspend;   /* 仅 CP_CMD_SET_SUSPEND 使用 */
 } call_phone_cmd_msg_t;
 
 /* ======================== 模块私有结构 ================================================== */
@@ -145,10 +170,42 @@ struct call_phone_s {
     SemaphoreHandle_t destroy_done;   /* DESTROY 完成后由任务置位 */
     volatile call_phone_state_t state;
 
+    /* 播放态抑制（App 层在音频播放期间置位）
+     * 为什么要它：wn9s 单帧耗时 ≈ 一帧音频时长，常驻 LISTENING 会把 Core1
+     * 吃满（IDLE1 饿死 + A2DP starved，最终 INT WDT）。播放期间把整条
+     * esp-sr 流水线停掉，Core1 立刻还回 ~780ms/s。任务线程写，任意线程读。 */
+    volatile bool suspended;
+    uint8_t       resume_flush;       /* 恢复时丢弃前 N 帧的唤醒判定（清 AFE 残留） */
+
     uint32_t sco_deadline;            /* CONNECTING 等待 SCO 的绝对超时 tick */
+
+    /* ---- 唤醒检测的实时预算与负载统计 ----
+     * 这一组字段回答一个此前无法观测的问题："Core1 到底还有没有空闲？"
+     * 只要 proc_max_us ≥ frame_us，就说明这一帧没能在实时预算内做完。 */
+    uint32_t frame_us;        /* 单帧音频时长（feed_chunk / afe_rate），16k×256 = 16ms */
+    int64_t  win_t0_us;       /* 统计窗口起点 */
+    uint32_t win_frames;      /* 本统计窗口内完成的帧数 */
+    uint32_t win_starve;      /* 本统计窗口内"读不到麦克风数据"的次数 */
+    uint64_t win_proc_us;     /* 本统计窗口内累计处理耗时（feed+fetch） */
+    uint32_t win_proc_max_us; /* 本统计窗口内单帧处理耗时峰值 */
+    uint32_t overrun_cnt;     /* 累计"单帧处理 ≥ 实时预算"的次数 */
+    uint32_t frames_per_s;    /* 上一窗口的帧率（16ms 帧满速 = 62） */
+    uint32_t proc_avg_us;    /* 上一窗口的平均处理耗时 */
+    uint32_t proc_max_us;    /* 上一窗口的处理耗时峰值 */
+    uint32_t starve_per_s;    /* 上一窗口的读空次数 */
 };
 
 /* ======================== 私有函数 ======================================================= */
+
+/** 构造命令消息：结构体字段全部给出初值，避免以后加参数时忘了初始化 */
+static call_phone_cmd_msg_t CallPhone_Msg(call_phone_cmd_t cmd)
+{
+    call_phone_cmd_msg_t msg;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.cmd = cmd;
+    return msg;
+}
 
 /** 分配样本缓冲：PSRAM 优先，失败退回内部堆 */
 static int16_t *CallPhone_AllocSamples(size_t samples)
@@ -168,9 +225,24 @@ static int16_t *CallPhone_AllocSamples(size_t samples)
 /** 设置状态（互斥保护，API 线程与任务线程共用） */
 static void CallPhone_State_Set(call_phone_handle_t cp, call_phone_state_t state)
 {
+    call_phone_state_t old;
+
     xSemaphoreTake(cp->lock, portMAX_DELAY);
+    old = cp->state;
     cp->state = state;
     xSemaphoreGive(cp->lock);
+
+    /* 状态迁移用**独立 tag 且常开**：CALL_PHONE_* 日志全部被条件编译关掉了，
+     * 于是一次误唤醒（会请求手机打开 SCO，从而把 A2DP 音乐抢断）在串口上
+     * 完全无痕 —— 外部只看到"音乐突然停了、手机还显示连着"。
+     * 迁移本身极少发生（用户唤醒/挂断级别），不会造成日志刷屏。 */
+    if (old != state)
+    {
+        static const char *const names[] = { "IDLE", "LISTENING", "CONNECTING", "STREAMING" };
+        const char *n_old = ((int)old   < 4) ? names[(int)old]   : "?";
+        const char *n_new = ((int)state < 4) ? names[(int)state] : "?";
+        ESP_LOGW("CpState", "state %s -> %s", n_old, n_new);
+    }
 }
 
 /** 读取状态 */
@@ -182,6 +254,44 @@ static call_phone_state_t CallPhone_State_Get(call_phone_handle_t cp)
     state = cp->state;
     xSemaphoreGive(cp->lock);
     return state;
+}
+
+/**
+ * @brief 清洗 esp-sr 流水线（只在"开始/恢复监听"时调用）
+ *
+ * 停止监听期间麦克风 FIFO 会一直满着丢旧数据（Microphone 的 Push 侧策略），
+ * 恢复瞬间读到的是几秒前的音频；AFE 内部也还压着上一次的半帧。
+ * 不清就会把"过去的噪声"当成"现在的语音"喂给 wakenet —— 要么误唤醒
+ * （直接抢断 A2DP），要么白跑几帧。
+ */
+static void CallPhone_Reset_Pipeline(call_phone_handle_t cp)
+{
+    Microphone_Flush();
+    cp->rs_pos       = 0;
+    cp->resume_flush = 3;   /* AFE 有 ~1 帧延迟，丢 3 帧足够 */
+}
+
+/**
+ * @brief 回到监听（唯一入口，受"播放态抑制"约束）
+ *
+ * 原来散落在 4 处的 `CallPhone_State_Set(cp, LISTENING)` 全部收敛到这里，
+ * 否则会出现前后矛盾：播放期间被抑制成 IDLE，结果通话挂断后又自己爬回
+ * LISTENING，Core1 又被吃满。
+ */
+static void CallPhone_Goto_Listening(call_phone_handle_t cp)
+{
+    if (cp->suspended)
+    {
+        CallPhone_State_Set(cp, CALL_PHONE_STATE_IDLE);
+        return;
+    }
+    /* 从非监听状态回到监听（含首次启动、通话结束、挂断）：
+     * 期间攒下的麦克风数据都是旧的，先清干净再接上，避免误唤醒。 */
+    if (CallPhone_State_Get(cp) != CALL_PHONE_STATE_LISTENING)
+    {
+        CallPhone_Reset_Pipeline(cp);
+    }
+    CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
 }
 
 /**
@@ -279,13 +389,30 @@ static size_t CallPhone_ExtractMono(int16_t *pair, size_t samples, int8_t *lane,
     return frames;
 }
 
-/** LISTENING：读麦克风（提取单声道）→ 重采样 → 喂入 → 检测唤醒词 */
-static void CallPhone_Listening(call_phone_handle_t cp)
+/** LISTENING：读麦克风（提取单声道）→ 重采样 → 喂入 → 检测唤醒词
+ *
+ *  @return true 表示本帧完整处理了一帧音频；false 表示没取到足够麦克风数据
+ *          （调用方必须让出 CPU，否则会退化成 100% 空转，见下方说明）。
+ *
+ *  为什么要返回这个值：`Microphone_Read_Pcm16` 在 FIFO 里没有新数据时会
+ *  **立刻返回 0**（超时 → break），并不阻塞。原来的主循环在 LISTENING 状态
+ *  用的是 0 超时轮询，于是"读空 → 立刻下一轮 → 读空"完全不停顿，把 Core1
+ *  整个吃满（任务看门狗报 IDLE1 饿死，backtrace 停在 wakenet 推理里）。
+ */
+static bool CallPhone_Listening(call_phone_handle_t cp)
 {
     uint32_t   in_need, pair_need;
     size_t     got = 0;
     esp_err_t  ret;
     int32_t    lane_avg0 = 0, lane_avg1 = 0;
+    int64_t    t_proc0;
+
+    /* 防御：主循环在 IDLE 下不会进来，但抑制切换与状态读取之间有一拍的窗口，
+     * 这里再挡一次，保证"被抑制时绝不碰 AFE"。 */
+    if (cp->suspended)
+    {
+        return false;
+    }
 
     in_need = (uint32_t)(((uint64_t)cp->feed_chunk * CP_MIC_SAMPLE_RATE)
                          / (uint32_t)cp->afe_rate) + 1;
@@ -310,13 +437,14 @@ static void CallPhone_Listening(call_phone_handle_t cp)
     }
     if (got < pair_need)
     {
-        return;
+        cp->win_starve++;
+        return false;
     }
 
     if (CallPhone_ExtractMono(cp->rs_in, pair_need, &cp->lane,
                               &lane_avg0, &lane_avg1) != in_need)
     {
-        return;
+        return false;
     }
 
     /* 重采样 44.1k 单声道 → 16k AFE 输入，填满 feed_buf 一帧 */
@@ -324,7 +452,7 @@ static void CallPhone_Listening(call_phone_handle_t cp)
                                  (uint32_t)cp->feed_chunk, cp->rs_step,
                                  &cp->rs_pos) != (uint32_t)cp->feed_chunk)
     {
-        return;
+        return false;
     }
 
     /* 游标折回本帧窗口：每帧已消费 in_need 个输入样本 */
@@ -361,26 +489,62 @@ static void CallPhone_Listening(call_phone_handle_t cp)
         }
     }
 
-    /* 喂入 AFE 处理流水线（feed 与 fetch 成对；fetch 非阻塞，返回 NULL 表示尚未有结果） */
+    /* 喂入 AFE 处理流水线（feed 与 fetch 成对；fetch 非阻塞，返回 NULL 表示尚未有结果）。
+     * 从这里开始计时 = 纯处理耗时（不含等麦克风数据的时间），用于判断是否超预算。 */
+    t_proc0 = esp_timer_get_time();
     cp->afe_if->feed(cp->afe_data, cp->feed_buf);
 
     afe_fetch_result_t *res = cp->afe_if->fetch(cp->afe_data);
-    if (res != NULL && res->wakeup_state == WAKENET_DETECTED)
+    if (res != NULL)
     {
-        CALL_PHONE_LOGI( "wake word '%s' detected (index %d)",
-                 CP_WAKE_WORD_STRING, res->wake_word_index);
-
-        CallPhone_State_Set(cp, CALL_PHONE_STATE_CONNECTING);
-        cp->sco_deadline = (uint32_t)xTaskGetTickCount()
-                           + pdMS_TO_TICKS(CP_SCO_TIMEOUT_MS);
-
-        /* 请求手机语音助手（AT+BVRA=1）；SLC 未连接会失败，忽略本次唤醒 */
-        if (bt_audio_hfp_start_voice(cp->audio) != ESP_OK)
+        /* 恢复监听后的前几帧是暂停期间残留的旧数据，只消费不判定 */
+        if (cp->resume_flush > 0)
         {
-            CALL_PHONE_LOGW( "start voice failed (HFP not connected?), back to listening");
-            CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
+            cp->resume_flush--;
+        }
+        else if (res->wakeup_state == WAKENET_DETECTED)
+        {
+            CALL_PHONE_LOGI( "wake word '%s' detected (index %d)",
+                     CP_WAKE_WORD_STRING, res->wake_word_index);
+
+            CallPhone_State_Set(cp, CALL_PHONE_STATE_CONNECTING);
+            cp->sco_deadline = (uint32_t)xTaskGetTickCount()
+                               + pdMS_TO_TICKS(CP_SCO_TIMEOUT_MS);
+
+            /* 请求手机语音助手（AT+BVRA=1）；SLC 未连接会失败，忽略本次唤醒 */
+            if (bt_audio_hfp_start_voice(cp->audio) != ESP_OK)
+            {
+                CALL_PHONE_LOGW( "start voice failed (HFP not connected?), back to listening");
+                CallPhone_Goto_Listening(cp);
+            }
         }
     }
+
+    /* ---- 实时预算核算 + 超载让出 ----
+     * 处理耗时（feed + fetch，即整条 wakenet 推理）如果 ≥ 单帧音频时长，
+     * 说明本核已经做不完实时任务了：麦克风 FIFO 会持续积压，
+     * `Microphone_Read_Pcm16` 从此永远"立刻返回"，主循环彻底不再阻塞 →
+     * IDLE1 一次都轮不到 → 任务看门狗持续报 IDLE1 饿死，音频链路也失去全部余量。
+     *
+     * 这里主动让出 CPU，把占用压回预算以内。丢一点唤醒帧率，换整机稳定。 */
+    {
+        uint32_t proc_us = (uint32_t)(esp_timer_get_time() - t_proc0);
+
+        cp->win_frames++;
+        cp->win_proc_us += proc_us;
+        if (proc_us > cp->win_proc_max_us)
+        {
+            cp->win_proc_max_us = proc_us;
+        }
+
+        if (proc_us >= cp->frame_us)
+        {
+            cp->overrun_cnt++;
+            vTaskDelay(CP_OVERRUN_YIELD_TICKS);
+        }
+    }
+
+    return true;
 }
 
 /** CONNECTING：等待目标手机 SCO 打开，超时回到监听 */
@@ -400,7 +564,7 @@ static void CallPhone_Connecting(call_phone_handle_t cp)
     {
         CALL_PHONE_LOGW( "SCO open timeout (%d ms), back to listening", CP_SCO_TIMEOUT_MS);
         bt_audio_hfp_stop_voice(cp->audio);  /* 取消语音请求，避免残留 SCO */
-        CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
+        CallPhone_Goto_Listening(cp);
         return;
     }
 
@@ -434,7 +598,7 @@ static void CallPhone_Streaming(call_phone_handle_t cp)
     {
         CALL_PHONE_LOGW( "SCO closed by phone, back to listening");
         cp->rs_pos = 0;
-        CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
+        CallPhone_Goto_Listening(cp);
     }
 }
 
@@ -486,8 +650,13 @@ static bool CallPhone_HandleCmd(call_phone_handle_t cp,
     case CP_CMD_START_LISTEN:
         if (CallPhone_State_Get(cp) == CALL_PHONE_STATE_IDLE)
         {
+            if (cp->suspended)
+            {
+                CALL_PHONE_LOGI( "start listening ignored: suspended (playback active)");
+                break;
+            }
             cp->rs_pos = 0;
-            CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
+            CallPhone_Goto_Listening(cp);
             CALL_PHONE_LOGI( "start listening, wake word '%s'", CP_WAKE_WORD_STRING);
         }
         break;
@@ -500,6 +669,37 @@ static bool CallPhone_HandleCmd(call_phone_handle_t cp,
         }
         break;
 
+    case CP_CMD_SET_SUSPEND:
+    {
+        call_phone_state_t st = CallPhone_State_Get(cp);
+
+        if (cp->suspended == msg->suspend)
+        {
+            break;   /* 幂等：重复下发不重复动作 */
+        }
+        cp->suspended = msg->suspend;
+
+        if (msg->suspend)
+        {
+            /* 只在 LISTENING 时立刻落地；通话/建链中不打断，等它自己
+             * 回到监听时由 CallPhone_Goto_Listening 直接转 IDLE。 */
+            if (st == CALL_PHONE_STATE_LISTENING)
+            {
+                CallPhone_State_Set(cp, CALL_PHONE_STATE_IDLE);
+            }
+            ESP_LOGW("CpState", "afe suspended (playback): wake word off, core1 released");
+        }
+        else
+        {
+            if (st == CALL_PHONE_STATE_IDLE)
+            {
+                CallPhone_Goto_Listening(cp);
+            }
+            ESP_LOGW("CpState", "afe resumed: wake word on");
+        }
+        break;
+    }
+
     case CP_CMD_HANGUP:
     {
         call_phone_state_t state = CallPhone_State_Get(cp);
@@ -510,7 +710,7 @@ static bool CallPhone_HandleCmd(call_phone_handle_t cp,
             CALL_PHONE_LOGI( "hangup done, back to listening");
         }
         cp->rs_pos = 0;
-        CallPhone_State_Set(cp, CALL_PHONE_STATE_LISTENING);
+        CallPhone_Goto_Listening(cp);
         break;
     }
 
@@ -529,6 +729,36 @@ static bool CallPhone_HandleCmd(call_phone_handle_t cp,
         break;
     }
     return false;
+}
+
+/** 结算唤醒检测的负载窗口（每约 2s 一次，供 [hb] 心跳读取）
+ *
+ *  提供的是"预算 vs 实际"的对照：`frame_us` 是一帧音频的时长（16ms），
+ *  `proc_avg_us/proc_max_us` 是处理一帧实际花掉的时间。
+ *    - proc_max < frame_us        → Core1 有余量，正常；
+ *    - proc_avg 接近 frame_us     → 已经贴着实时的边跑，任何抖动都会丢帧；
+ *    - proc_max ≥ frame_us 且持续 → 本核已超载（本次修复针对的就是这一条）。
+ */
+static void CallPhone_Load_Roll(call_phone_handle_t cp)
+{
+    int64_t elapsed = esp_timer_get_time() - cp->win_t0_us;
+
+    if (elapsed < 2000000)
+    {
+        return;
+    }
+
+    cp->frames_per_s = (uint32_t)((uint64_t)cp->win_frames * 1000000u / (uint64_t)elapsed);
+    cp->proc_avg_us  = (cp->win_frames > 0)
+                       ? (uint32_t)(cp->win_proc_us / cp->win_frames) : 0;
+    cp->proc_max_us  = cp->win_proc_max_us;
+    cp->starve_per_s = (uint32_t)((uint64_t)cp->win_starve * 1000000u / (uint64_t)elapsed);
+
+    cp->win_frames      = 0;
+    cp->win_starve      = 0;
+    cp->win_proc_us     = 0;
+    cp->win_proc_max_us = 0;
+    cp->win_t0_us       = esp_timer_get_time();
 }
 
 /** CallPhone_Task：状态机主循环（优先级 8 / 栈 8192 / Core 1） */
@@ -560,7 +790,12 @@ static void CallPhone_Task(void *arg)
             break;   /* 无命令时阻塞在 xQueueReceive，不空转 */
 
         case CALL_PHONE_STATE_LISTENING:
-            CallPhone_Listening(cp);
+            if (!CallPhone_Listening(cp))
+            {
+                /* 没读到麦克风数据（FIFO 空/超时）。原来这里立刻进下一轮，
+                 * 主循环变成零阻塞空转，把 Core1 全部吃满 —— 必须让出 CPU。 */
+                vTaskDelay(pdMS_TO_TICKS(2));
+            }
             break;
 
         case CALL_PHONE_STATE_CONNECTING:
@@ -571,6 +806,10 @@ static void CallPhone_Task(void *arg)
             CallPhone_Streaming(cp);
             break;
         }
+
+        /* 负载窗口结算（每约 2s 一次）：无论是否读到数据都要结算，
+         * 否则持续读空时窗口永远不滚动，[hb] 里就会一直显示旧值。 */
+        CallPhone_Load_Roll(cp);
     }
 }
 
@@ -634,8 +873,10 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
     }
     CALL_PHONE_LOGI( "wake model: %s", model_name);
 
-    /* ---- 步骤 3：AFE 配置（单麦 "M"，仅启用唤醒检测，同参考写法） ---- */
-    afe_cfg = afe_config_init("M", cp->models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+    /* ---- 步骤 3：AFE 配置（单麦 "M"，仅启用唤醒检测，同参考写法） ----
+     * 档位用 LOW_COST：本模块关掉了 AEC/SE/NS/VAD/AGC，只跑唤醒词，
+     * 高精度档位没有任何收益，只会把 Core1 的余量吃光（见 CP_AFE_MODE 注释）。 */
+    afe_cfg = afe_config_init("M", cp->models, AFE_TYPE_SR, CP_AFE_MODE);
     if (afe_cfg == NULL)
     {
         CALL_PHONE_LOGE( "afe_config_init failed");
@@ -684,6 +925,16 @@ call_phone_handle_t call_phone_create(const call_phone_cfg_t *cfg)
         CALL_PHONE_LOGW( "unexpected afe rate %d (expect %d)", cp->afe_rate, CP_AFE_RATE);
     }
     cp->rs_step = ((uint64_t)CP_MIC_SAMPLE_RATE << 16) / (uint32_t)cp->afe_rate;
+
+    /* 单帧音频时长 = 实时预算的另一半：处理一帧若超过它，Core1 就已超载 */
+    cp->frame_us = (uint32_t)(((uint64_t)cp->feed_chunk * 1000000u)
+                              / (uint32_t)cp->afe_rate);
+    if (cp->frame_us == 0)
+    {
+        cp->frame_us = 1000000u / (uint32_t)CP_AFE_RATE;   /* 兜底：按 16k 单样本 */
+    }
+    cp->win_t0_us = esp_timer_get_time();
+
     /* 单帧 44.1k 单声道需求，再 ×2 存储 I2S L/R 槽位对 */
     cp->rs_in_cap = ((size_t)(((uint64_t)cp->feed_chunk * CP_MIC_SAMPLE_RATE)
                               / (uint32_t)cp->afe_rate) + 2) * 2;
@@ -750,7 +1001,7 @@ esp_err_t call_phone_destroy(call_phone_handle_t cp)
         return ESP_ERR_INVALID_ARG;
     }
 
-    msg.cmd = CP_CMD_DESTROY;
+    msg = CallPhone_Msg(CP_CMD_DESTROY);
     if (xQueueSend(cp->cmd_q, &msg, pdMS_TO_TICKS(100)) != pdTRUE)
     {
         CALL_PHONE_LOGE( "destroy: queue send timeout");
@@ -790,7 +1041,7 @@ esp_err_t call_phone_start_listening(call_phone_handle_t cp)
         return ESP_ERR_INVALID_STATE;  /* 通话/建链中，先 hangup 再监听 */
     }
 
-    msg.cmd = CP_CMD_START_LISTEN;
+    msg = CallPhone_Msg(CP_CMD_START_LISTEN);
     return (xQueueSend(cp->cmd_q, &msg, pdMS_TO_TICKS(100)) == pdTRUE)
            ? ESP_OK : ESP_ERR_TIMEOUT;
 }
@@ -815,9 +1066,31 @@ esp_err_t call_phone_stop_listening(call_phone_handle_t cp)
         return ESP_ERR_INVALID_STATE;  /* 通话中先 hangup */
     }
 
-    msg.cmd = CP_CMD_STOP_LISTEN;
+    msg = CallPhone_Msg(CP_CMD_STOP_LISTEN);
     return (xQueueSend(cp->cmd_q, &msg, pdMS_TO_TICKS(100)) == pdTRUE)
            ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t call_phone_set_suspended(call_phone_handle_t cp, bool suspend)
+{
+    call_phone_cmd_msg_t msg;
+
+    if (cp == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 下发到任务线程执行：状态迁移集中在 CallPhone_HandleCmd 里，
+     * 避免 API 线程与任务线程同时改状态。 */
+    msg         = CallPhone_Msg(CP_CMD_SET_SUSPEND);
+    msg.suspend = suspend;
+    return (xQueueSend(cp->cmd_q, &msg, pdMS_TO_TICKS(100)) == pdTRUE)
+           ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+bool call_phone_is_suspended(call_phone_handle_t cp)
+{
+    return (cp != NULL) ? cp->suspended : false;
 }
 
 esp_err_t call_phone_hangup(call_phone_handle_t cp)
@@ -836,7 +1109,7 @@ esp_err_t call_phone_hangup(call_phone_handle_t cp)
         return ESP_OK;   /* 无通话在建立/进行 */
     }
 
-    msg.cmd = CP_CMD_HANGUP;
+    msg = CallPhone_Msg(CP_CMD_HANGUP);
     return (xQueueSend(cp->cmd_q, &msg, pdMS_TO_TICKS(100)) == pdTRUE)
            ? ESP_OK : ESP_ERR_TIMEOUT;
 }
@@ -849,5 +1122,21 @@ esp_err_t call_phone_get_state(call_phone_handle_t cp, call_phone_state_t *state
     }
 
     *state = CallPhone_State_Get(cp);
+    return ESP_OK;
+}
+
+esp_err_t call_phone_get_load(call_phone_handle_t cp, call_phone_load_t *out)
+{
+    if (cp == NULL || out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    out->frame_us     = cp->frame_us;
+    out->frames_per_s = cp->frames_per_s;
+    out->proc_avg_us  = cp->proc_avg_us;
+    out->proc_max_us  = cp->proc_max_us;
+    out->starve_per_s = cp->starve_per_s;
+    out->overrun_cnt  = cp->overrun_cnt;
     return ESP_OK;
 }

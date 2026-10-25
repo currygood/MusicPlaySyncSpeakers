@@ -35,6 +35,8 @@
 #include "amplifier.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
@@ -118,8 +120,12 @@ static const char *const SYNC_DEFAULT_SLAVE_IPS[] = {
 /** 控制命令组播发送超时 */
 #define SYNC_CTRL_SEND_TIMEOUT_MS 100
 
-/** 本地播放写入 I2S 超时（写满待 DMA 时最长等 500ms，再长视为异常） */
-#define SYNC_PLAY_WRITE_TIMEOUT_MS 500
+/** 本地播放写入 I2S 超时。
+ *  一帧只有 15ms 音频（约 2.6KB），DMA 有 8×256 帧 ≈ 46ms 的余量，
+ *  正常情况下写立即完成、最坏也就等十几毫秒。原来的 500ms 一旦 I2S
+ *  侧停转（DMA 不开/功放无时钟），每帧都要白等半秒，听感上就是
+ *  "卡死"，而且会把 Watchdog 的判定拖进噪声里。100ms 足够，异常时快速失败。 */
+#define SYNC_PLAY_WRITE_TIMEOUT_MS 100
 
 /** 出队时间与 t_play_master 时差在此范围内即认为“准时” */
 #define SYNC_PLAY_DELTA_TOLERATE_US 2000
@@ -196,6 +202,8 @@ typedef struct {
     uint32_t tx_pkts;
     int64_t  last_played_pts_us;
     int64_t  play_delta_us;
+    uint32_t silence_frames;   /* 露底时写的静音帧数（每帧=1个 frame_ms）：
+                                * 增长即"延迟队列被耗尽"，是卡顿的最终判据 */
 
     /* 时间同步 */
     bool     slave_online;
@@ -461,6 +469,7 @@ static void sync_snapshot(sync_protocol_master_status_t *out)
                             ? (uint32_t)xStreamBufferBytesAvailable(s_master.ingress) : 0;
     out->delay_queue_used = (s_master.delay_cap > 0)
                             ? ((uint32_t)(s_master.delay_count)) : 0;
+    out->silence_frames = s_master.silence_frames;
     out->play_delta_us = s_master.play_delta_us;
     out->slave_online  = s_master.slave_online;
     out->last_slave_offset_us = 0;   /* 主节点不能单边计算 offset */
@@ -721,8 +730,14 @@ static void sync_tx_task(void *arg)
 {
     (void)arg;
 
+    /* 订阅任务看门狗：它一卡，从机立刻断流、本地延迟队列也会被抽干。
+     * 卡在 s_lock（含锁内的 SYNC_START 网络发送）或忙等时由 TWDT 报出。 */
+    (void)esp_task_wdt_add(NULL);
+
     for (;;)
     {
+        (void)esp_task_wdt_reset();
+
         /* 控制通道轮询（PING→PONG、在线检测） */
         sync_handle_control_rx();
 
@@ -939,6 +954,7 @@ static void sync_tx_task(void *arg)
     }
 
     SYNC_LOGI("SyncTx_Task exit");
+    (void)esp_task_wdt_delete(NULL);   /* 自删前退订，否则 TWDT 会报"任务不存在" */
     s_master.tx_task = NULL;   /* 自删前清句柄，deinit 不再重复删除 */
     vTaskDelete(NULL);
 }
@@ -960,6 +976,7 @@ static void sync_feed_silence(void)
 {
     int64_t t0;
     int64_t frame_us = (int64_t)s_master.cfg_frame_ms * 1000;
+    int64_t used_us;
 
     if (s_master.play_buf == NULL)
     {
@@ -971,9 +988,20 @@ static void sync_feed_silence(void)
     t0 = esp_timer_get_time();
     (void)Amplifier_Play_Buffer((const uint8_t *)s_master.play_buf,
                                 SYNC_FRAME_MAX_SAMPLES * 4, NULL, 100);
-    if (esp_timer_get_time() - t0 < frame_us / 2)
+    s_master.silence_frames++;   /* 诊断：露底时播了多少帧静音（见 status） */
+
+    /* 必须严格按"一帧 15ms"的节拍补足，而不是写完一帧就立刻写下一帧。
+     *
+     * 原来的写法是"耗时不足半帧就 vTaskDelay(1)"：DMA 有空位时 2~3ms 就
+     * 写完一帧静音，于是静音以数倍实时速度灌进 I2S DMA。DMA 只有
+     * 8 × 256 帧 ≈ 46ms，被静音灌满之后，真实 PCM 回来还要先把这 46ms
+     * 静音播完——听感就是"卡一下,声音还拖一拍才回来"。按节拍写则让 DMA
+     * 保持半满，数据一到立刻就能播出去。 */
+    used_us = esp_timer_get_time() - t0;
+    if (used_us < frame_us)
     {
-        vTaskDelay(1);
+        uint32_t wait_ms = (uint32_t)((frame_us - used_us) / 1000);
+        vTaskDelay(pdMS_TO_TICKS(wait_ms > 0 ? wait_ms : 1));
     }
 }
 
@@ -985,8 +1013,15 @@ static void sync_play_task(void *arg)
 {
     (void)arg;
 
+    /* 订阅任务看门狗：本任务是本地出声的最后一环，它一卡就是"音乐停、
+     * 串口全静"。订阅后卡住 5s 会由 TWDT 打印所有任务状态，能直接看出
+     * 是卡在等锁、等 I2S 还是忙等。 */
+    (void)esp_task_wdt_add(NULL);
+
     for (;;)
     {
+        (void)esp_task_wdt_reset();
+
         if (s_master.deinit_pending)
         {
             break;
@@ -1053,8 +1088,16 @@ static void sync_play_task(void *arg)
             }
             continue;
         }
-        /* 距离目标 < 2ms：忙等到时刻，提高与从节点同时出声的精度 */
-        while (esp_timer_get_time() < play_at)
+        /* 距离目标 < 2ms：忙等到时刻，提高与从节点同时出声的精度。
+         *
+         * 必须带硬上限：play_at 由延迟队列里的 t_play_us 换算而来，正常只在
+         * "差 2ms 以内"才会进这个循环；但如果队列里混进一条异常时间戳
+         * （换流残留/被写坏），无上限的忙等在 prio 12 上会把整个 core 1
+         * 饿死 —— 外部表现就是"放着放着突然卡死，串口再无任何输出，手机
+         * 却仍显示已连接"。加界之后最多多等 10ms 就放弃这一帧。 */
+        int64_t busy_deadline = esp_timer_get_time() + 10000;
+        while (esp_timer_get_time() < play_at &&
+               esp_timer_get_time() < busy_deadline)
         {
         }
 
@@ -1090,6 +1133,7 @@ static void sync_play_task(void *arg)
     }
 
     SYNC_LOGI("SyncLocalPlay_Task exit");
+    (void)esp_task_wdt_delete(NULL);   /* 自删前退订 */
     s_master.play_task = NULL; /* 自删前清句柄，deinit 不再重复删除 */
     vTaskDelete(NULL);
 }
@@ -1150,11 +1194,23 @@ static void sync_reset_stream(void)
     s_master.dropped_pkts    = 0;
     s_master.last_played_pts_us = 0;
     s_master.play_delta_us   = 0;
+    s_master.silence_frames  = 0;
     s_master.start_sent      = false;
     s_master.last_heartbeat_us = 0;
     if (s_master.ingress != NULL)
     {
+        /* 复位必须与 push_pcm 的"查空间 + 写"互斥：否则正在写的生产者会带着
+         * 复位前的 xHead 缓存继续写，复位后 xHead/xTail 关系被破坏，环里可能
+         * 出现几万个字节的陈旧数据被当成 PCM 播出去（听感为一段满量程噪声）。 */
+        if (s_push_lock != NULL)
+        {
+            xSemaphoreTake(s_push_lock, portMAX_DELAY);
+        }
         xStreamBufferReset(s_master.ingress);
+        if (s_push_lock != NULL)
+        {
+            xSemaphoreGive(s_push_lock);
+        }
     }
     sync_delay_clear();
 }
@@ -1244,8 +1300,12 @@ esp_err_t sync_protocol_master_init(const sync_protocol_master_cfg_t *cfg)
         xSemaphoreGive(s_lock);
         return ESP_ERR_NO_MEM;
     }
+    /* trigger level 必须是 1（不能传整个环容量）：stream buffer 只有在
+     * "已存字节数 >= trigger level" 时才通知等待中的接收方，而环里最多只能
+     * 存 xLength-1 字节，传满容量等于**永不通知**——目前接收方都用超时 0
+     * 轮询所以没暴露，但任何一次改成阻塞接收都会直接卡死。 */
     s_master.ingress = xStreamBufferCreateStatic(s_master.cfg_ingress_bytes,
-                                                 s_master.cfg_ingress_bytes,
+                                                 1,
                                                  s_master.ingress_buf, &s_master.ingress_sb);
     if (s_master.ingress == NULL)
     {
@@ -1460,8 +1520,18 @@ esp_err_t sync_protocol_master_push_pcm(const int16_t *pcm, size_t samples)
         size_t space;
         size_t room;
 
-        /* 换流/复位后旧通道的尾巴不能再混进新流 */
-        xSemaphoreTake(s_lock, portMAX_DELAY);
+        /* 换流/复位后旧通道的尾巴不能再混进新流。
+         *
+         * 这里**不能**用 portMAX_DELAY：本函数的调用方之一是 bt_audio_task，
+         * 它一旦被永久堵在锁上就再也无法消费 A2DP FIFO，上游随即溢出，
+         * 外部表现就是"放着放着突然卡死、串口全静、手机却还显示连着"。
+         * 拿不到锁只说明有异常的长持锁者，放弃这一块（丢帧）比整条链路
+         * 僵死好得多 —— 丢帧最多听一声咔，僵死是不可恢复的。 */
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) != pdTRUE)
+        {
+            s_master.dropped_pkts++;
+            break;
+        }
         bool stale = (s_master.stream_gen != gen);
         xSemaphoreGive(s_lock);
         if (stale)
@@ -1470,8 +1540,12 @@ esp_err_t sync_protocol_master_push_pcm(const int16_t *pcm, size_t samples)
         }
 
         /* 生产者互斥：free-space 判定和写入必须是原子的，否则两个生产者
-         * （本地解码 / 蓝牙）交错时仍可能写出非整采样字节。 */
-        xSemaphoreTake(s_push_lock, portMAX_DELAY);
+         * （本地解码 / 蓝牙）交错时仍可能写出非整采样字节。同样加超时。 */
+        if (xSemaphoreTake(s_push_lock, pdMS_TO_TICKS(20)) != pdTRUE)
+        {
+            s_master.dropped_pkts++;
+            break;
+        }
         space = xStreamBufferSpacesAvailable(s_master.ingress);
         room  = space - (space % unit);
         if (room > 0)

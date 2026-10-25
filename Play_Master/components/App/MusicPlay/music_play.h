@@ -12,6 +12,12 @@
  *     由内部 MusicPlay_Task 状态机串行处理；
  *   - 手机与 UI 同时按键时，UI 指令作为"期望"，蓝牙源的最终状态以 bt_audio
  *     事件为准，本地源以自身状态机为准。
+ *   - 播放模式按源各存一份，互不继承：本地源由本模块状态机执行并持久化到
+ *     node_role.play_mode；蓝牙源的播放列表在手机侧，设备只能
+ *     bt_audio_set_repeat_mode() 请求 + 曲末守卫（TRACK_CHANGE -> PREV）兜底，
+ *     故 bt_mode 只存会话内存（手机真实循环状态无法回读，持久化会造成假状态）。
+ *     view.mode / view.mode_owner 是"当前源那一份"的对外副本，UI 据此区分
+ *     模式由设备执行还是由手机执行。
  *
  * 依赖接线（App 初始化时完成）：
  *   - bt_audio 由 App 层创建后经 cfg.bt_audio 传入；其 on_pcm/on_event 由 App
@@ -67,6 +73,17 @@ typedef enum {
     MUSIC_PLAY_MODE_SINGLE_LOOP,     /* 单曲循环 */
 } music_play_mode_t;
 
+/**
+ * 播放模式的执行方（UI 据此区分两种语义完全不同的事）
+ *
+ * 本地源：设备自己持有播放列表，播完由本模块决定下一首，模式是"命令"；
+ * 蓝牙源：手机持有播放列表，设备只是音频出口，模式只能"请求 + 兜底纠正"。
+ */
+typedef enum {
+    MUSIC_MODE_OWNER_LOCAL = 0,  /* 设备状态机直接执行 */
+    MUSIC_MODE_OWNER_BT,         /* AVRCP 尽力下发 + 设备侧守卫兜底 */
+} music_mode_owner_t;
+
 /* 命令 */
 typedef enum {
     MUSIC_CMD_PLAY,
@@ -96,7 +113,8 @@ typedef struct {
 typedef struct {
     music_source_t     source;
     music_state_t      state;
-    music_play_mode_t  mode;
+    music_play_mode_t  mode;        /* 当前源的生效模式（本地/蓝牙各存一份） */
+    music_mode_owner_t mode_owner;  /* 该模式由谁执行（本地状态机 / 手机） */
     uint8_t            volume;
     uint16_t           track_index;
     uint16_t           track_count;

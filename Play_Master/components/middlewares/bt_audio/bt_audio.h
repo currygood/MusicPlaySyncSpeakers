@@ -143,6 +143,19 @@ bool      bt_audio_hfp_is_audio_open(bt_audio_handle_t audio); /* 查询 SCO 是
 
 /* AVRCP：UI 控制 */
 esp_err_t bt_audio_send_ctrl_cmd(bt_audio_handle_t audio, bt_audio_cmd_t cmd);
+
+/**
+ * @brief 向手机下发播放器的重复模式（AVRCP SetPlayerApplicationSettingValue）
+ *
+ * 属于 best-effort 能力：手机作为 A2DP source 时不一定实现 AVRCP TG 角色，
+ * 命令可能被忽略或拒绝；bluedroid 的 CT 侧也没有该命令的响应事件，因此
+ * **调用成功只代表帧已发出，不代表手机已生效**，需要由上层按播放行为兜底
+ * （见 music_play 的蓝牙单曲循环守卫）。
+ *
+ * @param single true=单曲循环（repeat=SINGLE），false=关闭重复（repeat=OFF）
+ * @return ESP_OK 已入协议栈；ESP_ERR_INVALID_STATE AVRCP 未连接
+ */
+esp_err_t bt_audio_set_repeat_mode(bt_audio_handle_t audio, bool single);
 esp_err_t bt_audio_get_play_state(bt_audio_handle_t audio, bt_audio_play_state_t *state);
 esp_err_t bt_audio_get_position_ms(bt_audio_handle_t audio, uint32_t *position_ms);
 esp_err_t bt_audio_get_track_info(bt_audio_handle_t audio,
@@ -154,5 +167,31 @@ uint8_t   bt_audio_get_volume(bt_audio_handle_t audio);
 
 /* 调试 */
 uint32_t bt_audio_get_pcm_dropped(bt_audio_handle_t audio, bt_audio_pcm_source_t source);
+/** A2DP FIFO 因字节流错位而复位整条流的次数（正常应恒为 0；非 0 说明上游
+ *  写入了非整帧字节，是"满量程噪声"的根因指标） */
+uint32_t bt_audio_get_pcm_resync(bt_audio_handle_t audio);
+/** A2DP 连续 80ms 无数据的次数：蓝牙路径"真欠载/卡顿"的直接指标。
+ *  正常播放时应保持为 0；非 0 说明手机端或射频共存把数据掐断过。 */
+uint32_t bt_audio_get_a2dp_underrun(bt_audio_handle_t audio);
+/** A2DP FIFO 单轮读空的累计次数。稳态下本来就会持续增长（本任务一有数据
+ *  就取走，手机包间隔 15~30ms），**不是**故障指标，只用来估算 FIFO 的
+ *  平均占用率，诊断卡顿时用来对照。 */
+uint32_t bt_audio_get_a2dp_idle(bt_audio_handle_t audio);
+/** 取走并清零"上一统计窗口内相邻两次 A2DP 数据回调的最大间隔(ms)"。
+ *  用来区分断供的性质：稳定在某个固定值(40/60/100ms) = 手机端攒包；
+ *  忽大忽小且能到 80ms 以上 = 射频被 WiFi 抢占导致的链路丢包。 */
+uint32_t bt_audio_get_and_reset_a2dp_gap(bt_audio_handle_t audio);
+
+/* ---------------------- 卡死定位（活体检测） ---------------------- */
+/** A2DP 数据回调累计次数（协议栈上下文自增）。
+ *  与 bt_audio_get_task_beat() 组合可唯一区分三种"没声音"：
+ *    两者都不涨      → 手机/链路不再送数据（host 侧没收到）
+ *    本值涨、beat 停  → bt_audio_task 自己卡住（被下游互斥量卡死）
+ *    本值停、beat 涨  → 数据没到，但模块任务活着 */
+uint32_t bt_audio_get_a2dp_cb_count(bt_audio_handle_t audio);
+/** 模块任务主循环累计圈数（每圈 +1）。卡死时它停止增长。 */
+uint32_t bt_audio_get_task_beat(bt_audio_handle_t audio);
+/** A2DP FIFO 当前已用字节数（0 = 被抽干；接近容量 = 消费端停转）。 */
+uint32_t bt_audio_get_a2dp_fifo_used(bt_audio_handle_t audio);
 
 #endif

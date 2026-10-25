@@ -115,7 +115,16 @@ static void player_apply_view(const music_play_view_t *v)
     }
     if (s_lblSub != NULL)
     {
-        lv_label_set_text(s_lblSub, s_srcBt ? "蓝牙音频" : "本地音乐");
+        /* 蓝牙源的循环模式由手机播放器执行（设备只做 AVRCP 请求 + 兜底），
+         * 副标题必须显式说明归属，否则"图标变了歌却在换"就是假反馈。 */
+        if (s_srcBt)
+        {
+            lv_label_set_text(s_lblSub, "蓝牙音频 · 循环跟随手机");
+        }
+        else
+        {
+            lv_label_set_text(s_lblSub, "本地音乐");
+        }
     }
 
     /* ▶/⏸ 与 🔁 图标（只由回流快照驱动，绝不本地翻转） */
@@ -129,6 +138,11 @@ static void player_apply_view(const music_play_view_t *v)
         lv_label_set_text(s_lblModeIcon,
                           (v->mode == MUSIC_PLAY_MODE_SINGLE_LOOP) ? UI_ICON_REPEAT_ONE
                                                                    : UI_ICON_REPEAT);
+        /* 蓝牙源下模式的实际执行方是手机（设备只请求 + 兜底），图标用次色，
+         * 与本地源"设备自己执行"在视觉上区分开 */
+        lv_obj_set_style_text_color(s_lblModeIcon,
+                                    (v->mode_owner == MUSIC_MODE_OWNER_BT)
+                                        ? UI_COLOR_TEXT_SUB : UI_COLOR_TEXT, 0);
     }
 
     /* 主控键"等待回流"态：pending_cmd 时图标转灰（设计文档 5.2） */
@@ -277,9 +291,20 @@ static void mode_click_cb(lv_event_t *e)
     next = (v != NULL && v->mode == MUSIC_PLAY_MODE_SINGLE_LOOP)
                ? MUSIC_PLAY_MODE_SEQUENTIAL : MUSIC_PLAY_MODE_SINGLE_LOOP;
     ret  = music_play_set_mode(cfg->music, next);
-    UI_LOGI( "播放模式 -> music_play_set_mode(%s): %s",
-             (next == MUSIC_PLAY_MODE_SINGLE_LOOP) ? "SINGLE_LOOP" : "SEQUENTIAL",
-             esp_err_to_name(ret));
+    if (s_srcBt)
+    {
+        /* 蓝牙源：模式先请求手机（AVRCP repeat），手机不支持时由设备守卫在
+         * 曲末发 PREV 兜底，故这里只记录指令，等待 MUSIC_EVT_PLAY_MODE_CHANGED 回流 */
+        UI_LOGI( "播放模式 -> 蓝牙源 %s（请手机 + 设备兜底）: %s",
+                 (next == MUSIC_PLAY_MODE_SINGLE_LOOP) ? "SINGLE_LOOP" : "SEQUENTIAL",
+                 esp_err_to_name(ret));
+    }
+    else
+    {
+        UI_LOGI( "播放模式 -> 本地源 %s: %s",
+                 (next == MUSIC_PLAY_MODE_SINGLE_LOOP) ? "SINGLE_LOOP" : "SEQUENTIAL",
+                 esp_err_to_name(ret));
+    }
 }
 
 static void chip_click_cb(lv_event_t *e)

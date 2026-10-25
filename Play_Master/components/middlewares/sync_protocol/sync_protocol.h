@@ -256,6 +256,9 @@ typedef struct {
     uint32_t         dropped_pkts;   /* 入环满丢弃 + 发送失败累计 */
     uint32_t         ingress_used;   /* ingress 已用字节 */
     uint32_t         delay_queue_used; /* 本地延迟队列已用包数 */
+    uint32_t         silence_frames;   /* 延迟队列露底时补的静音帧数（每帧 =
+                                        * cfg_frame_ms）：持续增长就是"卡顿"本身，
+                                        * 停止增长说明供数已经跟上 */
     int64_t          play_delta_us;  /* 本机出队播放与 t_play_master 的偏差（µs） */
     bool             slave_online;
     int32_t          last_slave_offset_us; /* 主节点无法单边计算，恒为 0，从机阶段填写 */

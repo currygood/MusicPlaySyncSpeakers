@@ -2,16 +2,15 @@
  * @file scr_settings.c
  * @brief 设置页（Tab 3，固定 4 页，右上角箭头翻页；UI 界面设计 5.5）
  *
- * 分区：播放源 / 网络 / 同步播放 / 语音助手 / 固件 / 关于。
+ * 分区：播放源 / 网络 / 同步播放 / 固件 / 关于。
  * 内容区 320×176 不再纵向滚动，按下列分组固定摆放，每页都完整可见：
  *   第 1 页 播放源 + 网络
  *   第 2 页 同步播放（汇总 + 最多 8 台从机，行高 19 = 字体行高）
- *   第 3 页 语音助手 + 固件
+ *   第 3 页 固件（原"语音助手"分区随语音唤醒下线删除，2026-10-25）
  *   第 4 页 关于
  * 第八阶段数据来源：
  *   - 真实：SD 卡状态（SD_Card_Is_Mounted()）；
- *   - 句柄注入后真实：WiFi 状态/IP（wifi_manager 查询，1s 轮询）、
- *     语音状态（call_phone_get_state()，1s 轮询）；
+ *   - 句柄注入后真实：WiFi 状态/IP（wifi_manager 查询，1s 轮询）；
  *   - 源切换：music_play_set_source()（句柄注入后真实，NULL 时占位日志）；
  *   - 占位日志：配网（需扫描接口，设计文档 9.1）、同步（sync_protocol，
  *     九阶段）、OTA（十二阶段）。
@@ -31,7 +30,6 @@
 /* 动态标签（句柄注入后由 1s 轮询刷新） */
 static lv_obj_t *s_lblNetState;
 static lv_obj_t *s_lblNetIp;
-static lv_obj_t *s_lblMicState;
 static lv_obj_t *s_lblSyncState;  /* 同步播放汇总标签（已连接 N 台 / 状态） */
 static lv_obj_t *s_lblFwVersion;  /* 固件版本标签 */
 static lv_obj_t *s_btnOta;        /* "检查更新"按钮（OTA 期间禁用） */
@@ -78,18 +76,6 @@ static const char *wifi_state_name(wifi_state_t st)
     case WIFI_STATE_DISCONNECTED: return "已断开(重连中)";
     case WIFI_STATE_ERROR:        return "错误(检查密码)";
     default:                      return "未知";
-    }
-}
-
-static const char *call_state_name(call_phone_state_t st)
-{
-    switch (st)
-    {
-    case CALL_PHONE_STATE_IDLE:       return "待机";
-    case CALL_PHONE_STATE_LISTENING:  return "监听唤醒词";
-    case CALL_PHONE_STATE_CONNECTING: return "建立语音链路";
-    case CALL_PHONE_STATE_STREAMING:  return "语音通话中";
-    default:                          return "未知";
     }
 }
 
@@ -558,11 +544,6 @@ static void ota_ui_evt_cb(const ota_update_event_info_t *info, void *user_ctx)
             music_play_destroy(cfg->music);
             UI_LOGI( "music_play destroyed");
         }
-        if (cfg->call_phone != NULL)
-        {
-            call_phone_destroy(cfg->call_phone);
-            UI_LOGI( "call_phone destroyed");
-        }
         if (cfg->light != NULL)
         {
             light_control_destroy(cfg->light);
@@ -756,15 +737,6 @@ static void settings_timer_cb(lv_timer_t *timer)
                          ip, (int)wifi_manager_get_rssi(cfg->wifi));
                 lv_label_set_text(s_lblNetIp, buf);
             }
-        }
-    }
-
-    if (cfg->call_phone != NULL)
-    {
-        call_phone_state_t st = CALL_PHONE_STATE_IDLE;
-        if (call_phone_get_state(cfg->call_phone, &st) == ESP_OK)
-        {
-            lv_label_set_text_fmt(s_lblMicState, "状态: %s", call_state_name(st));
         }
     }
 
@@ -1071,18 +1043,9 @@ void scr_settings_build(lv_obj_t *page)
         s_syncRows[i] = row;
     }
 
-    /* ---- 第 3 页：语音助手 + 固件 ---- */
+    /* ---- 第 3 页：固件（原"语音助手"分区已随语音唤醒功能下线删除） ---- */
     p = s_setPages[2];
     y = 4;
-
-    panel = section_add(p, y, "语音助手", 58);
-    s_lblMicState = ui_label_create(panel,
-        (cfg->call_phone != NULL) ? "状态: --" : "状态: 未接线（传入 call_phone 句柄后生效）",
-        &ui_font_cn_16, UI_COLOR_TEXT_SUB);
-    lv_obj_set_pos(s_lblMicState, 8, 8);
-    lbl = ui_label_create(panel, "唤醒词: 你好小智", &ui_font_cn_16, UI_COLOR_DISABLED);
-    lv_obj_set_pos(lbl, 8, 32);
-    y += 20 + 58 + 8;   /* = 90 */
 
     panel = section_add(p, y, "固件", 44);
     s_lblFwVersion = ui_label_create(panel, "版本: " FW_VERSION,

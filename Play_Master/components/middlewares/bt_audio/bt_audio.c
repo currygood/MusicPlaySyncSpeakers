@@ -13,7 +13,8 @@
  *     bt_audio 任务上下文触发，绝不在协议栈上下文调用用户回调。
  *
  * 说明：AVRCP 已实现播放控制（play/pause/prev/next/toggle）、音量（SetAbsoluteVolume）
- *       与曲目信息（元数据 + TRACK_CHANGE / PLAY_STATUS_CHANGE / VOLUME_CHANGE 通知）。
+ *       与曲目信息（元数据 + TRACK_CHANGE / PLAY_STATUS_CHANGE / VOLUME_CHANGE 通知），
+ *       以及播放器重复模式下发（SetPlayerApplicationSettingValue，best-effort）。
  */
 
 #include "bt_audio.h"
@@ -38,7 +39,10 @@
 #include "esp_avrc_api.h"
 #include "esp_hf_client_api.h"
 #include "esp_hf_client_legacy_api.h"
+#include "esp_coexist.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
 
@@ -58,8 +62,23 @@
 
 /* ======================== 默认参数 ============================================ */
 
-/** A2DP PCM FIFO 默认大小（cfg->a2dp_fifo_bytes 为 0 时使用） */
-#define BT_A2DP_FIFO_DEFAULT_BYTES  (24 * 1024)
+/** A2DP PCM FIFO 默认大小（cfg->a2dp_fifo_bytes 为 0 时使用）
+ *
+ *  44.1kHz/2ch/16bit = 176400 B/s ⇒ 64KB ≈ 371ms。
+ *  原来是 24KB（≈139ms），但蓝牙这条支路是"手机实时给多少就有多少"，
+ *  FIFO 就是唯一的抖动垫子（SD 卡路径不是：解码端能跑在实时速率之前，
+ *  64KB 的 sync 入口环常年是满的）。所以这里放大到 64KB，配合任务侧的
+ *  开流预灌，把蓝牙路径的抗抖动能力从"零"提到 100ms 以上。 */
+#define BT_A2DP_FIFO_DEFAULT_BYTES  (64 * 1024)
+
+/** A2DP 开流预灌水位：开始往下游喂数据前，先让 FIFO 攒到这么多字节。
+ *  24KB ≈ 139ms @44.1k/2ch，等于给蓝牙音频补一个"启动抖动缓冲"。 */
+#define BT_A2DP_PREBUFFER_BYTES     (24 * 1024)
+
+/** 字节流错位自愈后的重灌水位（8KB ≈ 46ms）。
+ *  只在 FIFO 被 Reset 之后使用——那种情况下确实是"从头开始"，需要一小段
+ *  余量；正常播放中读空**绝不**用这个值重灌（见任务里 bytes==0 的注释）。 */
+#define BT_A2DP_REPRIME_BYTES       (8 * 1024)
 
 /** HFP 上行 FIFO 默认大小（44.1kHz 单声道；1s ≈ 88200 字节） */
 #define BT_HFP_UP_FIFO_DEFAULT_BYTES  (16 * 1024)
@@ -91,9 +110,45 @@
 /** 每次从 FIFO 取出的 PCM 块长度（int16 采样点数） */
 #define BT_PCM_CHUNK_SAMPLES        2048
 
+/**
+ * A2DP PCM 的**整帧字节数**：16bit × 2 声道 = 4 字节。
+ *
+ * FIFO 是纯字节流，没有消息边界。只要写进去的字节数不是 4 的整数倍
+ * （哪怕只差 1 字节），环里所有采样的边界就永久错位一格：消费端把相邻
+ * 两字节拼成 int16，输出的就是满量程随机噪声（听感"吱吱/蹦蹦"），而且
+ * 只有断开重连（FIFO 重建）才会恢复。
+ *
+ * 危险点在于 FreeRTOS 的语义：xStreamBufferSend() 在 xTicksToWait=0 且空间
+ * 不足时是**部分写入**（写满剩余空间就返回），而 stream buffer 的空闲
+ * 字节数 = xLength - used - 1，xLength 为偶数、游标按整帧走 ⇒ 空闲字节数
+ * 恒为**奇数**。也就是说：只要 A2DP FIFO 溢出过一次，就必然写进半个采样，
+ * 整条流从此变成噪声。所以生产端必须自己按整帧裁剪，不能依赖 send 的语义。
+ */
+#define BT_A2DP_FRAME_BYTES         4u
+
 /** 模块任务栈：大 PCM 缓冲已移出栈（A2DP/HFP 下行块放 PSRAM），
  *  栈上只剩事件结构体（约 536B）与回调调用帧（sync/Amplifier），4KB 足够 */
 #define BT_AUDIO_TASK_STACK         4096
+
+/** 模块任务优先级。原来为 5 —— 全系统倒数第二（只高于 Touch_Task 的 3），
+ *  而音乐链路的其它环节都在 9~12（MusicPlay 9 / decoder 10 / SyncTx 11 /
+ *  SyncPlay 12）。蓝牙这里是"实时生产者"，被压 15ms 以上就会让下游断音，
+ *  所以往上提：11 —— 只低于 SyncPlay(12)（播放节拍绝不能被生产者抢掉），
+ *  高于解码器(10)/MusicPlay(9)。 */
+#define BT_AUDIO_TASK_PRIO          11
+
+/** 模块任务绑核：固定在 core 1。
+ *
+ *  core 0 上已经挤了 WiFi(23) / BT 控制器(~23) / lwIP(18) / SyncTx(11) /
+ *  UI / Touch，并且经典蓝牙与 WiFi 共用射频（CONFIG_ESP_COEX_SW_COEXIST_ENABLE），
+ *  A2DP 收包本身就带几十毫秒抖动。把 FIFO 搬运任务也丢在 core 0，等于让
+ *  "最怕抖"的一环去和射频栈抢 CPU。
+ *
+ *  core 1 上只有 SyncPlay(12) / decoder(10) / MusicPlay(9) / CallPhone(8)，
+ *  且蓝牙放音时 decoder 空闲，搬运动作可以稳定拿到时间片。
+ *  （协议栈的 A2DP 数据回调仍在 core 0 写 FIFO，这是跨核写入，但 FIFO 本身
+ *   带锁且只是 memcpy，代价远小于被抢占） */
+#define BT_AUDIO_TASK_CORE          1
 
 /* 配对 PIN（测试阶段固定，后续可由 UI 配置） */
 #define BT_PIN_CODE                 "0000"
@@ -148,8 +203,30 @@ struct bt_audio_s
 
     /* ---- 丢帧 / 丢事件统计 ---- */
     uint32_t             dropped_pcm;    /* A2DP FIFO 满丢弃字节数 */
+    uint32_t             resync_cnt;     /* A2DP FIFO 出现非整帧数据后的复位次数（自愈） */
     uint32_t             dropped_evt;    /* 事件队列满丢弃个数 */
     uint32_t             hfp_dn_dropped; /* HFP 下行 FIFO 溢出丢弃字节数 */
+
+    /* ---- A2DP 抖动缓冲（开流预灌） ---- */
+    bool                 a2dp_primed;       /* FIFO 是否已攒够预灌水位 */
+    uint32_t             a2dp_prime_bytes;  /* 本轮预灌目标（开流 24KB） */
+    uint32_t             a2dp_idle_cnt;     /* FIFO 读空次数（稳态下本来就会发生，非异常） */
+    uint32_t             a2dp_underrun_cnt; /* 连续 80ms 无数据 = 真欠载次数：卡顿的直接指标 */
+    uint8_t              a2dp_idle_run;     /* 当前连续读空的轮数（用于区分"取太快"与"真断供"） */
+
+    /* ---- A2DP 到达间隔统计（判断断供是"手机攒包"还是"射频丢包"） ---- */
+    uint64_t             a2dp_last_cb_us;   /* 上一次数据回调的时刻 */
+    uint32_t             a2dp_gap_max_ms;   /* 本统计窗口内相邻两次回调的最大间隔 */
+
+    /* ---- 活体检测（卡死定位用，只增不减） ----
+     * a2dp_cb_cnt 在协议栈数据回调里自增，task_beat 在模块任务循环里自增。
+     * 二者组合能唯一区分三种"没声音"：
+     *   两者都停        → 手机/链路不再送数据（host 没收到）
+     *   cb 涨、beat 停   → bt_audio_task 自己卡住（被下游锁死）
+     *   cb 停、beat 涨   → 数据没到，但任务活着 */
+    uint32_t             a2dp_cb_cnt;       /* A2DP 数据回调累计次数 */
+    uint32_t             task_beat;         /* 模块任务主循环累计圈数 */
+    uint32_t             warn_last_ms;      /* 限流打印用：上次告警的 tick(ms) */
 
     /* HFP 状态 */
     bool                 hfp_connected;    /* SLC 已建立 */
@@ -208,6 +285,22 @@ static bool s_stack_ready = false;
 
 #define BT_AUDIO_LOCK()   xSemaphoreTake(s_bt_audio.lock, portMAX_DELAY)
 #define BT_AUDIO_UNLOCK() xSemaphoreGive(s_bt_audio.lock)
+
+/** 必须被看到的告警（限流 2s 一条）。
+ *
+ *  bt_audio 自己的 BT_AUDIO_LOGW 受 BT_AUDIO_DEBUG_LOGS 编译开关控制，
+ *  该开关默认关闭 —— 于是 FIFO 溢出、欠载、错位这些**恰恰只在出问题时
+ *  才发生**的事件，全都被编译掉了。用户看到的现象就是"卡死了，串口
+ *  一个字都没有"，无法判断卡在哪一环。
+ *  这里改用独立 tag "BT_PCM"，并做 2 秒限流，既不会刷屏也不会静默。 */
+#define BT_PCM_WARN(ms_now, fmt, ...)                                        \
+    do {                                                                     \
+        uint32_t _ms = (uint32_t)(ms_now);                                    \
+        if ((uint32_t)(_ms - s_bt_audio.warn_last_ms) >= 2000u) {             \
+            s_bt_audio.warn_last_ms = _ms;                                    \
+            ESP_LOGW("BT_PCM", fmt, ##__VA_ARGS__);                           \
+        }                                                                     \
+    } while (0)
 
 /* ======================== 内部工具 ========================================== */
 
@@ -325,7 +418,8 @@ static uint64_t bt_audio_hfp_up_step(void)
 static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len)
 {
     StreamBufferHandle_t fifo;
-    size_t sent;
+    size_t space, room, whole, n, sent;
+    uint64_t now_us;
 
     if (data == NULL || len == 0)
     {
@@ -338,12 +432,65 @@ static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len)
         return;
     }
 
-    /* 非阻塞写入：FIFO 满直接丢弃并计数，不阻塞协议栈任务 */
-    sent = xStreamBufferSend(fifo, data, len, 0);
-    if (sent != len)
+    /* ---- 到达间隔统计 ----
+     * 手机 SBC 的 RTP 包间隔通常是 15~30ms。如果最大间隔稳定在某个
+     * 固定值（比如 40/60/100ms），说明是**手机端在攒包**，不是干扰；
+     * 如果间隔忽大忽小、最坏到 80ms 以上，那就是射频被抢导致的**丢包**。
+     * 这两种情况的处理方式完全不同，所以必须分开测量。 */
+    now_us = (uint64_t)esp_timer_get_time();
+    if (s_bt_audio.a2dp_last_cb_us != 0)
     {
-        s_bt_audio.dropped_pcm += (uint32_t)(len - sent);
-        BT_AUDIO_LOGW("A2DP FIFO overflow, drop %u bytes", (unsigned)(len - sent));
+        uint32_t gap_ms = (uint32_t)((now_us - s_bt_audio.a2dp_last_cb_us) / 1000u);
+        if (gap_ms > s_bt_audio.a2dp_gap_max_ms)
+        {
+            s_bt_audio.a2dp_gap_max_ms = gap_ms;
+        }
+    }
+    s_bt_audio.a2dp_last_cb_us = now_us;
+    s_bt_audio.a2dp_cb_cnt++;          /* 活体检测：协议栈还在往我们这里送数据 */
+
+    /* 非阻塞写入：FIFO 满直接丢弃并计数，不阻塞协议栈任务。
+     *
+     * 但**不能**直接把 len 交给 xStreamBufferSend：空间不足时它会部分写入，
+     * 而空闲字节数恒为奇数（见 BT_A2DP_FRAME_BYTES 注释），一旦部分写入就
+     * 写进半个 int16，整条字节流永久错位 → 输出满量程噪声。
+     * 所以这里先把"要写的量"和"能写的量"都裁剪到整帧边界：宁可丢整帧，
+     * 也绝不让 FIFO 里出现非整帧字节数。 */
+    whole = (size_t)len - ((size_t)len % BT_A2DP_FRAME_BYTES);
+    if (whole == 0)
+    {
+        s_bt_audio.dropped_pcm += len;
+        BT_PCM_WARN(now_us / 1000u, "A2DP chunk %u B not whole frame, drop",
+                    (unsigned)len);
+        return;
+    }
+
+    space = xStreamBufferSpacesAvailable(fifo);
+    room  = space - (space % BT_A2DP_FRAME_BYTES);
+    n     = (whole < room) ? whole : room;
+
+    if (n == 0)
+    {
+        s_bt_audio.dropped_pcm += len;
+        BT_PCM_WARN(now_us / 1000u, "A2DP FIFO full, drop %u B (consumer stuck?)",
+                    (unsigned)len);
+        return;
+    }
+
+    sent = xStreamBufferSend(fifo, data, n, 0);
+    if (sent < n)
+    {
+        /* 空间已按整帧裁剪，正常不会走到这里；真发生了也只影响计数，
+         * 因为 sent 必然是整帧的整数倍（send 只会写满 xSpace，而 xSpace
+         * 已由我们按整帧对齐过）。 */
+        BT_PCM_WARN(now_us / 1000u, "A2DP short write %u/%u B",
+                    (unsigned)sent, (unsigned)n);
+    }
+    if (n < (size_t)len)
+    {
+        s_bt_audio.dropped_pcm += (uint32_t)((size_t)len - n);
+        BT_PCM_WARN(now_us / 1000u, "A2DP FIFO overflow, drop %u B",
+                    (unsigned)((size_t)len - n));
     }
 }
 
@@ -367,6 +514,11 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             s_bt_audio.a2dp.sample_rate       = 0;   /* 在 AUDIO_CFG 事件里更新 */
             s_bt_audio.a2dp.channels          = 0;
             s_bt_audio.a2dp.bits_per_sample   = 16;
+            s_bt_audio.a2dp_primed            = false;   /* 新链路：重新预灌 */
+            s_bt_audio.a2dp_prime_bytes       = BT_A2DP_PREBUFFER_BYTES;
+            s_bt_audio.a2dp_underrun_cnt      = 0;
+            s_bt_audio.a2dp_idle_cnt          = 0;
+            s_bt_audio.a2dp_idle_run          = 0;
             memcpy(s_bt_audio.remote_addr, param->conn_stat.remote_bda, 6);
             BT_AUDIO_UNLOCK();
 
@@ -381,10 +533,16 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             s_bt_audio.a2dp.sample_rate       = 0;
             s_bt_audio.a2dp.channels          = 0;
             s_bt_audio.stream_started         = false;
+            s_bt_audio.a2dp_primed            = false;
+            s_bt_audio.a2dp_prime_bytes       = BT_A2DP_PREBUFFER_BYTES;
             memset(s_bt_audio.remote_addr, 0, sizeof(s_bt_audio.remote_addr));
             BT_AUDIO_UNLOCK();
 
             BT_AUDIO_LOGI("A2DP disconnected");
+
+            /* 异常断开时 stream_stopped 不一定先到，这里兜底还射频给 WiFi */
+            (void)esp_coex_status_bit_clear(ESP_COEX_ST_TYPE_BT,
+                                            ESP_COEX_BT_ST_A2DP_STREAMING);
         }
         else
         {
@@ -403,14 +561,44 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED)
         {
             evt.id = BT_AUDIO_EVT_A2DP_STREAM_STARTED;
-            s_bt_audio.stream_started = true;
+            BT_AUDIO_LOCK();
+            s_bt_audio.stream_started    = true;
+            s_bt_audio.a2dp_primed       = false;   /* 开流：先攒够预灌水位再放行 */
+            s_bt_audio.a2dp_prime_bytes  = BT_A2DP_PREBUFFER_BYTES;
+            s_bt_audio.a2dp_idle_run     = 0;
+            s_bt_audio.a2dp_last_cb_us   = 0;
+            s_bt_audio.a2dp_gap_max_ms   = 0;
+            BT_AUDIO_UNLOCK();
             BT_AUDIO_LOGI("A2DP stream started");
+
+            /* 软件共存的官方"我在放 A2DP"标志位。
+             *
+             * 主节点同时还在用 WiFi 每 15ms 给从机单播一包音频，两条链路
+             * 抢同一个 2.4G 天线。不置这个位时共存器按 BALANCE 处理，WiFi
+             * 的长帧会把蓝牙的接收窗口挤掉 → A2DP 包被链路层丢弃（手机侧
+             * 早已发出，我们这边永远收不到）→ 音频内容出现 80ms 级的空洞，
+             * 听感就是"老旧收音机"那种断续。
+             *
+             * 置位后共存器会为经典蓝牙留出更确定的窗口。代价是 WiFi 单播
+             * 的发包时刻会被推迟若干 ms —— 从机侧有 200ms 延迟队列和 PLC，
+             * 完全吃得下；而蓝牙是实时流，没有任何补救手段。 */
+            (void)esp_coex_status_bit_set(ESP_COEX_ST_TYPE_BT,
+                                          ESP_COEX_BT_ST_A2DP_STREAMING);
         }
         else if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_SUSPEND)
         {
             evt.id = BT_AUDIO_EVT_A2DP_STREAM_STOPPED;
-            s_bt_audio.stream_started = false;
+            BT_AUDIO_LOCK();
+            s_bt_audio.stream_started    = false;
+            s_bt_audio.a2dp_primed       = false;   /* 暂停期间 FIFO 里只剩残帧 */
+            s_bt_audio.a2dp_prime_bytes  = BT_A2DP_PREBUFFER_BYTES;
+            s_bt_audio.a2dp_idle_run     = 0;
+            BT_AUDIO_UNLOCK();
             BT_AUDIO_LOGI("A2DP stream stopped");
+
+            /* 停流后立刻交还射频给 WiFi（否则 WiFi 发包会一直被压着） */
+            (void)esp_coex_status_bit_clear(ESP_COEX_ST_TYPE_BT,
+                                            ESP_COEX_BT_ST_A2DP_STREAMING);
         }
         else
         {
@@ -434,6 +622,10 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         BT_AUDIO_LOCK();
         s_bt_audio.a2dp.sample_rate = rate;
         s_bt_audio.a2dp.channels    = ch;
+        /* 采样率/声道变了 ⇒ FIFO 里旧格式的数据不能和新数据混着喂，
+         * 丢掉重来并重新预灌（正常只在切歌/换编码时发生一次） */
+        s_bt_audio.a2dp_primed      = false;
+        s_bt_audio.a2dp_prime_bytes = BT_A2DP_PREBUFFER_BYTES;
         BT_AUDIO_UNLOCK();
 
         memset(&evt, 0, sizeof(evt));
@@ -1132,8 +1324,17 @@ static void bt_audio_task(void *arg)
 
     (void)arg;
 
+    /* 订阅任务看门狗：这一环卡住 = 音乐立刻断，而它下游全是 portMAX_DELAY
+     * 的互斥量，一旦卡住就是"静默死机"（串口一个字都没有）。订阅之后，
+     * 超过 CONFIG_ESP_TASK_WDT_TIMEOUT_S 未喂狗，TWDT 会打印所有任务的
+     * 运行状态，直接指出是谁卡住了。 */
+    (void)esp_task_wdt_add(NULL);
+
     for (;;)
     {
+        (void)esp_task_wdt_reset();
+        s_bt_audio.task_beat++;        /* 活体检测：本任务主循环还在转 */
+
         /* 事件优先：非阻塞取一条 */
         if (xQueueReceive(s_bt_audio.evt_q, &evt, 0) == pdTRUE)
         {
@@ -1170,12 +1371,82 @@ static void bt_audio_task(void *arg)
             }
         }
 
+        /* ---- A2DP 抖动缓冲：开流预灌 ----
+         * 蓝牙是严格实时的音源（手机喂多少就只有多少），数据一到就往下走，
+         * 于是链路的抗抖动能力只剩 sync 的 200ms 延迟队列，而 SD 卡路径的
+         * 解码端能跑在实时速率之前、把 64KB 入口环常年灌满。这里先在本地
+         * FIFO 里攒够 a2dp_prime_bytes 再放行，给蓝牙补上同量级的缓冲余量。 */
+        if (s_bt_audio.stream_started && !s_bt_audio.a2dp_primed &&
+            s_bt_audio.pcm_fifo != NULL)
+        {
+            uint32_t need = (s_bt_audio.a2dp_prime_bytes > 0)
+                                ? s_bt_audio.a2dp_prime_bytes
+                                : BT_A2DP_PREBUFFER_BYTES;
+            if (xStreamBufferBytesAvailable(s_bt_audio.pcm_fifo) < (size_t)need)
+            {
+                /* 还不够：让协议栈回调继续往里灌，任务这边小睡等待 */
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue;
+            }
+            s_bt_audio.a2dp_primed = true;
+            BT_AUDIO_LOGI("A2DP prebuffer ready: %u bytes", (unsigned)need);
+        }
+
         /* 最后处理 A2DP PCM（20ms 超时，兼顾事件实时性） */
         size_t bytes = xStreamBufferReceive(s_bt_audio.pcm_fifo, pcm_buf,
                                             BT_PCM_CHUNK_SAMPLES * sizeof(int16_t),
                                             pdMS_TO_TICKS(20));
         if (bytes == 0)
         {
+            /* ===== 这里曾经是个"人造断音"的坑，务必别改回去 =====
+             *
+             * xStreamBufferReceive 返回 0 只代表"这 20ms 窗口里 FIFO 是空的"，
+             * 不代表手机断供：本任务只要 FIFO 里有数据就立刻取走，而手机
+             * SBC 的 RTP 包间隔本身就有 15~30ms，所以两次取之间 FIFO 空着
+             * 是**稳态**，不是异常。
+             *
+             * 之前把这里当成欠载、重新预灌 8KB(≈46ms)，等于每 20ms 就可能
+             * 人为停供 46ms。sync 层只有 200ms 延迟队列，被这样反复抽，
+             * 就会周期性露底 → sync_feed_silence() 播静音 → 听感"偶尔卡一下"。
+             *
+             * 现在只做统计。真欠载的判据是"连续多轮完全没数据"（见下），
+             * 且即便那样也**不重灌**——重灌只会让缺口变成有保证的 46ms，
+             * 缓冲该由 sync 的 D 来兜，不该在生产者这一侧再砍一刀。
+             */
+            s_bt_audio.a2dp_idle_cnt++;
+            if (s_bt_audio.stream_started && s_bt_audio.a2dp_idle_run < 0xFF)
+            {
+                s_bt_audio.a2dp_idle_run++;
+            }
+            /* 连续 4 轮（约 80ms）完全没有新数据，才记一次真欠载：
+             * 这个量级手机侧补不回来，下游一定露底，用来定位是"手机/共存
+             * 断供"还是"我们自己的时序问题" */
+            if (s_bt_audio.stream_started && s_bt_audio.a2dp_idle_run == 4)
+            {
+                s_bt_audio.a2dp_underrun_cnt++;
+                BT_PCM_WARN(esp_timer_get_time() / 1000,
+                            "A2DP starved ~80ms (cnt=%u, avail=%u)",
+                            (unsigned)s_bt_audio.a2dp_underrun_cnt,
+                            (unsigned)xStreamBufferBytesAvailable(s_bt_audio.pcm_fifo));
+            }
+            continue;
+        }
+
+        /* 拿到了数据：清掉连续读空计数 */
+        s_bt_audio.a2dp_idle_run = 0;
+
+        /* 半个采样说明 FIFO 里的字节流已经错位（正常由上面 bt_a2dp_data_cb
+         * 按整帧写入保证不会发生）。这种情况下继续往下播只会输出满量程
+         * 噪声且永不自愈，所以直接复位整条流、丢掉这一块，相当于一次
+         * 微小的断音，而不是一直"吱吱吱"。 */
+        if ((bytes % BT_A2DP_FRAME_BYTES) != 0)
+        {
+            s_bt_audio.resync_cnt++;
+            s_bt_audio.a2dp_primed      = false;          /* 复位后重新攒余量 */
+            s_bt_audio.a2dp_prime_bytes = BT_A2DP_REPRIME_BYTES;
+            xStreamBufferReset(s_bt_audio.pcm_fifo);
+            ESP_LOGE("BT_PCM", "A2DP FIFO misaligned (got=%u B), reset (cnt=%u)",
+                     (unsigned)bytes, (unsigned)s_bt_audio.resync_cnt);
             continue;
         }
 
@@ -1191,7 +1462,8 @@ static void bt_audio_task(void *arg)
         }
     }
 
-    /* 不可达 */
+    /* 不可达（若真退出，先退订看门狗，避免 TWDT 误报"任务不存在"） */
+    (void)esp_task_wdt_delete(NULL);
     vTaskDelete(NULL);
 }
 
@@ -1588,7 +1860,10 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
     }
 
     bt_audio_heap_dump("before task create");
-    BaseType_t rt = xTaskCreate(bt_audio_task, "bt_audio_task", BT_AUDIO_TASK_STACK, NULL, 5, &s_bt_audio.task);
+    BaseType_t rt = xTaskCreatePinnedToCore(bt_audio_task, "bt_audio_task",
+                                            BT_AUDIO_TASK_STACK, NULL,
+                                            BT_AUDIO_TASK_PRIO, &s_bt_audio.task,
+                                            BT_AUDIO_TASK_CORE);
     if (rt != pdPASS)
     {
         vStreamBufferDelete(s_bt_audio.pcm_fifo);
@@ -1848,6 +2123,31 @@ esp_err_t bt_audio_send_ctrl_cmd(bt_audio_handle_t audio, bt_audio_cmd_t cmd)
                                             ESP_AVRC_PT_CMD_STATE_RELEASED);
 }
 
+esp_err_t bt_audio_set_repeat_mode(bt_audio_handle_t audio, bool single)
+{
+    esp_err_t err;
+
+    (void)audio;
+
+    if (!s_bt_audio.avrc_connected)
+    {
+        return ESP_ERR_INVALID_STATE;   /* AVRCP 未连接，无法向手机下发 */
+    }
+
+    /* 值使用 AVRCP 规范字面量：0x00=OFF / 0x01=SINGLE / 0x02=ALL。
+     * 不可改用 esp_avrc_ps_rpt_value_ids_t：IDF 该枚举从 0x1 起算
+     * （OFF=1/SINGLE=2/GROUP=3），而 bluedroid 在 avrc_bld_ct.c 里把
+     * attr_val 原样打包、不做重映射，按枚举名发 SINGLE(2) 实际发出去的
+     * 是规范的 ALL TRACK REPEAT（全列表循环），现象就是"设了等于没设"。 */
+    err = esp_avrc_ct_send_set_player_value_cmd(bt_audio_avrc_alloc_tl(),
+                                                ESP_AVRC_PS_REPEAT_MODE,
+                                                single ? 0x01u : 0x00u);
+    BT_AUDIO_LOGI("AVRCP repeat -> %s: %s",
+                  single ? "SINGLE(0x01)" : "OFF(0x00)",
+                  esp_err_to_name(err));
+    return err;
+}
+
 esp_err_t bt_audio_get_play_state(bt_audio_handle_t audio, bt_audio_play_state_t *state)
 {
     (void)audio;
@@ -1964,4 +2264,53 @@ uint32_t bt_audio_get_pcm_dropped(bt_audio_handle_t audio, bt_audio_pcm_source_t
         return s_bt_audio.hfp_dn_dropped;
     }
     return 0;
+}
+
+uint32_t bt_audio_get_pcm_resync(bt_audio_handle_t audio)
+{
+    (void)audio;
+    return s_bt_audio.resync_cnt;
+}
+
+uint32_t bt_audio_get_a2dp_underrun(bt_audio_handle_t audio)
+{
+    (void)audio;
+    return s_bt_audio.a2dp_underrun_cnt;
+}
+
+uint32_t bt_audio_get_a2dp_idle(bt_audio_handle_t audio)
+{
+    (void)audio;
+    return s_bt_audio.a2dp_idle_cnt;
+}
+
+uint32_t bt_audio_get_and_reset_a2dp_gap(bt_audio_handle_t audio)
+{
+    uint32_t gap;
+    (void)audio;
+    gap = s_bt_audio.a2dp_gap_max_ms;
+    s_bt_audio.a2dp_gap_max_ms = 0;
+    return gap;
+}
+
+uint32_t bt_audio_get_a2dp_cb_count(bt_audio_handle_t audio)
+{
+    (void)audio;
+    return s_bt_audio.a2dp_cb_cnt;
+}
+
+uint32_t bt_audio_get_task_beat(bt_audio_handle_t audio)
+{
+    (void)audio;
+    return s_bt_audio.task_beat;
+}
+
+uint32_t bt_audio_get_a2dp_fifo_used(bt_audio_handle_t audio)
+{
+    (void)audio;
+    if (s_bt_audio.pcm_fifo == NULL)
+    {
+        return 0;
+    }
+    return (uint32_t)xStreamBufferBytesAvailable(s_bt_audio.pcm_fifo);
 }

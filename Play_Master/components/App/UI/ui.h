@@ -8,7 +8,7 @@
  *     LVGL 9.6，所有 lv_* 调用只发生在 UI_Task；
  *   - 显示/触摸经 middlewares/LCD_Touch 既有接口适配（ui_disp.c）；
  *   - 页面：状态栏 + 播放 / 灯控 / 设置 三个 Tab + 本地音乐列表二级页；
- *   - 已实现模块（MusicPlay / LightControl / CallPhone / wifi_manager）句柄注入后
+ *   - 已实现模块（MusicPlay / LightControl / wifi_manager）句柄注入后
  *     走真实接口；MusicPlay 已全量接线（源切换、播放/暂停/上下曲、播放模式、音量、
  *     进度轮询、本地列表，见 scr_player.c / scr_playlist.c，第十一阶段）；
  *   - 未注入或未实现的模块（sync_protocol / OTA / WiFi 配网）触摸后仅 ESP_LOGI 占位提示。
@@ -21,7 +21,6 @@
 
 #include "esp_err.h"
 #include "light_control.h"   /* light_control_handle_t / light_event_t */
-#include "call_phone.h"      /* call_phone_handle_t */
 #include "music_play.h"      /* music_play_handle_t / music_event_t（事件接线入口） */
 #include "wifi_manager.h"    /* wifi_manager_handle_t */
 #include "OTA_Update.h"      /* ota_update_event_info_t（OTA 事件接线入口） */
@@ -36,7 +35,6 @@ extern "C" {
 typedef struct {
     wifi_manager_handle_t  wifi;       /* 网络状态显示：NULL 时状态栏/设置页占位 */
     light_control_handle_t light;      /* 灯控页真实开关：NULL 时本地演示 + 日志 */
-    call_phone_handle_t    call_phone; /* 语音状态显示：NULL 时占位 */
     music_play_handle_t    music;      /* 播放页全量（控制/显示/列表）：NULL 时占位日志 */
     /* 后续阶段扩展：sync_protocol / OTA；UI 内部已按"NULL = 占位日志"设计 */
 } ui_cfg_t;

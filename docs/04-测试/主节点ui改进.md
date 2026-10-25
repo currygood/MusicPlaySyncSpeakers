@@ -1,8 +1,10 @@
-1. 设置页面的同步播放那里显示的：
+# 设置页面的同步播放那里显示的：
 
-   从节点.....
+从节点.....
 
-   改进为有多少个从节点接入
+改进为有多少个从节点接入
+
+已经实现
 
 ---
 
@@ -101,3 +103,8 @@ UI 切换已流畅（用户反馈"很舒服"）。播放中切页/滑动仍有�
 | `components/middlewares/sync_protocol/sync_protocol.c` | ingress 默认 24KB→64KB |
 | `components/middlewares/sync_protocol/sync_protocol.h` | ingress_bytes 注释更正 |
 | `components/middlewares/sd_card/sd_card.c` | SD 会话优先级 NORMAL→HIGH（两处） |
+
+# 设置页面翻页->为了更流程
+
+**进一步：把翻页的前一页和后一页放大，把前一页按键放到左边的中间。。。1/4页数和当前页面显示放在中间上方。**
+

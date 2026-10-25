@@ -101,6 +101,28 @@
 /** 自动源选择轮询间隔默认值（ms）：cfg->source_poll_ms 为 0 时使用（原 PlayMode poll_interval_ms） */
 #define MP_SOURCE_POLL_MS_DEFAULT  1000
 
+/* ---- 蓝牙源"单曲循环"守卫参数（手机不支持 AVRCP repeat 时由设备兜底） ----
+ *
+ * 原理：手机作为 A2DP source 时大多不实现 AVRCP TG 角色，
+ * bt_audio_set_repeat_mode() 发出的 repeat 设置很可能被忽略；此时手机仍按
+ * 自己的列表循环在曲末自动切下一首。守卫利用已有的 TRACK_CHANGE 通知，
+ * 在"曲尾窗口"内收到切歌就立刻发 PREV 把刚播完那首拉回来从头播。
+ * 新曲刚开始播放位置 < 3s，安卓把 PREV 解释为"回上一首"，正好等于原曲重播。
+ */
+/** 距曲尾多少 ms 内视为"即将自然播完"（只有窗口内切歌才判定为自动切歌） */
+#define MP_BT_GUARD_TAIL_MS        2000
+/** 本机发起切歌后忽略 TRACK_CHANGE 的时长窗（ms），避免把自己发的命令当成自动切歌 */
+#define MP_BT_GUARD_SELF_MS        3000
+/** 兜底纠正时功放静音保持上限（ms）：回执丢失时的保险，到点无条件恢复 */
+#define MP_BT_GUARD_MUTE_MAX_MS    2500
+/** 收到"已切回原曲"回执后继续静音的时长（ms）：盖住 A2DP FIFO 里残留的下一首尾音 */
+#define MP_BT_GUARD_RELEASE_MS     500
+/** 是否在兜底纠正时静音（0=不静音，直接接受下一首前奏泄漏约 0.3~1s） */
+#define MP_BT_GUARD_MUTE_EN        1
+/** 曲目位置/时长未知时的兜底：距上次 TRACK_CHANGE 超过该时长仍无新曲，
+ *  不做事（仅用于避免"位置不可用导致守卫永不武装"的日志噪音） */
+#define MP_BT_GUARD_POS_POLL_MS    500
+
 /* ==================== 内部定义 ================================= */
 
 /** 任务内部消息类型 */
@@ -145,6 +167,22 @@ struct music_play_s
     music_play_view_t view;      /* 权威视图 */
     music_play_view_t ui_view;   /* get_view() 返回快照 */
 
+    /* ---- 播放模式：按源各存一份（view.mode 是二者之一的活动副本） ----
+     * local_mode：本地列表播放，由本模块状态机执行，持久化到 node_role；
+     * bt_mode：手机侧播放器，只能 AVRCP 请求 + 守卫兜底纠正。手机的真实循环
+     * 状态既不可回读也不可枚举，故**只存会话内存**：持久化会让设备重启后
+     * 显示"单曲循环"而手机实际是列表循环，制造新的假状态。 */
+    music_play_mode_t local_mode;
+    music_play_mode_t bt_mode;
+
+    /* ---- 蓝牙单曲循环守卫（仅 Task 上下文访问） ---- */
+    bool     bt_guard_armed;          /* 当前处于"曲尾窗口"，下次切歌判定为自然播完 */
+    bool     bt_self_switch;          /* 本机刚发过 NEXT/PREV，忽略随之而来的 TRACK_CHANGE */
+    uint32_t bt_self_switch_ms;       /* 上次本机切歌时刻（用于超时清理） */
+    bool     bt_guard_muted;          /* 守卫静音中 */
+    uint32_t bt_guard_mute_ms;        /* 静音到期时刻 */
+    uint32_t bt_guard_pos_ms;         /* 上次查询播放位置的时刻（限频） */
+
     /* ---- 本地曲目列表 ---- */
     music_track_t *tracks;
     uint16_t       track_count;
@@ -179,6 +217,15 @@ static void Music_Apply_Volume(music_play_handle_t h, uint8_t volume,
                                bool sync_bt);
 static void Music_On_Bt_Volume(music_play_handle_t h, uint8_t volume);
 static void Music_Set_Mode_Msg(music_play_handle_t h, music_play_mode_t mode);
+
+/* 播放模式：按源分派 + 蓝牙守卫（方案 D） */
+static uint32_t Music_Now_Ms(void);
+static void Music_Mode_To_View(music_play_handle_t h);
+static void Music_Bt_Mode_Apply(music_play_handle_t h, music_play_mode_t mode);
+static void Music_Bt_Guard_Mute(music_play_handle_t h, bool on);
+static void Music_Bt_Guard_Note_Self(music_play_handle_t h);
+static void Music_Bt_Guard_On_Track_Change(music_play_handle_t h);
+static void Music_Bt_Guard_Tick(music_play_handle_t h);
 
 static void Music_Dec_Pcm_Cb(const int16_t *pcm, size_t samples,
                              uint32_t sample_rate, uint8_t channels,
@@ -347,6 +394,217 @@ static void Music_On_Bt_Volume(music_play_handle_t h, uint8_t volume)
     Music_Publish_View(h);
 }
 
+/* ---------------- 播放模式：按源分派 + 蓝牙单曲循环守卫 ---------------- */
+
+/** 单调毫秒（守卫时间窗用；差值比较一律走无符号回绕） */
+static uint32_t Music_Now_Ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/** 按当前源把 local_mode / bt_mode 落到 view.mode + view.mode_owner */
+static void Music_Mode_To_View(music_play_handle_t h)
+{
+    music_play_mode_t  mode;
+    music_mode_owner_t owner;
+
+    if (h->view.source == MUSIC_SOURCE_BT)
+    {
+        mode  = h->bt_mode;
+        owner = MUSIC_MODE_OWNER_BT;
+    }
+    else
+    {
+        mode  = h->local_mode;
+        owner = MUSIC_MODE_OWNER_LOCAL;
+    }
+
+    xSemaphoreTake(h->lock, portMAX_DELAY);
+    h->view.mode       = mode;
+    h->view.mode_owner = owner;
+    xSemaphoreGive(h->lock);
+}
+
+/**
+ * 蓝牙源模式生效：先请求手机（AVRCP repeat），再重置守卫状态
+ *
+ * 手机支持 AVRCP TG 且播放器认这个属性时，曲末由手机自己单曲循环，守卫不会
+ * 触发（曲末不再出现 TRACK_CHANGE）；不支持时守卫兜底。两条路互不冲突，
+ * 所以这里无条件都做。
+ */
+static void Music_Bt_Mode_Apply(music_play_handle_t h, music_play_mode_t mode)
+{
+    bool      single = (mode == MUSIC_PLAY_MODE_SINGLE_LOOP);
+    esp_err_t err;
+
+    h->bt_guard_armed = false;
+    h->bt_self_switch = false;
+
+    if (h->cfg.bt_audio == NULL)
+    {
+        return;
+    }
+
+    err = bt_audio_set_repeat_mode(h->cfg.bt_audio, single);
+    if (err == ESP_OK)
+    {
+        MUSIC_PLAY_LOGI( "bt mode -> %s, AVRCP repeat request sent",
+                 single ? "SINGLE_LOOP" : "SEQUENTIAL");
+    }
+    else
+    {
+        /* 常见原因：AVRCP 未连接（手机未连/不支持控制通道）。守卫仍在 */
+        MUSIC_PLAY_LOGW( "bt mode -> %s, AVRCP repeat request failed: %s"
+                 " (device-side guard still armed)",
+                 single ? "SINGLE_LOOP" : "SEQUENTIAL", esp_err_to_name(err));
+    }
+}
+
+/**
+ * 守卫静音：兜底纠正瞬间把输出压到 0，盖住手机已经推出的下一首前奏
+ *
+ * 只动功放和从节点广播，不碰 view.volume / NVS —— UI 音量条不动，
+ * 解除时按 view.volume 还原（期间用户调音量会以最新值为准）。
+ */
+static void Music_Bt_Guard_Mute(music_play_handle_t h, bool on)
+{
+#if MP_BT_GUARD_MUTE_EN
+    uint8_t vol = h->view.volume;
+
+    if (on)
+    {
+        Amplifier_Set_Volume(0);
+        if (h->sync_ok)
+        {
+            sync_protocol_master_broadcast_cmd(SYNC_CMD_VOLUME, 0);
+        }
+        h->bt_guard_muted   = true;
+        h->bt_guard_mute_ms = Music_Now_Ms() + MP_BT_GUARD_MUTE_MAX_MS;
+    }
+    else
+    {
+        Amplifier_Set_Volume(vol);
+        if (h->sync_ok)
+        {
+            sync_protocol_master_broadcast_cmd(SYNC_CMD_VOLUME, vol);
+        }
+        h->bt_guard_muted = false;
+    }
+#else
+    (void)h;
+    (void)on;
+#endif
+}
+
+/** 记录"本机发起切歌"：随后的 TRACK_CHANGE 是回执，不能当成自动切歌 */
+static void Music_Bt_Guard_Note_Self(music_play_handle_t h)
+{
+    h->bt_self_switch    = true;
+    h->bt_self_switch_ms = Music_Now_Ms();
+}
+
+/**
+ * TRACK_CHANGE 守卫：蓝牙单曲循环下，把"手机自动切的下一首"拽回原曲
+ *
+ * 判定链：
+ *   1. 本机刚发过 NEXT/PREV（bt_self_switch）→ 是回执，放行；
+ *   2. 当前不在曲尾窗口（bt_guard_armed）→ 视为用户手动切歌，放行；
+ *   3. 在曲尾窗口 → 手机刚自动切了下一首：发 PREV。新曲播放位置 < 3s，
+ *      安卓把 PREV 解释为"回上一首"，即原曲从头重播。
+ */
+static void Music_Bt_Guard_On_Track_Change(music_play_handle_t h)
+{
+    if (h->bt_self_switch)
+    {
+        h->bt_self_switch = false;   /* 本机命令的回执，放行 */
+        h->bt_guard_armed = false;
+        if (h->bt_guard_muted)
+        {
+            /* 兜底纠正的回执：原曲已切回来，再压住 FIFO 里残留的下一首尾音
+             * 就恢复，静音时长自适应，不吃原曲开头 */
+            h->bt_guard_mute_ms = Music_Now_Ms() + MP_BT_GUARD_RELEASE_MS;
+        }
+        return;
+    }
+    if (h->view.source != MUSIC_SOURCE_BT ||
+        h->bt_mode != MUSIC_PLAY_MODE_SINGLE_LOOP)
+    {
+        return;
+    }
+    if (!h->bt_guard_armed)
+    {
+        MUSIC_PLAY_LOGI( "bt single-loop guard: manual track change, pass");
+        return;
+    }
+
+    h->bt_guard_armed = false;
+    Music_Bt_Guard_Mute(h, true);
+    Music_Bt_Guard_Note_Self(h);     /* 回到原曲那次 TRACK_CHANGE 是本机的回执 */
+
+    if (bt_audio_send_ctrl_cmd(h->cfg.bt_audio, BT_AUDIO_CMD_PREV) != ESP_OK)
+    {
+        h->bt_self_switch = false;
+        Music_Bt_Guard_Mute(h, false);
+        MUSIC_PLAY_LOGW( "bt single-loop guard: PREV failed, give up this round");
+        return;
+    }
+    MUSIC_PLAY_LOGI( "bt single-loop guard: auto advance detected, PREV to replay");
+}
+
+/**
+ * 守卫周期（随 MusicPlay_Task 的 50ms 拍运行）
+ *
+ * 职责：维护"曲尾窗口"、到点解除静音、清理过期的本机切歌标记。
+ * 位置/时长拿不到时一律不武装——宁可这次不纠错，也不能把用户手动切歌拽回来。
+ */
+static void Music_Bt_Guard_Tick(music_play_handle_t h)
+{
+    uint32_t now = Music_Now_Ms();
+    uint32_t pos = 0;
+    uint32_t dur;
+
+    if (h->bt_guard_muted && (int32_t)(now - h->bt_guard_mute_ms) >= 0)
+    {
+        Music_Bt_Guard_Mute(h, false);
+    }
+    if (h->bt_self_switch &&
+        (uint32_t)(now - h->bt_self_switch_ms) > MP_BT_GUARD_SELF_MS)
+    {
+        h->bt_self_switch = false;   /* 手机没回 TRACK_CHANGE，超时清理 */
+    }
+
+    if (h->view.source != MUSIC_SOURCE_BT ||
+        h->bt_mode != MUSIC_PLAY_MODE_SINGLE_LOOP)
+    {
+        h->bt_guard_armed = false;
+        return;
+    }
+    if ((uint32_t)(now - h->bt_guard_pos_ms) < MP_BT_GUARD_POS_POLL_MS)
+    {
+        return;
+    }
+    h->bt_guard_pos_ms = now;
+
+    dur = h->bt_track.duration_ms;
+    if (dur == 0 || h->cfg.bt_audio == NULL ||
+        bt_audio_get_position_ms(h->cfg.bt_audio, &pos) != ESP_OK)
+    {
+        h->bt_guard_armed = false;
+        return;
+    }
+    h->bt_guard_armed = ((uint64_t)pos + MP_BT_GUARD_TAIL_MS >= dur);
+}
+
+/**
+ * 播放模式切换（UI 唯一入口）
+ *
+ * 本地源：写 local_mode 并持久化（node_role.play_mode），播完由
+ *         Music_On_Local_Eof 执行；
+ * 蓝牙源：写 bt_mode（会话级，不落 NVS），先向手机请求 AVRCP repeat，
+ *         再由守卫兜底纠正。
+ *
+ * 两份模式互不覆盖：蓝牙下切单曲循环，回到 SD 卡仍是原来的本地模式。
+ */
 static void Music_Set_Mode_Msg(music_play_handle_t h, music_play_mode_t mode)
 {
     node_role_cfg_t nr;
@@ -357,16 +615,22 @@ static void Music_Set_Mode_Msg(music_play_handle_t h, music_play_mode_t mode)
         return;
     }
 
-    xSemaphoreTake(h->lock, portMAX_DELAY);
-    h->view.mode = mode;
-    xSemaphoreGive(h->lock);
-
-    if (node_role_get(&nr) == ESP_OK)
+    if (h->view.source == MUSIC_SOURCE_BT)
     {
-        nr.play_mode = (uint8_t)mode;
-        node_role_set(&nr);
+        h->bt_mode = mode;
+        Music_Bt_Mode_Apply(h, mode);
+    }
+    else
+    {
+        h->local_mode = mode;
+        if (node_role_get(&nr) == ESP_OK)
+        {
+            nr.play_mode = (uint8_t)mode;
+            node_role_set(&nr);
+        }
     }
 
+    Music_Mode_To_View(h);
     Music_Emit(h, MUSIC_EVT_PLAY_MODE_CHANGED);
     Music_Publish_View(h);
 }
@@ -509,7 +773,8 @@ static void Music_On_Local_Eof(music_play_handle_t h)
 
     Music_Emit(h, MUSIC_EVT_EOF);
 
-    if (h->view.mode == MUSIC_PLAY_MODE_SINGLE_LOOP)
+    /* 本地源只认 local_mode：view.mode 是对外副本，蓝牙下的设置不参与 */
+    if (h->local_mode == MUSIC_PLAY_MODE_SINGLE_LOOP)
     {
         next = h->view.track_index;
     }
@@ -642,6 +907,8 @@ static void Music_Handle_Bt_Event(music_play_handle_t h,
         break;
 
     case BT_AUDIO_EVT_TRACK_CHANGED:
+        /* 单曲循环守卫：先判定这次切歌是"自动播完"还是"用户手动" */
+        Music_Bt_Guard_On_Track_Change(h);
         /* 新曲：清空蓝牙曲目展示，等元数据 */
         xSemaphoreTake(h->lock, portMAX_DELAY);
         h->bt_track_valid = false;
@@ -778,9 +1045,11 @@ static void Music_Cmd_BT(music_play_handle_t h, music_cmd_t cmd)
         break;
     case MUSIC_CMD_NEXT:
         bcmd = BT_AUDIO_CMD_NEXT;
+        Music_Bt_Guard_Note_Self(h);   /* 手动切歌：守卫不要把它当自动切歌拽回来 */
         break;
     case MUSIC_CMD_PREV:
         bcmd = BT_AUDIO_CMD_PREV;
+        Music_Bt_Guard_Note_Self(h);
         break;
     default:
         return;
@@ -905,8 +1174,18 @@ static void Music_Switch_Source_Msg(music_play_handle_t h, music_source_t src)
     h->view.state = (src == MUSIC_SOURCE_LOCAL) ? MUSIC_STATE_IDLE
                                                 : MUSIC_STATE_STOPPED;
     xSemaphoreGive(h->lock);
+
+    /* 源变了：view.mode 切到该源自己的那份设置（本地/蓝牙互不继承） */
+    Music_Mode_To_View(h);
+
     Music_Emit(h, MUSIC_EVT_SOURCE_CHANGED);
     Music_Publish_View(h);
+
+    /* 进入蓝牙源且为单曲循环：重连/切源后手机侧可能已复位，重新请求一次 */
+    if (src == MUSIC_SOURCE_BT && h->bt_mode == MUSIC_PLAY_MODE_SINGLE_LOOP)
+    {
+        Music_Bt_Mode_Apply(h, h->bt_mode);
+    }
 
     if (src == MUSIC_SOURCE_LOCAL && h->track_count > 0)
     {
@@ -1231,6 +1510,7 @@ static void Music_Play_Task(void *arg)
             Music_Handle_Msg(h, &msg);
         }
         Music_Poll_Source(h);   /* 自动源选择：每 tick 检查，内部按 source_poll_ms 限频 */
+        Music_Bt_Guard_Tick(h); /* 蓝牙单曲循环守卫：曲尾窗口 / 解除静音 / 标记超时 */
     }
     MUSIC_PLAY_LOGI( "task exit");
     xSemaphoreGive(h->destroy_done);
@@ -1244,7 +1524,7 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
     music_play_handle_t h;
     node_role_cfg_t nr;
     uint8_t volume = NODE_ROLE_DEFAULT_VOLUME;
-    uint8_t mode = MUSIC_PLAY_MODE_SEQUENTIAL;
+    music_play_mode_t local_mode = MUSIC_PLAY_MODE_SEQUENTIAL;
     uint32_t delay_ms = 0;
     sync_protocol_master_cfg_t scfg;
 
@@ -1289,7 +1569,7 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
         }
         if (nr.play_mode == 1)
         {
-            mode = MUSIC_PLAY_MODE_SINGLE_LOOP;
+            local_mode = MUSIC_PLAY_MODE_SINGLE_LOOP;
         }
         if (cfg->sync_delay_ms == 0 && nr.sync_delay_ms != 0)
         {
@@ -1302,7 +1582,11 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
     }
 
     h->view.volume      = volume;
-    h->view.mode        = mode;
+    /* 持久化只覆盖本地源模式；蓝牙源默认顺序（=跟随手机自己的循环设置） */
+    h->local_mode       = local_mode;
+    h->bt_mode          = MUSIC_PLAY_MODE_SEQUENTIAL;
+    h->view.mode        = local_mode;
+    h->view.mode_owner  = MUSIC_MODE_OWNER_LOCAL;
     h->view.source      = MUSIC_SOURCE_NONE;
     h->view.state       = MUSIC_STATE_IDLE;
     h->view.track_index = 0;
@@ -1335,7 +1619,8 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
         goto fail;
     }
 
-    MUSIC_PLAY_LOGI( "created (vol=%u mode=%u)", volume, mode);
+    MUSIC_PLAY_LOGI( "created (vol=%u local_mode=%u)",
+             volume, (unsigned)local_mode);
     return h;
 
 fail:

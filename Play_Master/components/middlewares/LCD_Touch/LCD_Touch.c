@@ -23,6 +23,23 @@ static TaskHandle_t TouchTaskHandle = NULL;
 static Touch_Point_t LastTouchData = {0};
 static uint32_t s_touchReadFailCount = 0;   /* 连续读失败计数，用于限流打印 */
 
+/* 触摸状态告警用独立 tag：LCD_TOUCH_DEBUG_LOGS 关掉时业务日志全部编译掉，
+ * 但"触摸彻底读不到（总线不通）"这件事必须能看到一次，否则用户只会觉得
+ * 屏幕点了没反应，却在串口里找不到任何线索。 */
+static const char *TOUCH_TAG = "Touch";
+
+/* 触摸轮询周期与失败退避 ---------------------------------------------------
+ * CTP_INT 未接线，只能轮询。正常情况下 20ms 读一次即可（FT6336G 的
+ * 触摸上报率就 60~100Hz）。但如果 I2C 总线不通（从设备不 ACK / SDA 被拉低），
+ * 每次读都会走一遍"超时 → 总线 FSM 复位 → 打日志"，如果不退避，就会变成
+ * 每秒十几次的持续骚扰：串口被刷屏、触摸任务一直卡在失败路径上。
+ * 所以失败时按指数退避到 1s，并且前若干次失败之后就不再复位总线
+ * （硬件真不通时复位没有意义）。一旦读成功立刻回到 20ms。 */
+#define LCD_TOUCH_POLL_MS             20
+#define LCD_TOUCH_BACKOFF_MAX_MS      1000
+#define LCD_TOUCH_RESET_BUS_MAX_FAILS 20   /* 超过此失败次数不再尝试复位总线 */
+#define LCD_TOUCH_WARN_FAILS          20   /* 连续失败到此数量时告警一次 */
+
 
 /**
  * @brief 设置D/CX引脚为命令模式（低电平）
@@ -110,20 +127,27 @@ static void LCD_SPI_Init(void)
  * 
  * 通过控制RST引脚产生低电平脉冲来复位ILI9341芯片：
  * 1. RST拉低 → 进入复位状态
- * 2. 延时10ms → 确保复位完成
+ * 2. 延时30ms → 确保复位完成（见下方说明）
  * 3. RST拉高 → 退出复位状态
  * 4. 延时120ms → 等待芯片内部稳定
  * 
  * 复位后所有寄存器恢复默认值，需要重新配置。
  * 
  * @note 此函数仅供LCD_TOUCH_Init()内部调用
- * @note 总耗时约130ms
+ * @note 总耗时约150ms
  * @see ILI9341数据手册8.2.2节（Software Reset时序要求）
+ *
+ * @warning 这个 RST 是 **LCD 与 CTP（FT6336G）共用** 的 GPIO25
+ *          （见《引脚分配表》），而 CTP 要求低电平 **>20ms** 才算有效复位。
+ *          原来只拉低 10ms：LCD 能复位，触摸芯片却可能进不了复位 →
+ *          上电后 I2C 上完全没有 ACK，总线一直被拉死（表现为
+ *          "i2c.master: bus is still busy / hardware timeout" 连续刷屏）。
+ *          所以这里统一给到 30ms，同时满足两颗芯片的数据手册要求。
  */
 static void LCD_Hardware_Reset(void)
 {
     gpio_set_level((gpio_num_t)LCD_TOUCH_SPI_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(30));
     gpio_set_level((gpio_num_t)LCD_TOUCH_SPI_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(120));
 }	
@@ -165,11 +189,12 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
     uint8_t touchBuf[6];
     uint16_t rawX = 0;
     uint16_t rawY = 0;
+    uint32_t poll_ms = LCD_TOUCH_POLL_MS;   /* 失败时按指数退避放大 */
 
     while(1)
     {
         /* CTP_INT 未接（轮询模式）：定时唤醒读点；以后若接上 INT，notify 仍可立即唤醒 */
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(poll_ms));
 
         if(Ft6336I2cHandle == NULL)
         {
@@ -183,21 +208,50 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
         esp_err_t ret = I2c_Read_Bytes(Ft6336I2cHandle, LCD_TOUCH_FT6336G_REG_TD_STATUS, touchBuf, sizeof(touchBuf));
         if(ret != ESP_OK)
         {
-            /* 读失败（如芯片忙/总线被拖住）：清除假的按下状态，限流打印 */
+            /* 读失败（总线被从设备拉死 / 芯片未就绪）：清除假的按下状态 */
             LastTouchData.touchCount = 0;
             s_touchReadFailCount++;
+
             if(s_touchReadFailCount == 1 || s_touchReadFailCount % 50 == 0)
             {
                 LCD_TOUCH_LOGW("[FT6336G] read fail #%lu: %s",
                          (unsigned long)s_touchReadFailCount, esp_err_to_name(ret));
             }
-            if(s_touchReadFailCount % 25 == 0)
+            /* 只告警一次：总线不通时这条信息量最大，且必须能在
+             * LCD_TOUCH_DEBUG_LOGS=0 的正式固件里看到 */
+            if(s_touchReadFailCount == LCD_TOUCH_WARN_FAILS)
+            {
+                ESP_LOGW(TOUCH_TAG, "I2C 连续读失败 %lu 次（%s），总线疑似不通："
+                                    "触摸暂不可用，轮询已退避到 %dms；"
+                                    "请检查 CTP_SDA/SCL(32/33) 上拉、接插件与 CTP_RST",
+                         (unsigned long)s_touchReadFailCount, esp_err_to_name(ret),
+                         (int)LCD_TOUCH_BACKOFF_MAX_MS);
+            }
+
+            /* 前若干次才尝试复位总线；硬件真不通时反复复位毫无意义 */
+            if(s_touchReadFailCount <= LCD_TOUCH_RESET_BUS_MAX_FAILS &&
+               (s_touchReadFailCount % 5) == 0)
             {
                 (void)I2c_Reset_Bus(I2c_Get_Global_Bus_Handle());
             }
+
+            /* 指数退避 20→40→…→1000ms：把总线不通时的骚扰降到 ~1 次/秒 */
+            if(poll_ms < LCD_TOUCH_BACKOFF_MAX_MS)
+            {
+                poll_ms <<= 1;
+                if(poll_ms > LCD_TOUCH_BACKOFF_MAX_MS)
+                {
+                    poll_ms = LCD_TOUCH_BACKOFF_MAX_MS;
+                }
+            }
             continue;
         }
+
+        /* 读成功：恢复正常轮询节奏（总线恢复后触摸立刻可用）。
+         * 这里不再打日志：触摸总线接触不良时会出现"失败 1 次→成功→失败"
+         * 的高频抖动，逐次打印会重新把串口刷满（正是上一版要消掉的噪音）。 */
         s_touchReadFailCount = 0;
+        poll_ms = LCD_TOUCH_POLL_MS;
 
         uint8_t touchCount = touchBuf[0] & 0x0F;
         uint8_t eventFlag = (touchBuf[1] >> 6) & 0x03;

@@ -58,6 +58,7 @@ esp_err_t I2c_Write_Bytes(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8
  * 这里提供无锁计数，由心跳任务按低频汇总打印。 */
 typedef struct {
     uint32_t fail_cnt;    /* 累计失败事务数 */
+    uint32_t ok_cnt;      /* 累计成功事务数：只有和 fail_cnt 一起看才知道**失败率** */
     uint32_t reset_cnt;   /* 累计总线软件复位次数 */
     int      last_err;    /* 最后一次错误码（esp_err_t） */
     int64_t  last_us;     /* 最后一次失败时刻（us），0 = 从未失败 */

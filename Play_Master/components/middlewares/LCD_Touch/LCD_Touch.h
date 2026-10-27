@@ -25,7 +25,19 @@
 #define LCD_TOUCH_SPI_RST 					25
 #define LCD_TOUCH_SPI_RS					22
 #define LCD_TOUCH_SPI_LED					23
-#define LCD_TOUCH_FT6336_INT				-1		/* 文档：CTP_INT 不接，触摸用轮询 */
+/* CTP_INT：已飞线接入 GPIO2（2026-10-27），触摸改为"中断 + 低频兜底轮询"。
+ * 实现要点（LCD_Touch.c 里已按此实现，改引脚号只需动这一行）：
+ *   - NEGEDGE 触发：FT6336 的 INT 是"读走 TD_STATUS 才释放"的电平信号，
+ *     若某次 I2C 读 NACK，这次边沿就永远丢了 —— 由兜底轮询补读，绝不能用
+ *     LOW_LEVEL（NACK 期间 INT 常低 → 持续中断风暴，每次进 ISR 都要抢
+ *     intr_alloc 全局锁，正是之前 Interrupt WDT 自锁的那把锁）；
+ *   - ISR 只做 vTaskNotifyGiveFromISR，真正的 I2C 读在触摸任务里做；
+ *   - isr service 用 ESP_INTR_FLAG_IRAM：SD 卡写会临时关闭 flash cache，
+ *     非 IRAM 中断此时触发会直接 panic（gpio_intr_service 本身已是 IRAM_ATTR）。
+ * 注意：ESP32 的 GPIO2 是 strapping 引脚 —— 下载模式启动时必须为高。
+ * CTP_INT 静止时为高（模块上拉），正常无影响；但若某天"无法进入下载模式"，
+ * 先拔掉这根飞线再试。 */
+#define LCD_TOUCH_FT6336_INT				2		/* CTP_INT 飞线 GPIO2，中断驱动 + 兜底轮询 */
 #define LCD_TOUCH_FT6336_RST				25		/* 与 LCD_RST 共用 GPIO25，触摸初始化时不可再复位 */
 #define LCD_TOUCH_SD_CS						15
 

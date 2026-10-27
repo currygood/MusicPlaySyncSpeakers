@@ -1,0 +1,39 @@
+diff --git a/components/esp_driver_i2c/i2c_master.c b/components/esp_driver_i2c/i2c_master.c
+index fd9380d41..f135c635b 100644
+--- a/components/esp_driver_i2c/i2c_master.c
++++ b/components/esp_driver_i2c/i2c_master.c
+@@ -109,6 +109,23 @@ static esp_err_t s_i2c_hw_fsm_reset(i2c_master_bus_handle_t i2c_master, bool cle
+ {
+     esp_err_t ret = ESP_OK;
+     i2c_hal_context_t *hal = &i2c_master->base->hal;
++    /* [LOCAL PATCH 2026-10-27] Fix Interrupt WDT deadlock during FSM reset.
++     * This function is called from s_i2c_send_commands (task context) after a
++     * hardware transaction timeout. It reconfigures GPIO pins, bit-bangs the
++     * bus (clear_bus) and resets the I2C peripheral registers -- all of which
++     * generates bus glitches while the I2C interrupt is STILL ENABLED (the
++     * intr mask is only cleared at the end, see i2c_ll_disable_intr_mask
++     * below / after the #else branch). If the I2C interrupt fires inside this
++     * window it enters shared_intr_isr(), which takes the global intr_alloc
++     * spinlock while the interrupted context already holds a critical
++     * section -> same-core self-deadlock -> Interrupt WDT panic (observed on
++     * ESP32 with intermittent CTP NACK, backtrace:
++     * gpio_set_level <- i2c_common_deinit_pins <- s_i2c_hw_fsm_reset).
++     * Workaround: disable the I2C interrupt for the whole reset window and
++     * re-enable it before returning. This matches the upstream fix. */
++    if (i2c_master->base->intr_handle != NULL) {
++        esp_intr_disable(i2c_master->base->intr_handle);
++    }
+ #if !I2C_LL_SUPPORT_HW_FSM_RST
+     i2c_hal_timing_config_t timing_config;
+     uint8_t filter_cfg;
+@@ -140,6 +157,10 @@ static esp_err_t s_i2c_hw_fsm_reset(i2c_master_bus_handle_t i2c_master, bool cle
+         ret = s_i2c_master_clear_bus(i2c_master->base);
+     }
+ #endif
++    /* [LOCAL PATCH 2026-10-27] re-enable I2C interrupt after reset window. */
++    if (i2c_master->base->intr_handle != NULL) {
++        esp_intr_enable(i2c_master->base->intr_handle);
++    }
+     return ret;
+ }
+ 

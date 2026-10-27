@@ -539,9 +539,13 @@ static void App_Bt_Diag_Print(void)
  * （经典蓝牙的连接由控制器维持，主机重启后手机端往往还会显示"已连接"几秒，
  *  很容易把重启误判成卡死）。
  *
- * i2c f=/r= 是总线失败次数与软件复位次数：驱动内部的 i2c 日志被整体静音了，
- * 这里是"总线被拉死"这类故障唯一的低成本观测点 —— 它会让任务长时间阻塞，
- * 是系统级卡死的头号嫌疑（见 I2c_Get_Err_Stats）。
+ * i2c f=/ok=/r= 是总线失败数、成功数、软件复位次数：驱动内部的 i2c 日志被
+ * 整体静音了，这里是"总线被拉死"这类故障唯一的低成本观测点 —— 它会让任务
+ * 长时间阻塞，是系统级卡死的头号嫌疑（见 I2c_Get_Err_Stats）。
+ * **ok 必须和 f 一起看**：只看 f=2195 无法判断故障性质 ——
+ *   失败率 ~6%（f 缓慢增长、ok 飞快增长）→ 信号完整性/时序问题；
+ *   失败率 ~90%（ok 几乎不涨）→ 从设备根本没在应答，查供电/接插件/复位。
+ * 两条路的处置方向相反，所以这个字段不能省。
  */
 #define APP_HB_PERIOD_MS   3000
 
@@ -589,7 +593,7 @@ static void App_Heartbeat_Task(void *arg)
                  "[hb] up=%us reset=%d heap=%u psram=%u | "
                  "a2dp_cb=%u beat=%u fifo=%uB | "
                  "sync st=%d dq=%u tx=%u drop=%u sil=%u | "
-                 "i2c f=%u r=%u last=%s",
+                 "i2c f=%u ok=%u r=%u last=%s",
                  (unsigned)(esp_timer_get_time() / 1000000),
                  (int)esp_reset_reason(),
                  (unsigned)esp_get_free_heap_size(),
@@ -603,6 +607,7 @@ static void App_Heartbeat_Task(void *arg)
                  (unsigned)st.dropped_pkts,
                  (unsigned)st.silence_frames,
                  (unsigned)i2c.fail_cnt,
+                 (unsigned)i2c.ok_cnt,
                  (unsigned)i2c.reset_cnt,
                  esp_err_to_name(i2c.last_err));
     }

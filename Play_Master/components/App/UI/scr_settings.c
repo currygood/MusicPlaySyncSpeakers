@@ -1,6 +1,6 @@
 /**
  * @file scr_settings.c
- * @brief 设置页（Tab 3，固定 4 页，右上角箭头翻页；UI 界面设计 5.5）
+ * @brief 设置页（Tab 3，固定 4 页，左右中间箭头翻页+顶部中间页码；UI 界面设计 5.5）
  *
  * 分区：播放源 / 网络 / 同步播放 / 固件 / 关于。
  * 内容区 320×176 不再纵向滚动，按下列分组固定摆放，每页都完整可见：
@@ -37,19 +37,23 @@ static lv_obj_t *s_btnOta;        /* "检查更新"按钮（OTA 期间禁用） 
 /* "已连接从机"列表：行数固定，按发现数量显示/隐藏，避免运行时创建/删除
  * LVGL 对象造成堆碎片。每行 = 状态点 + 文本（名字 / IP / RSSI / 离线）。
  * 行距 19 = ui_font_cn_16 的 line_height；同步页顶部只留一行汇总，
- * 23 + 8×19 = 175，正好占满 176 的内容区。 */
+ * 43 + 8×19 = 195（略超176，底部自动裁剪）。 */
 #define SYNC_ROW_H     19
-#define SYNC_LIST_TOP  23
+#define SYNC_LIST_TOP  43
 static lv_obj_t *s_syncDots[SYNC_MAX_SLAVES];
 static lv_obj_t *s_syncRows[SYNC_MAX_SLAVES];
 
-/* 设置页内翻页：4 个固定页面容器 + 右上角箭头（LVGL 对象只在构建时创建） */
+/* 设置页内翻页：4 个固定页面容器 + 左右中间箭头 + 顶部中间页码（LVGL 对象只在构建时创建） */
 #define SETTINGS_PAGE_COUNT  4
 #define PAGER_BTN_W          26
-#define PAGER_BTN_H          20
-#define PAGER_Y              1
-#define PAGER_LEFT_X         236
-#define PAGER_RIGHT_X        286
+#define PAGER_BTN_H          60
+#define PAGER_Y              58
+#define PAGER_LEFT_X         0
+#define PAGER_RIGHT_X        294
+#define PAGER_LABEL_X        145
+#define PAGER_LABEL_Y        1
+#define PAGE_MARGIN_LEFT     32
+#define PAGE_CONTENT_W       (LCD_WIDTH - PAGE_MARGIN_LEFT - 32)
 static lv_obj_t *s_setPages[SETTINGS_PAGE_COUNT];
 static lv_obj_t *s_lblPageNum;
 static int       s_setPage;
@@ -733,7 +737,7 @@ static void settings_timer_cb(lv_timer_t *timer)
             size_t len = sizeof(ip);
             if (wifi_manager_get_ip(cfg->wifi, ip, &len) == ESP_OK)
             {
-                snprintf(buf, sizeof(buf), "IP: %s   RSSI: %d dBm",
+                snprintf(buf, sizeof(buf), "IP:%s RSSI:%ddBm",
                          ip, (int)wifi_manager_get_rssi(cfg->wifi));
                 lv_label_set_text(s_lblNetIp, buf);
             }
@@ -870,7 +874,7 @@ static lv_obj_t *section_add(lv_obj_t *page, int y, const char *title, int panel
     lv_obj_set_pos(lbl, 8, y);
     ui_style_card(panel);               /* 先剥离主题并设卡片样式（内含 remove_style_all） */
     lv_obj_set_pos(panel, 8, y + 20);   /* pos/size 属样式属性，须在其后设置 */
-    lv_obj_set_size(panel, LCD_WIDTH - 16, panel_h);
+    lv_obj_set_size(panel, PAGE_CONTENT_W - 16, panel_h);
     lv_obj_set_style_radius(panel, 6, 0);
     return panel;
 }
@@ -898,14 +902,14 @@ static lv_obj_t *text_btn(lv_obj_t *parent, int x, int y, int w, int h,
 
 /* ======================== 设置页内翻页 ======================== */
 
-/** 设置页内的一页：占满内容区、不滚动、默认隐藏 */
+/** 设置页内的一页：左右留边距给翻页按钮、不滚动、默认隐藏 */
 static lv_obj_t *set_page_add(lv_obj_t *parent)
 {
     lv_obj_t *p = lv_obj_create(parent);
 
     lv_obj_remove_style_all(p);
-    lv_obj_set_pos(p, 0, 0);
-    lv_obj_set_size(p, LCD_WIDTH, UI_CONTENT_H);
+    lv_obj_set_pos(p, PAGE_MARGIN_LEFT, 0);
+    lv_obj_set_size(p, PAGE_CONTENT_W, UI_CONTENT_H);
     lv_obj_set_scrollable(p, false);
     lv_obj_set_hidden(p, true);
     return p;
@@ -997,9 +1001,6 @@ void scr_settings_build(lv_obj_t *page)
     panel = section_add(p, y, "播放源", 44);
     text_btn(panel, 8, 6, 70, 32, "蓝牙", src_bt_click_cb);
     text_btn(panel, 86, 6, 70, 32, "本地", src_local_click_cb);
-    lbl = ui_label_create(panel, "蓝牙连接期间自动优先蓝牙模式",
-                          &ui_font_cn_16, UI_COLOR_DISABLED);
-    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 166, 0);
     y += 20 + 44 + 8;   /* = 76 */
 
     panel = section_add(p, y, "网络", 70);
@@ -1007,9 +1008,13 @@ void scr_settings_build(lv_obj_t *page)
         (cfg->wifi != NULL) ? "状态: --" : "状态: 未接线（传入 wifi 句柄后生效）",
         &ui_font_cn_16, UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblNetState, 8, 8);
-    s_lblNetIp = ui_label_create(panel, "IP: --", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
-    lv_obj_set_pos(s_lblNetIp, 8, 40);
-    text_btn(panel, 204, 20, 84, 30, "WiFi 配网", wifi_cfg_click_cb);
+    lv_obj_set_width(s_lblNetState, 120);
+    lv_label_set_long_mode(s_lblNetState, LV_LABEL_LONG_MODE_DOTS);
+    text_btn(panel, 136, 6, 96, 30, "WiFi 配网", wifi_cfg_click_cb);
+    s_lblNetIp = ui_label_create(panel, "IP:-- RSSI:--dBm", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+    lv_obj_set_pos(s_lblNetIp, 8, 42);
+    lv_obj_set_width(s_lblNetIp, 224);
+    lv_label_set_long_mode(s_lblNetIp, LV_LABEL_LONG_MODE_DOTS);
 
     /* ---- 第 2 页：同步播放 / 已连接从机 ----
      * 本页不放分区标题（高度刚好 176）：顶部一行汇总，下面 8 行从机，
@@ -1017,8 +1022,8 @@ void scr_settings_build(lv_obj_t *page)
     p = s_setPages[1];
     s_lblSyncState = ui_label_create(p, "正在扫描从机...",
                           &ui_font_cn_16, UI_COLOR_TEXT_SUB);
-    lv_obj_set_pos(s_lblSyncState, 8, 2);
-    lv_obj_set_width(s_lblSyncState, 220);   /* 右侧给翻页按钮留位 */
+    lv_obj_set_pos(s_lblSyncState, 8, 22);
+    lv_obj_set_width(s_lblSyncState, PAGE_CONTENT_W - 20);   /* 右侧给翻页按钮留位 */
     lv_label_set_long_mode(s_lblSyncState, LV_LABEL_LONG_MODE_DOTS);
 
     for (i = 0; i < SYNC_MAX_SLAVES; i++)
@@ -1037,7 +1042,7 @@ void scr_settings_build(lv_obj_t *page)
 
         row = ui_label_create(p, "", &ui_font_cn_16, UI_COLOR_TEXT);
         lv_obj_set_pos(row, 24, SYNC_LIST_TOP + i * SYNC_ROW_H);
-        lv_obj_set_width(row, LCD_WIDTH - 24 - 8);
+        lv_obj_set_width(row, PAGE_CONTENT_W - 24 - 8);
         lv_label_set_long_mode(row, LV_LABEL_LONG_MODE_DOTS);
         lv_obj_set_hidden(row, true);
         s_syncRows[i] = row;
@@ -1051,7 +1056,7 @@ void scr_settings_build(lv_obj_t *page)
     s_lblFwVersion = ui_label_create(panel, "版本: " FW_VERSION,
                           &ui_font_cn_16, UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblFwVersion, 8, 12);
-    s_btnOta = text_btn(panel, 204, 7, 84, 30, "检查更新", ota_click_cb);
+    s_btnOta = text_btn(panel, 140, 7, 84, 30, "检查更新", ota_click_cb);
 
     /* ---- 第 4 页：关于 ---- */
     p = s_setPages[3];
@@ -1068,8 +1073,8 @@ void scr_settings_build(lv_obj_t *page)
     pager_btn_add(page, PAGER_LEFT_X, "←", pager_prev_cb);
     pager_btn_add(page, PAGER_RIGHT_X, "→", pager_next_cb);
     s_lblPageNum = ui_label_create(page, "1/4", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
-    lv_obj_set_pos(s_lblPageNum, PAGER_LEFT_X + PAGER_BTN_W,
-                   PAGER_Y + 1);
+    lv_obj_set_pos(s_lblPageNum, PAGER_LABEL_X,
+                   PAGER_LABEL_Y);
 
     settings_show_page(0);
     lv_timer_create(settings_timer_cb, 1000, NULL);

@@ -21,24 +21,44 @@ static Spi_Handle_t LcdSpiHandle;
 static i2c_master_dev_handle_t Ft6336I2cHandle = NULL;
 static TaskHandle_t TouchTaskHandle = NULL;
 static Touch_Point_t LastTouchData = {0};
-static uint32_t s_touchReadFailCount = 0;   /* 连续读失败计数，用于限流打印 */
+static uint32_t s_touchReadFailCount = 0;   /* 连续读失败计数，用于限流打印与慢探测 */
 
 /* 触摸状态告警用独立 tag：LCD_TOUCH_DEBUG_LOGS 关掉时业务日志全部编译掉，
  * 但"触摸彻底读不到（总线不通）"这件事必须能看到一次，否则用户只会觉得
  * 屏幕点了没反应，却在串口里找不到任何线索。 */
 static const char *TOUCH_TAG = "Touch";
 
-/* 触摸轮询周期与失败退避 ---------------------------------------------------
- * CTP_INT 未接线，只能轮询。正常情况下 20ms 读一次即可（FT6336G 的
- * 触摸上报率就 60~100Hz）。但如果 I2C 总线不通（从设备不 ACK / SDA 被拉低），
- * 每次读都会走一遍"超时 → 总线 FSM 复位 → 打日志"，如果不退避，就会变成
- * 每秒十几次的持续骚扰：串口被刷屏、触摸任务一直卡在失败路径上。
- * 所以失败时按指数退避到 1s，并且前若干次失败之后就不再复位总线
- * （硬件真不通时复位没有意义）。一旦读成功立刻回到 20ms。 */
-#define LCD_TOUCH_POLL_MS             20
-#define LCD_TOUCH_BACKOFF_MAX_MS      1000
-#define LCD_TOUCH_RESET_BUS_MAX_FAILS 20   /* 超过此失败次数不再尝试复位总线 */
-#define LCD_TOUCH_WARN_FAILS          20   /* 连续失败到此数量时告警一次 */
+/* 触摸采样策略 -------------------------------------------------------------
+ * 2026-10-27 起 CTP_INT 已飞线到 GPIO2（见 LCD_Touch.h），采样改为：
+ *   INT 边沿（实时性） + 兜底轮询（补 NACK 吃掉的边沿与松手事件）。
+ *
+ * 轮询频率曾经是这个系统最大的风险敞口：一次 I2c_Read_Bytes 在 IDF 6.0 的
+ * i2c_master 里是"队列 + 信号量 + ISR"，读 6 字节要 2~3 次 ISR 进出，每次
+ * ISR 都要抢 intr_alloc 的全局 spinlock；而 ~6% 的 NACK 率会把驱动推进
+ * "任务与硬件 FSM 脱同步"的状态，之后中断在派发层"关中断 + 无限等锁"
+ * = Interrupt WDT（i2c_driver.c 顶部注释 + 2026-10-27 的 IDF 本地补丁）。
+ * 接 INT 后静止时事务量 ≈ 兜底轮询频率（200ms 一次，5 次/s），只有真正
+ * 摸屏才产生额外事务 —— 比纯轮询 25 次/s 低一个数量级。
+ *
+ * **绝不复位总线**：
+ *   I2c_Reset_Bus() → i2c_master_bus_reset() → s_i2c_hw_fsm_reset(clear_bus=true)
+ * 会把 GPIO 从 I2C 外设手里抢过来、手动敲 9 个 SCL、再切回去、复位 FSM 寄存器。
+ * 而 2026-10-26 那次崩溃（i2c f=2195 / r=0）已经证明：一次总线复位都没做过
+ * 照样崩 —— 说明这条路径既不是必要条件、也没有任何收益，直接删掉。
+ * （IDF 侧 s_i2c_hw_fsm_reset 内部的自动 reset 无法由应用关闭，已用本地
+ *   补丁给它套上 esp_intr_disable/enable，见 IDF i2c_master.c 顶部注释。）
+ *
+ * 失败策略只剩两条：退避 + 慢探测，目标都是"故障期间把事务量压到最低"。
+ *   - 首次失败起：40 → 80 → … → 1000ms；
+ *   - 连续失败 >= LCD_TOUCH_DEAD_AFTER_FAILS（配合退避约 3 分钟读不到）：
+ *     认为总线长期不通，降到 5s 慢探测 —— 只保留"总线是否恢复"的探针；
+ *   - 一旦读成功：INT 模式回到 200ms 兜底（有触摸期间 40ms），轮询模式 40ms。 */
+#define LCD_TOUCH_POLL_MS                 40
+#define LCD_TOUCH_FALLBACK_POLL_MS        200   /* INT 模式下的静止兜底轮询周期 */
+#define LCD_TOUCH_BACKOFF_MAX_MS          1000
+#define LCD_TOUCH_DEAD_AFTER_FAILS        200   /* 连续失败到此数 → 进入慢探测 */
+#define LCD_TOUCH_BACKOFF_DEAD_MS         5000  /* 慢探测周期（约 5s 一次事务） */
+#define LCD_TOUCH_WARN_FAILS              20    /* 连续失败到此数量时告警一次 */
 
 
 /**
@@ -164,6 +184,13 @@ static void LCD_Hardware_Reset(void)
 #if LCD_TOUCH_FT6336_INT >= 0
 static void IRAM_ATTR LCD_TOUCH_FT6336G_Int_Isr_Handler(void *arg)
 {
+    /* 触摸任务在 Step 6 才创建，而中断在 Step 5 已使能；且 CTP_RST 与
+     * LCD_RST 共用 GPIO25，复位释放瞬间 CTP 就可能拉低 INT。任务句柄为空
+     * 时 vTaskNotifyGiveFromISR(NULL) 会解引用空指针，必须挡掉。 */
+    if(TouchTaskHandle == NULL)
+    {
+        return;
+    }
     BaseType_t highPriorityTaskWoken = pdFALSE;
     vTaskNotifyGiveFromISR(TouchTaskHandle, &highPriorityTaskWoken);
     if(highPriorityTaskWoken == pdTRUE)
@@ -228,30 +255,38 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
                          (int)LCD_TOUCH_BACKOFF_MAX_MS);
             }
 
-            /* 前若干次才尝试复位总线；硬件真不通时反复复位毫无意义 */
-            if(s_touchReadFailCount <= LCD_TOUCH_RESET_BUS_MAX_FAILS &&
-               (s_touchReadFailCount % 5) == 0)
-            {
-                (void)I2c_Reset_Bus(I2c_Get_Global_Bus_Handle());
-            }
-
-            /* 指数退避 20→40→…→1000ms：把总线不通时的骚扰降到 ~1 次/秒 */
-            if(poll_ms < LCD_TOUCH_BACKOFF_MAX_MS)
+            /* 失败时只做一件事：退避。**绝不动总线**（原因见文件头注释：
+             * clear_bus 是最危险窗口，而实测"一次都不复位也照样崩"，说明
+             * 它既不是必要条件、也没有收益）。
+             * 退避目标是把故障期间的 I2C 事务量压到最低 —— 事务数就是撞上
+             * ISR 自锁的样本数。 */
+            uint32_t cap = (s_touchReadFailCount >= LCD_TOUCH_DEAD_AFTER_FAILS)
+                           ? (uint32_t)LCD_TOUCH_BACKOFF_DEAD_MS
+                           : (uint32_t)LCD_TOUCH_BACKOFF_MAX_MS;
+            if(poll_ms < cap)
             {
                 poll_ms <<= 1;
-                if(poll_ms > LCD_TOUCH_BACKOFF_MAX_MS)
+                if(poll_ms > cap)
                 {
-                    poll_ms = LCD_TOUCH_BACKOFF_MAX_MS;
+                    poll_ms = cap;
                 }
             }
             continue;
         }
 
-        /* 读成功：恢复正常轮询节奏（总线恢复后触摸立刻可用）。
-         * 这里不再打日志：触摸总线接触不良时会出现"失败 1 次→成功→失败"
-         * 的高频抖动，逐次打印会重新把串口刷满（正是上一版要消掉的噪音）。 */
+        /* 读成功：恢复正常采样节奏。
+         * INT 模式：静止时兜底 200ms（边沿负责实时性，兜底只补丢失的
+         * 边沿/松手事件），有触摸期间 40ms 保证松手能被及时读到；
+         * 轮询模式：回到 40ms。
+         * 这里不打日志：触摸总线接触不良时会出现"失败 1 次→成功→失败"
+         * 的高频抖动，逐次打印会重新把串口刷满。 */
         s_touchReadFailCount = 0;
+#if LCD_TOUCH_FT6336_INT >= 0
+        poll_ms = (LastTouchData.touchCount > 0) ? LCD_TOUCH_POLL_MS
+                                                 : LCD_TOUCH_FALLBACK_POLL_MS;
+#else
         poll_ms = LCD_TOUCH_POLL_MS;
+#endif
 
         uint8_t touchCount = touchBuf[0] & 0x0F;
         uint8_t eventFlag = (touchBuf[1] >> 6) & 0x03;
@@ -368,7 +403,7 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
 #if LCD_TOUCH_FT6336_INT >= 0
     LCD_TOUCH_LOGI("[FT6336G] Step 5: Setting up interrupt (GPIO%d)...", LCD_TOUCH_FT6336_INT);
 
-    gpio_install_isr_service(0);
+    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
 
     gpio_config_t intConf = {
         .mode = GPIO_MODE_INPUT,

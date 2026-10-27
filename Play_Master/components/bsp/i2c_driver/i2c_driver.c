@@ -6,12 +6,40 @@
 #include <string.h>
 
 /* I2C 事务超时（毫秒）：
- * -1 会永久阻塞（卡死时饿死任务、触发看门狗）；原来用 100ms 也偏大——
- * 触摸屏读 6 字节在 100kHz 下只需 ~0.6ms，一旦从设备不响应，100ms 纯属白等，
- * 而且失败后驱动还会做一次总线 FSM 复位（每次复位会刷一对
- * "GPIO xx is not usable" 告警）。实测触摸总线不通时每秒能刷 20 行日志，
- * 把真正有用的音频日志全冲掉。10ms 足够覆盖最坏情况（含被抢占）。 */
-#define I2C_TRANS_TIMEOUT_MS  10
+ *
+ * 这个值的含义不是"总线要跑多久"，而是"任务最坏调度延迟"。
+ * 读 6 字节在 100kHz 下只要 ~0.6ms，但任务等的是"中断把我叫醒"，
+ * 所以真正的约束是被抢占多久。
+ *
+ * 曾经取 10ms（理由是"总线不通时别白等"），实测在播放音乐时会频繁误判：
+ * 触摸任务优先级只有 3，core0 上还有蓝牙/共存中断，PSRAM 带宽又被解码和
+ * LVGL 抢，实际调度延迟经常超过 10ms。一旦误判，命中的是 IDF 6.0 驱动的
+ * **软件超时**分支，而那条分支有副作用：
+ *     i2c_master.c:535   xSemaphoreTake(cmd_semphr, ticks) 失败
+ *     i2c_master.c:541   xSemaphoreGive(cmd_semphr)   ← 没拿到却又给一个
+ * 于是 cmd_semphr 上凭空多一个 token，后续事务 take 立刻返回，但硬件并没有
+ * 产生事件 → 任务与硬件 FSM 脱同步 → 接下来走
+ *     i2c_master.c:546   s_i2c_hw_fsm_reset(bus, clear_bus=true)
+ * 也就是"抢 GPIO + 手敲 9 个 SCL + 复位 FSM 寄存器"。这段时间 I2C 中断仍然
+ * 是活的，而该驱动的 ISR 会先关中断再无限等锁（xQueueGiveFromISR →
+ * vPortEnterCritical → spinlock_acquire(portMUX_NO_TIMEOUT)），抢不到就是
+ * Interrupt wdt timeout。所以"省那几十毫秒"换来的是把驱动推进失步状态，
+ * 代价远高于多等几十毫秒。
+ *
+ * 结论：超时宁可给大也不能误判。-1 会永久阻塞（真挂死时饿死任务、触发
+ * 任务看门狗），故取 150ms。失败后的重试节奏由调用方控制（LCD_Touch 的
+ * 指数退避），不靠这里卡时间。
+ *
+ * 2026-10-27：50 → 150ms。第 5 次 INT WDT（up=710s / i2c f=2195 r=0 /
+ * backtrace 停在 shared_intr_isr）证明了两件事：
+ *   1. `r=0` —— 那次崩溃**根本没走 clear_bus / FSM reset**，所以"复位总线"
+ *      不是必要条件，上一版把它当放大器是判断偏了；
+ *   2. 真正致命的是"软件超时"这条分支本身（凭空多 Give 一个 token → 任务与
+ *      硬件 FSM 脱同步 → 中断在派发层关中断无限等 intr_alloc 的全局 spinlock）。
+ * 既然致命的是"误判超时"，那就把误判概率压到最低。150ms 远大于可观测的最坏
+ * 调度延迟（LVGL 刷一整屏 ~123ms，而触摸任务本来就是低优先级、可以被拖）。
+ * 代价只是"总线真挂时多等一会儿"，而失败后触摸任务本身就退避到 1s/5s 才读一次。 */
+#define I2C_TRANS_TIMEOUT_MS  150
 
 /* 是否屏蔽 I2C 驱动的总线错误日志（i2c.master / i2c.common）。
  * 触摸屏未接线或总线被拉死时，这两类日志会以每秒十几条的速率刷屏，
@@ -26,9 +54,14 @@
 static i2c_master_bus_handle_t global_i2c_bus = NULL;
 
 /* 总线事务错误统计（写者：任意任务上下文；读者：心跳任务）
- * 32 位对齐的读写在本平台是原子的，因此不需要加锁。 */
+ * 32 位对齐的读写在本平台是原子的，因此不需要加锁。
+ *
+ * ok_cnt 是后补的：只有 fail 数没有成功数，是**算不出失败率**的 ——
+ * "f=2195 但 710s 里成功了 3 万次"(6%) 和 "f=2195 而几乎全失败"(90%)
+ * 是完全不同的两个故障，处置方向也相反（前者查信号完整性，后者查硬件连接）。 */
 static struct {
     volatile uint32_t fail_cnt;   /* 累计失败事务数 */
+    volatile uint32_t ok_cnt;     /* 累计成功事务数 */
     volatile uint32_t reset_cnt;  /* 累计总线软件复位次数 */
     volatile uint32_t last_err;   /* 最后一次错误码（esp_err_t 数值） */
     volatile int64_t  last_us;    /* 最后一次失败时刻（us，0 表示从未失败） */
@@ -38,6 +71,7 @@ static inline void I2c_Note_Result(esp_err_t ret)
 {
     if (ret == ESP_OK)
     {
+        s_i2cStat.ok_cnt++;
         return;
     }
     s_i2cStat.fail_cnt++;
@@ -128,6 +162,7 @@ esp_err_t I2c_Reset_Bus(i2c_master_bus_handle_t bus_handle) {
 void I2c_Get_Err_Stats(i2c_err_stats_t *out) {
     if (out == NULL) return;
     out->fail_cnt  = s_i2cStat.fail_cnt;
+    out->ok_cnt    = s_i2cStat.ok_cnt;
     out->reset_cnt = s_i2cStat.reset_cnt;
     out->last_err  = (int)s_i2cStat.last_err;
     out->last_us   = s_i2cStat.last_us;
@@ -143,6 +178,7 @@ esp_err_t I2c_Write_Bytes(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8
     memcpy(&temp_buf[1], buffer, count);
     
     esp_err_t ret = i2c_master_transmit(dev_handle, temp_buf, count + 1, I2C_TRANS_TIMEOUT_MS);
+    I2c_Note_Result(ret);   /* 和其它接口保持一致：这条路径原来漏统计 */
     free(temp_buf);
     return ret;
 }

@@ -748,3 +748,116 @@ Core 0 was running in ISR context: EPC1: uart_hal_write_txfifo   ← panic 打�
 - `LCD_Touch.c` 读失败退避计数成功后未归零，触摸会"越用越迟钝"；
 - 可选加固：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 0 → 4096，减少 PSRAM 自旋锁路径（第 3 次崩溃 `cpu.c:205`）被触发的机会。
 
+---
+
+## 触摸 I2C 间歇 NACK → Interrupt WDT 自锁（2026-10-26/27）—— 软件侧降暴露完成，硬件上拉待做
+
+**现象**：第 5 次 `Interrupt wdt timeout on CPU0`（up=710s），PC 停在
+`xPortEnterCriticalTimeout` ← `shared_intr_isr`(intr_alloc.c:467)，A2=A3=0xFFFFFFFF
+（`portMUX_NO_TIMEOUT`），CPU1 在 IDLE1；崩溃前心跳
+`i2c f=2195 r=0 last=ESP_ERR_INVALID_RESPONSE`。与第 3/4 次同源。
+
+**根因（本节新结论，修正上一节的两处判断）**：
+
+1. I2C 中断在 IDF 6.0 里就是**共享中断**（`i2c_private.h:59 I2C_INTR_ALLOC_FLAG`
+   含 `ESP_INTR_FLAG_SHARED`），而 `LCD_TOUCH_FT6336_INT=-1` 使 GPIO ISR 服务从未
+   安装 —— 所以 backtrace 里的 `shared_intr_isr` 必然是 I2C 派发层，与 GPIO 无关；
+2. `r=0`（一次总线复位都没做）仍然崩 ⇒ **"clear_bus/FSM reset 是放大器"的判断
+   不成立**，致命的是 i2c_master **软件超时分支本身**（`xSemaphoreTake` 失败后仍
+   `xSemaphoreGive`，凭空多 token → 任务与硬件 FSM 脱同步 → 派发层关中断无限等锁）；
+3. CPU1 在 IDLE1 ⇒ 不是普通跨核锁竞争，更像派发层自锁/重入或 owner 错位
+   （与第 4 次 A3=0xCDCD=本核 一致）。
+
+完整证据链、五次崩溃对照表与排查工具见
+`note/触摸I2C间歇NACK-InterruptWDT自锁-软件侧降暴露.md`。
+
+**修复（软件侧降暴露：把"事务数"当"样本数"管理）**
+
+| 位置 | 改动 |
+| --- | --- |
+| `i2c_driver.c` | 事务超时 50 → **150ms**（不命中"软件超时 → 凭空 Give"分支） |
+| `i2c_driver.c/.h` | 统计新增 `ok_cnt` 成功计数；`I2c_Write_Bytes` 补上漏掉的统计 |
+| `LCD_Touch.c` | **删除 `I2c_Reset_Bus` 调用**及整套复位预算逻辑（无收益且高危） |
+| `LCD_Touch.c` | 轮询 20 → **40ms**；连续失败 ≥200 次后进入 **5s 慢探测** |
+| `app_main.c` | 心跳改 `i2c f= ok= r= last=`（f/ok 必须一起看：失败率 ≈5% 查信号完整性，≈90% 查供电/接插件） |
+
+**验证（改动后首跑 46min）**
+
+- 失败速率 3.1 次/s → **0.94 次/s**（≈1/3）；单次事务失败率 ~6% → **4.9%**（没变，
+  电气问题）；46min 无重启（已超此前 710s/945s 崩溃点）；音频链路 resync=0、un 不涨。
+- 结论：概率性改善，不是根治 —— 单次失败仍可能引发自锁，预期 MTBF 抬到小时级，
+  以 24h 长跑为准。
+- 重要更正：`I2C_FREQ` 本来就是 100kHz（非 400kHz）。**100kHz + 仅内部 ~45kΩ 上拉
+  仍有 ~5% NACK** ⇒ 根因基本可判为上拉缺失/接插件/CTP_RST 余量，软件已到头。
+
+**遗留**
+
+- 硬件治本：SDA/SCL 外挂 4.7kΩ 上拉；
+- 备用方案：飞线接 CTP_INT（`LCD_Touch.h` 注释已写明启用要点：NEGEDGE + 500ms
+  兜底轮询，绝不用 LOW_LEVEL，否则 NACK 时中断风暴打在同一把全局锁上）；
+- 再崩时用与板上固件一致的 ELF 跑 `idf.py coredump-info`（本次 crash dump 已存
+  flash 0xfe0000），确认锁 owner，区分"自锁/重入"与"锁状态错位"。
+
+---
+
+## 第 6 次崩溃定位到 IDF 缺陷：本地补丁拆雷 + CTP_INT 中断化（2026-10-27）
+
+**现象**：24h 长跑在 `up=6196s`（103min）处第 6 次 `Interrupt wdt timeout on CPU0`。
+崩溃前心跳 `i2c f=7176 ok=109793 r=0 last=ESP_ERR_INVALID_RESPONSE`（失败速率
+1.16 次/s、失败率 6.15%，与首跑同量级）；发生在切歌瞬间（`sync stop → open track
+→ SYNC_START` 连发，SD 读取 + 解码器启动 + 组播重启，调度延迟最大）。
+
+**与前几次不同的关键点**：这次 backtrace 第一次给出完整 IDF 内部链 ——
+
+```text
+LCD_TOUCH_FT6336G_Process_Task（任务上下文读触摸）
+→ s_i2c_synchronous_transaction(1004) → s_i2c_send_commands(566)   status=TIMEOUT
+→ s_i2c_hw_fsm_reset(clear_bus=true)(124/132)
+→ i2c_common_deinit_pins(446) → i2c_bus_occupied(153) → gpio_set_level
+→ [level-1 中断插入] shared_intr_isr 抢锁死等（A15=0xCDCD = 本核 owner）
+→ tick 停 → IWDT
+```
+
+**根因（新结论）**：`esp_driver_i2c` 在硬件超时后于**任务上下文**做 FSM reset
+（抢 GPIO、手敲 9 个 SCL、复位外设寄存器），**全过程 I2C 中断未关**，reset 的
+总线毛刺立刻触发共享中断，派发层持 intr_alloc 全局 spinlock，与被打断的临界区
+**同核自锁**，而它第一步就屏蔽 level 1~3（喂 WDT 的 tick 也在其中）。
+⇒ **IDF 6.0.1 缺陷，应用层无法规避**（`r=0` 证明自有 `I2c_Reset_Bus` 从未被调用）。
+
+**修复 ①：IDF 6.0.1 本地补丁（治本·软件）**
+
+| 文件 | 改动 |
+| --- | --- |
+| `components/esp_driver_i2c/i2c_master.c` | `s_i2c_hw_fsm_reset` 开头 `esp_intr_disable(base->intr_handle)`、结尾 `esp_intr_enable`（含 NULL 守卫，覆盖两个 `I2C_LL_SUPPORT_HW_FSM_RST` 分支） |
+
+- 补丁文件：`note/patch/esp-idf-6.0.1-i2c-fsm-reset-intr.patch`
+- 说明文档：`note/ESP-IDF6.0.1本地补丁-i2c_fsm_reset关中断.md`
+- **⚠ 环境依赖**：补丁打在 `F:/esp_idf_6.0.1/.../esp-idf`，**所有用这份 IDF 的工程
+  都受影响**；升级/重装/换机器必须重打（先查新版是否已修），否则本崩溃会复发。
+- 改了 IDF 组件，建议 `idf.py fullclean` 后全量重编，避免旧对象残留。
+
+**修复 ②：CTP_INT 飞线接入 GPIO2（治标·降暴露）**
+
+| 文件 | 改动 |
+| --- | --- |
+| `LCD_Touch.h` | `LCD_TOUCH_FT6336_INT` -1 → **2** |
+| `LCD_Touch.c` | ISR 加 `TouchTaskHandle == NULL` 守卫（中断先使能、任务后创建） |
+| `LCD_Touch.c` | `gpio_install_isr_service(0)` → `ESP_INTR_FLAG_IRAM`（SD 写关 cache 时非 IRAM ISR 会 panic） |
+| `LCD_Touch.c` | 兜底轮询：静止 200ms / 有触摸 40ms（`LCD_TOUCH_FALLBACK_POLL_MS`） |
+
+触发方式保持 `GPIO_INTR_NEGEDGE`：FT6336 的 INT 是"读走 TD_STATUS 才释放"的
+电平信号，`LOW_LEVEL` 会在 NACK 时形成持续中断风暴，正好打在同一把全局锁上。
+
+**验证判据**
+
+- 启动日志出现 `Step 5: Setting up interrupt (GPIO2)... Interrupt configured (falling edge)`；
+- `[hb]` 里 `i2c ok=` 增速 ~26/s → **~5/s**，摸屏时才快速上涨；`f=` 增速同步下降；
+- 主要判据是**崩不崩**：NACK 仍在（电气问题未解），但硬件超时不再致命。
+  连续运行 1~2 天无 `Interrupt wdt` 即视为断根；
+- 触摸响应应从"≤40ms 轮询延迟"变为 ms 级。
+
+**遗留**
+
+- 电气治本未做：SDA/SCL 外挂 4.7kΩ 上拉（100kHz + 仅内部 45kΩ 仍 ~5% NACK）；
+- GPIO2 为 ESP32 strapping 引脚，下载模式需为高 —— **进不了下载先拔飞线**；
+- IDF 补丁属本地魔改，升级 IDF 时必须复核（见 note 文档第六节检查清单）。

@@ -126,6 +126,21 @@
  */
 #define BT_A2DP_FRAME_BYTES         4u
 
+/**
+ * 全链路固定采样率：amplifier 的 I2S、sync_protocol 的帧节拍（15ms = 661 样点）、
+ * 组播包、从节点全部写死 44.1kHz，所以 bt_audio 对外只输出 44.1k。
+ *
+ * 源采样率不是 44.1k 时（Windows 笔记本的 SBC 典型是 48k，Android 手机是 44.1k）
+ * 必须在这里先重采样，否则 48k 数据会以 8.16% 的速率盈余把 sync 的入口环灌满，
+ * 之后每个 15ms 槽都要丢掉一段样点 —— 听感就是持续的"吱吱 / 收音机"底噪。
+ */
+#define BT_A2DP_TARGET_RATE         44100u
+
+/** 重采样输出缓冲容量（int16 个数）。
+ *  单次从 FIFO 最多取 BT_PCM_CHUNK_SAMPLES 个 int16；按 16k 单声道升采样最坏
+ *  放大 2.76 倍 ⇒ 需要 ≥5650，这里留 3 倍余量。 */
+#define BT_RS_BUF_SAMPLES           (BT_PCM_CHUNK_SAMPLES * 3)
+
 /** 模块任务栈：大 PCM 缓冲已移出栈（A2DP/HFP 下行块放 PSRAM），
  *  栈上只剩事件结构体（约 536B）与回调调用帧（sync/Amplifier），4KB 足够 */
 #define BT_AUDIO_TASK_STACK         4096
@@ -197,6 +212,7 @@ struct bt_audio_s
 
     /* ---- 模块任务缓冲（大缓冲放 PSRAM，省内部 DRAM；栈上只留事件结构体） ---- */
     int16_t             *task_pcm_buf;     /* A2DP PCM 块缓冲（PSRAM，BT_PCM_CHUNK_SAMPLES×2B） */
+    int16_t             *task_rs_buf;      /* A2DP 重采样输出缓冲（PSRAM，BT_RS_BUF_SAMPLES） */
     int16_t             *task_hfp_dn_raw;  /* HFP 下行原始块缓冲（PSRAM，BT_HFP_DN_CHUNK_BYTES） */
     uint8_t             *evt_q_storage;    /* 事件队列数据缓冲（PSRAM，静态队列用） */
     StaticQueue_t        evt_q_ctrl;       /* 事件队列控制块（内部 RAM） */
@@ -217,6 +233,13 @@ struct bt_audio_s
     /* ---- A2DP 到达间隔统计（判断断供是"手机攒包"还是"射频丢包"） ---- */
     uint64_t             a2dp_last_cb_us;   /* 上一次数据回调的时刻 */
     uint32_t             a2dp_gap_max_ms;   /* 本统计窗口内相邻两次回调的最大间隔 */
+
+    /* ---- A2DP 采样率适配（源 48k/32k → 44.1k） ----
+     * 只由 bt_audio_task 读写（相位必须单写者，否则跨块插值会跳变）；
+     * 协议栈回调只把 a2dp_rs_rate 清 0 表示"下一条流要重新起相位"。 */
+    int64_t              a2dp_rs_pos;       /* 插值相位（32.32，单位=源采样帧，可跨块为负） */
+    int16_t              a2dp_rs_last[2];   /* 上一块最后一帧（跨块插值用，按声道） */
+    uint32_t             a2dp_rs_rate;      /* 相位当前对应的源采样率（0=需复位） */
 
     /* ---- 活体检测（卡死定位用，只增不减） ----
      * a2dp_cb_cnt 在协议栈数据回调里自增，task_beat 在模块任务循环里自增。
@@ -519,6 +542,7 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             s_bt_audio.a2dp_underrun_cnt      = 0;
             s_bt_audio.a2dp_idle_cnt          = 0;
             s_bt_audio.a2dp_idle_run          = 0;
+            s_bt_audio.a2dp_rs_rate           = 0;       /* 重采样相位作废（任务侧复位） */
             memcpy(s_bt_audio.remote_addr, param->conn_stat.remote_bda, 6);
             BT_AUDIO_UNLOCK();
 
@@ -535,6 +559,7 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             s_bt_audio.stream_started         = false;
             s_bt_audio.a2dp_primed            = false;
             s_bt_audio.a2dp_prime_bytes       = BT_A2DP_PREBUFFER_BYTES;
+            s_bt_audio.a2dp_rs_rate           = 0;       /* 重采样相位作废（任务侧复位） */
             memset(s_bt_audio.remote_addr, 0, sizeof(s_bt_audio.remote_addr));
             BT_AUDIO_UNLOCK();
 
@@ -568,6 +593,7 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             s_bt_audio.a2dp_idle_run     = 0;
             s_bt_audio.a2dp_last_cb_us   = 0;
             s_bt_audio.a2dp_gap_max_ms   = 0;
+            s_bt_audio.a2dp_rs_rate      = 0;   /* 开流：重采样相位从块首重新起 */
             BT_AUDIO_UNLOCK();
             BT_AUDIO_LOGI("A2DP stream started");
 
@@ -626,6 +652,7 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
          * 丢掉重来并重新预灌（正常只在切歌/换编码时发生一次） */
         s_bt_audio.a2dp_primed      = false;
         s_bt_audio.a2dp_prime_bytes = BT_A2DP_PREBUFFER_BYTES;
+        s_bt_audio.a2dp_rs_rate     = 0;   /* 采样率/声道变了：相位作废 */
         BT_AUDIO_UNLOCK();
 
         memset(&evt, 0, sizeof(evt));
@@ -1312,6 +1339,99 @@ static StreamBufferHandle_t bt_audio_sbuf_create(size_t bytes,
     return h;
 }
 
+/* ======================== A2DP 采样率适配 ==================================== */
+
+/**
+ * @brief 把 A2DP 解出的 PCM 从源采样率线性插值到 44.1kHz（16bit 交错，多声道）
+ *
+ * 相位（pos）与"上一块最后一帧"（last[]）都**跨块保留**：插值绝不能按块重置，
+ * 否则每个块边界都会产生一次相位跳变，听感是周期性的"咔"。
+ *
+ * 坐标系：pos 以"源采样帧"为单位、32.32 定点（32 位整数部分 + 32 位小数），
+ * 相对**当前块**起点，允许为负（负值表示待输出点落在上一块末尾与当前块首帧
+ * 之间，用 last[] 插值）。用 32.32 而不是 16.16：16.16 的步长量化误差会让
+ * 48k→44.1k 的实际比例偏 13ppm（10 秒多出 4 帧），长期会把入口环慢慢灌满；
+ * 32.32 的误差在 2^-32 量级，可以忽略。
+ *
+ * @param in         输入 PCM（源采样率，交错）
+ * @param in_frames  输入帧数（一帧 = 所有声道各一个样点）
+ * @param ch         声道数（1..2）
+ * @param out        输出缓冲（44.1kHz，交错）
+ * @param out_cap    输出缓冲能放的**帧**数
+ * @return 实际输出帧数（0 表示不需要重采样或参数非法）
+ */
+static size_t bt_a2dp_resample_to_44k(const int16_t *in, size_t in_frames,
+                                      uint8_t ch, int16_t *out, size_t out_cap)
+{
+    uint32_t src = s_bt_audio.a2dp.sample_rate;
+    uint64_t step;
+    int64_t  pos;
+    size_t   out_n = 0;
+    uint8_t  c;
+
+    if (in == NULL || out == NULL || in_frames == 0 || out_cap == 0)
+    {
+        return 0;
+    }
+    if (ch == 0 || ch > 2)
+    {
+        ch = 2;
+    }
+    if (src == 0 || src == BT_A2DP_TARGET_RATE)
+    {
+        return 0;   /* 原生 44.1k：不插值，省 CPU 也避免无谓损失 */
+    }
+
+    step = ((uint64_t)src << 32) / BT_A2DP_TARGET_RATE;   /* 每输出一帧前进多少源帧 */
+    if (step == 0)
+    {
+        return 0;
+    }
+    pos = s_bt_audio.a2dp_rs_pos;
+
+    while (out_n < out_cap)
+    {
+        int64_t  idx  = pos >> 32;
+        uint32_t frac = (uint32_t)(pos & 0xFFFFFFFF);
+
+        if (idx + 1 >= (int64_t)in_frames)
+        {
+            break;   /* 尾部这一帧要等下一块的首帧才能插值 */
+        }
+
+        for (c = 0; c < ch; c++)
+        {
+            int32_t s0 = (idx < 0) ? (int32_t)s_bt_audio.a2dp_rs_last[c]
+                                   : (int32_t)in[(size_t)idx * ch + c];
+            int32_t s1 = (int32_t)in[(size_t)(idx + 1) * ch + c];
+
+            /* 差值 × frac 最大 65535×2^32 ≈ 2.8e14，必须走 64 位 */
+            out[out_n * ch + c] =
+                (int16_t)(s0 + (int32_t)(((int64_t)(s1 - s0) * (int64_t)frac) >> 32));
+        }
+        out_n++;
+        pos += (int64_t)step;
+    }
+
+    /* 记下本块最后一帧，供下一块做跨块插值 */
+    for (c = 0; c < ch; c++)
+    {
+        s_bt_audio.a2dp_rs_last[c] = in[(in_frames - 1) * ch + c];
+    }
+
+    if (out_n >= out_cap)
+    {
+        /* 缓冲被填满（只可能是声道/块长配置异常）：丢掉本块剩余并复位相位，
+         * 绝不能带着半截相位进下一块 —— 那会被 last[] 拉成一段斜坡噪声 */
+        s_bt_audio.a2dp_rs_pos = 0;
+        return out_n;
+    }
+
+    pos -= ((int64_t)in_frames << 32);   /* 换算到下一块的相对坐标（通常为负） */
+    s_bt_audio.a2dp_rs_pos = pos;
+    return out_n;
+}
+
 /* ======================== 模块任务 =========================================== */
 
 /** bt_audio 任务：在安全上下文调用 on_event / on_pcm，参数在栈上取值 */
@@ -1453,11 +1573,54 @@ static void bt_audio_task(void *arg)
         bt_audio_pcm_cb_t cb = s_bt_audio.on_pcm;
         void *ctx = s_bt_audio.pcm_ctx;
         uint32_t rate = 0;
+        uint8_t  ch   = 2;
+
         BT_AUDIO_LOCK();
         rate = s_bt_audio.a2dp.sample_rate;
+        ch   = s_bt_audio.a2dp.channels;
         BT_AUDIO_UNLOCK();
-        if (cb != NULL)
+        if (ch == 0 || ch > 2)
         {
+            ch = 2;   /* AUDIO_CFG 之前按立体声（与 BT_A2DP_FRAME_BYTES 一致） */
+        }
+
+        if (cb == NULL)
+        {
+            continue;
+        }
+
+        /* 源不是 44.1k（Windows 笔记本常见 48k）时先重采样再交给下游。
+         * 下游全部写死 44.1k，直接灌 48k 会以 8.16% 的速率盈余把 sync 的
+         * 入口环灌满，之后每 15ms 丢一段样点 → 持续"吱吱"。 */
+        if (rate != 0 && rate != BT_A2DP_TARGET_RATE && s_bt_audio.task_rs_buf != NULL)
+        {
+            size_t frames;
+            size_t out_n;
+
+            if (rate != s_bt_audio.a2dp_rs_rate)
+            {
+                /* 新采样率/新流：相位与历史帧清零，避免沿用上一条流的位置 */
+                s_bt_audio.a2dp_rs_pos     = 0;
+                s_bt_audio.a2dp_rs_last[0] = 0;
+                s_bt_audio.a2dp_rs_last[1] = 0;
+                s_bt_audio.a2dp_rs_rate    = rate;
+                ESP_LOGI("BT_PCM", "A2DP resample %u -> %u Hz (%uch, linear)",
+                         (unsigned)rate, (unsigned)BT_A2DP_TARGET_RATE, (unsigned)ch);
+            }
+
+            frames = (size_t)(bytes / ((size_t)ch * sizeof(int16_t)));
+            out_n  = bt_a2dp_resample_to_44k(pcm_buf, frames, ch,
+                                             s_bt_audio.task_rs_buf,
+                                             BT_RS_BUF_SAMPLES / (size_t)ch);
+            if (out_n > 0)
+            {
+                cb(BT_AUDIO_PCM_SOURCE_A2DP, s_bt_audio.task_rs_buf,
+                   out_n * ch, BT_A2DP_TARGET_RATE, ctx);
+            }
+        }
+        else
+        {
+            s_bt_audio.a2dp_rs_rate = rate;   /* 44.1k 原生：相位无意义 */
             cb(BT_AUDIO_PCM_SOURCE_A2DP, pcm_buf, bytes / sizeof(int16_t), rate, ctx);
         }
     }
@@ -1579,6 +1742,11 @@ esp_err_t bt_audio_destroy(bt_audio_handle_t audio)
     {
         heap_caps_free(s_bt_audio.task_pcm_buf);
         s_bt_audio.task_pcm_buf = NULL;
+    }
+    if (s_bt_audio.task_rs_buf != NULL)
+    {
+        heap_caps_free(s_bt_audio.task_rs_buf);
+        s_bt_audio.task_rs_buf = NULL;
     }
     if (s_bt_audio.task_hfp_dn_raw != NULL)
     {
@@ -1841,6 +2009,22 @@ esp_err_t bt_audio_start(bt_audio_handle_t audio)
         {
             BT_AUDIO_LOGE("task pcm buf alloc failed");
             return ESP_ERR_NO_MEM;
+        }
+    }
+    /* 重采样输出缓冲：失败也不阻止启动（退化为"不做采样率适配"的原行为），
+     * 因为这是音质/兼容性问题，不该让整条蓝牙链路起不来 */
+    if (s_bt_audio.task_rs_buf == NULL)
+    {
+        s_bt_audio.task_rs_buf = (int16_t *)heap_caps_malloc(BT_RS_BUF_SAMPLES * sizeof(int16_t),
+                                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_bt_audio.task_rs_buf == NULL)
+        {
+            s_bt_audio.task_rs_buf = (int16_t *)heap_caps_malloc(BT_RS_BUF_SAMPLES * sizeof(int16_t),
+                                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (s_bt_audio.task_rs_buf == NULL)
+        {
+            BT_AUDIO_LOGW("resample buf alloc failed, non-44.1k source unsupported");
         }
     }
     if (s_bt_audio.task_hfp_dn_raw == NULL)

@@ -816,7 +816,11 @@ static void Music_BT_Enter_Playing(music_play_handle_t h)
         bt_audio_get_a2dp_info(h->cfg.bt_audio, &ai) == ESP_OK &&
         ai.sample_rate != 0)
     {
-        rate = ai.sample_rate;
+        /* 注意：采样率**不能**跟 ai.sample_rate 走。bt_audio 内部已经把非 44.1k
+         * 的源（Windows 笔记本典型 48k）重采样到 44.1k 再回调，这里上报的必须是
+         * **实际 PCM 的格式**；写成源采样率会让 sync 的帧节拍/日志按错误速率理解
+         * 同一段音频（帧长是 661 样点 = 15ms@44.1k，写死）。
+         * 声道数仍然跟链路走（单声道源解出来还是单声道，只是速率被统一了）。 */
         if (ai.channels == 1 || ai.channels == 2)
         {
             ch = ai.channels;

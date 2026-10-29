@@ -30,7 +30,9 @@ build/
 *.map
 flasher_args.json # Generated in build directory
 sdkconfig.old
-sdkconfig
+# sdkconfig 自 2026-10-27 起纳入版本管理：FreeType 等编译开关必须随仓库走，
+# 否则新克隆/换机时会静默退回默认配置（表现为代码引用了未启用的组件而编译失败）。
+# 只保留 sdkconfig.old 忽略。
 
 # ESP-IDF dependencies
 # For older versions or manual component management

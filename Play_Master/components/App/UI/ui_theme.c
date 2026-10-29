@@ -1,11 +1,12 @@
 /**
  * @file ui_theme.c
- * @brief UI 主题：深色配色（宏见 ui_priv.h）+ 字体实例 + 公共样式
+ * @brief UI 主题：深色配色（宏见 ui_priv.h）+ 公共样式
  *
- * 字体为 lv_font_conv 生成产物（编译进固件，不依赖 SD 卡）：
- *   - ui_font_cn_16 : 界面中文 16px（覆盖界面全部用字 + ASCII 数字/符号）
- *   - ui_icons_16   : 控件图标 16px（状态栏，Material Icons 子集）
- *   - ui_icons_24   : 控件图标 24px（Tab 栏/大按钮，Material Icons 子集）
+ * 字体说明：
+ *   - 中文全部走运行时 FreeType 字体（ui_font.h 的 ui_font_text()），固件里不再
+ *     编入任何中文字库；字体文件放 flash storage 分区，开机预载到 PSRAM。
+ *   - ui_icons_16 / ui_icons_24 仍是 lv_font_conv 产物（Material Icons PUA 码位），
+ *     它们是图标字体、不是中文，保留不动。
  */
 
 #include "ui_priv.h"

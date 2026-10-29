@@ -31,6 +31,24 @@
 #define SPI_MAX_DEVICES 8
 
 /**
+ * 单笔 SPI 事务字节上限（spi_bus_config_t.max_transfer_sz）。
+ *
+ * 必须 ≥ 调用方最大的一笔传输，否则 spi_master 会在 check_trans_valid() 直接
+ * 拒绝整笔事务（日志 `txdata transfer > host maximum`），表现为**屏幕画不出来但
+ * 不报错**。目前最大的一笔是 LCD 局部刷屏缓冲：
+ *     LCD_WIDTH(320) × UI_FLUSH_ROWS_MAX × 2B
+ * 这里按 **40 行**（320×40×2+8 = 25608B）预留，比当前 16 行（10240B）留了余量，
+ * 以后调 UI_FLUSH_ROWS_MAX 到 40 都不用再动这里。
+ *
+ * 代价：总线初始化时按 ceil(max/4092) 预分配 DMA 描述符，每个 12B，TX/RX 各一份
+ * → 40 行约 7×12×2 ≈ 168B 内部 RAM，可忽略。不要按整屏 240 行设置。
+ *
+ * UI 侧有 `_Static_assert` 校验 flush 缓冲不超过本值（见 ui_disp.c），
+ * 两边不同步会直接编译失败，而不是运行时黑屏。
+ */
+#define SPI_MAX_TRANSFER_SZ  (320 * 40 * 2 + 8)
+
+/**
  * SPI 总线配置（一条总线 = 三根信号线：SCK/MOSI/MISO）
  *
  * 注意：片选 CS 不属于总线，属于从设备，在 Spi_DeviceConfig_t 中指定。

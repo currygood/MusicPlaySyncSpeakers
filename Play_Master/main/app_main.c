@@ -92,8 +92,10 @@ static const char *TAG = "AppMain";
 #define APP_MUSIC_TASK_STACK    4096
 #define APP_LIGHT_TASK_STACK    3072
 /* UI 任务栈最大，必须趁内部堆还没被 WiFi/BT/其它任务切碎时最先创建；
- * 10240（原 UI_Task 13312）：省 3KB，实际水位由 ui_run() 打印 hwm_words 复核 */
-#define APP_UI_TASK_STACK       10240
+ * 大小由 UI 模块统一给出（components/App/UI/ui.h 的 UI_TASK_STACK_BYTES）：
+ * FreeType 接入后实测峰值 7.9KB，原 10240 只剩 2.3KB 余量，已提到 16384。
+ * 实际水位看 ui_run() 打印的 "stack after pages built" 与切页时的 hwm。 */
+#define APP_UI_TASK_STACK       UI_TASK_STACK_BYTES
 /* UI 优先级 12 → 10。
  *
  * 原值 12 比 SyncTx(11) 还高，而这两个任务都在 core 0：LVGL 用 10MHz SPI
@@ -590,7 +592,7 @@ static void App_Heartbeat_Task(void *arg)
         I2c_Get_Err_Stats(&i2c);
 
         ESP_LOGW(TAG,
-                 "[hb] up=%us reset=%d heap=%u psram=%u | "
+                 "[hb] up=%us reset=%d heap=%u psram=%u int=%u/%u | "
                  "a2dp_cb=%u beat=%u fifo=%uB | "
                  "sync st=%d dq=%u tx=%u drop=%u sil=%u | "
                  "i2c f=%u ok=%u r=%u last=%s",
@@ -598,6 +600,11 @@ static void App_Heartbeat_Task(void *arg)
                  (int)esp_reset_reason(),
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 /* 内部 DRAM 才是真正的瓶颈：esp_get_free_heap_size() 在
+                  * CONFIG_SPIRAM_USE_MALLOC + ALWAYSINTERNAL=0 下把 PSRAM 一起算进去了，
+                  * 那个 1.5MB 的数字会让人误以为内存很宽裕。int=空闲/最大连续块。 */
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                  (unsigned)bt_audio_get_a2dp_cb_count(s_app.bt),
                  (unsigned)bt_audio_get_task_beat(s_app.bt),
                  (unsigned)bt_audio_get_a2dp_fifo_used(s_app.bt),

@@ -69,9 +69,14 @@
 /** RX 任务单次 recvfrom 缓冲（灯控 JSON / 同步控制帧足够） */
 #define WIFI_MCAST_RX_BUF_BYTES                     (4096)
 
-/** wifi_mcast_rx_Task：优先级/栈/核（对应分层设计任务表） */
+/** wifi_mcast_rx_Task：优先级/栈/核（对应分层设计任务表）
+ *  栈 4096 → 6144：接入 FreeType 后实测出现过
+ *    "A stack overflow in task wifi_mcast_rx has been detected"
+ *  （UI 任务一次性同步渲染 744ms、同核 prio 更低的收包任务被饿死，
+ *    backlog 后 recvfrom 走错误/日志路径把 4KB 栈顶穿）。
+ *  UI 侧的同步刷新已去掉，这里再补 2KB 余量；内部 DRAM 当时余 ~69KB，可承受。 */
 #define WIFI_MCAST_RX_TASK_PRIO                     (6)
-#define WIFI_MCAST_RX_TASK_STACK                    (4096)
+#define WIFI_MCAST_RX_TASK_STACK                    (6144)
 #define WIFI_MCAST_RX_TASK_CORE                     (0)
 
 /** RX 任务轮询间隔（ms） */

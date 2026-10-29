@@ -5,10 +5,12 @@
  * 移植依据（全部来自本工程实测接口与 LVGL 9.6 公共头文件，无猜测 API）：
  *   - 刷屏：middlewares/LCD_Touch 的 LCD_Set_Window() + LCD_Write_PixelData()
  *     （LCD_Touch.c 注释已预留该 LVGL flush 用法，SPI 时钟 10MHz）；
- *   - 触摸：LCD_TOUCH_FT6336G_Get_Touch_Points() 返回内部任务 20ms 轮询缓存
- *     快照（INT 未接线，FT6336G I2C 地址 0x38）；
- *   - I2C 总线：bsp/i2c_driver 的 I2c_Init_Bus(I2C_PORT, I2C_SDA_GPIO=32,
- *     I2C_SCL_GPIO=33, I2C_FREQ=100kHz)，与 LCD_Touch.c 自检同一初始化方式；
+ *   - 触摸：LCD_TOUCH_FT6336G_Get_Touch_Points() 返回触摸任务缓存快照
+ *     （INT 已飞线到 GPIO2，FT6336G 地址 0x38）；
+ *   - 触摸总线：**GPIO 模拟 I2C**（SDA=32 / SCL=33，约 50kHz），实现在
+ *     LCD_Touch.c 内部。这里刻意不再创建 i2c_master 总线——该驱动在总线异常时
+ *     会让中断无限重入并触发 Interrupt WDT，而 level-1 ISR 占住 CPU 后任何
+ *     软件都救不回来（2026-10-29 实测）。
  *   - 图片文件：随固件烧录进 flash storage 分区（main/CMakeLists.txt 的
  *     spiffs_create_partition_image(storage ../storage FLASH_IN_PROJECT)），
  *     esp_vfs_spiffs_register() 挂载到 /storage 后经 lv_fs 自定义盘符 'F'
@@ -22,23 +24,115 @@
 
 #include "ui_priv.h"
 #include "esp_spiffs.h"
-#include "i2c_driver.h"
+#include "i2c_driver.h"   /* 仅为 I2C_SDA_GPIO/I2C_SCL_GPIO 引脚宏；
+                            * 触摸已改 GPIO 模拟 I2C，不再创建 i2c_master 总线 */
+#include "spi_driver.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include <stdio.h>
 #include <string.h>
 
-/* 渲染缓冲：必须落内部 DMA RAM（LCD 经 SPI DMA 直传），是内部 DRAM 的大头。
- * 40 行 × 320 像素 × 2B = 25.6KB → 16 行 = 10.2KB → 8 行 = 5.1KB；
- * 8 行 ≈ 1/30 屏，整屏多 flush 几次，对本 UI（静态页面为主）足够，
- * 而省下的 5KB 内部 RAM 正好用来放任务栈（见十三A内存记录）。
+/* 渲染缓冲：必须落内部 DMA RAM（LCD 经 SPI DMA 直传），是内部 DRAM的大头。
+ * 关键：PARTIAL 模式下缓冲高度 = **一次重绘窗口**，整屏 240 行要拆成
+ *   240 / rows 段，每一段都把整棵对象树重新遍历一遍、每个相交对象重新绘制一次。
+ *   8 行 → 30 段（25 对象 × 30 = 750 次绘制调用）；
+ *   16 行 → 15 段（375 次），绘制开销大致减半，且 flush 次数也减半。
+ * 16 行 = 320×16×2 = 10.2KB（8 行是 5.1KB，多占 5.1KB 内部 RAM）。
  * 分配失败时仍逐级减半到最小 1 行（极端内存下保证 UI 先活过来）。 */
-#define UI_FLUSH_ROWS_MAX   8
+#define UI_FLUSH_ROWS_MAX   16
 #define UI_FLUSH_ROWS_MIN   1
 
-static i2c_master_bus_handle_t s_i2cBus = NULL;
+/* 编译期交叉校验：一笔 SPI 事务不能超过总线配置的 max_transfer_sz，
+ * 否则 spi_master 会在 check_trans_valid() 直接拒收整笔事务
+ * （日志 `txdata transfer > host maximum`），而 LCD 侧只看到"什么都没写进去"——
+ * 屏幕停留在旧/花屏状态，且不影响程序继续跑，非常难发现。
+ * 这里做成编译期断言，以后调 UI_FLUSH_ROWS_MAX 忘了同步 SPI_MAX_TRANSFER_SZ 会直接编译失败。 */
+_Static_assert((size_t)(LCD_WIDTH * UI_FLUSH_ROWS_MAX * sizeof(uint16_t)) <= (size_t)SPI_MAX_TRANSFER_SZ,
+               "UI_FLUSH_ROWS_MAX 过大：单笔 SPI 事务超过 SPI_MAX_TRANSFER_SZ（见 bsp/spi_driver.h）");
+
+/* ======================== 渲染期诊断（只读，不参与显示逻辑） ========================
+ * 1) 刷屏耗时：把"切页 650ms"拆成「SPI 传输」和「LVGL 软件绘制」两半。
+ * 2) 真实栈深：uxTaskGetStackHighWaterMark() 靠扫栈底填充字节来判断，只要某个
+ *    深层函数有大块"只写一部分"的局部缓冲，扫描就会停在未写过的填充区，报出
+ *    偏大的余量（实测 20KB 栈报余 18100B，随后照样压穿栈底 canary）。
+ *    所以这里直接读当前 SP：以 ui_run() 入口的 SP 为基准，取渲染过程中的最小 SP
+ *    （= 最深），再加上入口处已用量，就是真实的峰值用量。 */
+
+static uint32_t  s_flushUs;
+static uint32_t  s_flushCnt;
+
+static int64_t   s_lastFlushEnd;   /* 上一次 flush 结束时刻；0 = 本轮统计还没开始 */
+static uint32_t  s_renderUs;       /* 相邻两次 flush 之间空档的累计 = LVGL 软件绘制 */
+static uint32_t  s_renderMax;      /* 单窗口最长绘制耗时 */
+static uint32_t  s_renderCnt;
+
+static uintptr_t s_spEntry;      /* ui_run() 入口的 SP（基准） */
+static uint32_t  s_usedEntry;    /* ui_run() 入口已用的栈字节 */
+static uintptr_t s_spMin;        /* 渲染过程中观察到的最小 SP（最深点） */
+static bool      s_spWarned;     /* 深度告警只打一次 */
+static bool      s_oversizeWarned; /* 单笔事务超限告警只打一次 */
+
+/** 在 ui_run() 最开头（还没建任何页面）调用，建立深度基准 */
+void ui_disp_sp_probe_init(void)
+{
+    s_spEntry      = (uintptr_t)esp_cpu_get_sp();
+    s_usedEntry    = (uint32_t)UI_TASK_STACK_BYTES -
+                     (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+    s_spMin        = s_spEntry;
+    s_spWarned     = false;
+    s_lastFlushEnd = 0;
+}
+
+/** 取走「自上次调用以来」的刷新统计 + 渲染期峰值栈用量，并复位 */
+void ui_disp_stat_take(ui_disp_stat_t *st)
+{
+    if (st != NULL) {
+        st->flush_us      = s_flushUs;
+        st->flush_calls   = s_flushCnt;
+        st->render_us     = s_renderUs;
+        st->render_count  = s_renderCnt;
+        st->render_max_us = s_renderMax;
+        st->depth_peak    = s_usedEntry + (uint32_t)(s_spEntry - s_spMin);
+    }
+    s_flushUs      = 0;
+    s_flushCnt     = 0;
+    s_renderUs     = 0;
+    s_renderMax    = 0;
+    s_renderCnt    = 0;
+    s_lastFlushEnd = 0;
+    s_spMin        = s_spEntry;
+    s_spWarned     = false;
+}
+
+/** 在渲染最深的地方（flush 回调）采样 SP；接近撞底时立刻打一条错误日志 */
+static void ui_sp_sample(const char *where)
+{
+    uintptr_t sp;
+    uint32_t  depth;
+
+    if (s_spEntry == 0) {
+        return;
+    }
+    sp = (uintptr_t)esp_cpu_get_sp();
+    if (sp < s_spMin) {
+        s_spMin = sp;
+    }
+    depth = s_usedEntry + (uint32_t)(s_spEntry - s_spMin);
+
+    /* 只剩 2KB 就报——这条日志会打在 abort 之前，是定位"渲染期栈爆"的关键证据 */
+    if (!s_spWarned && (depth + 2048U > (uint32_t)UI_TASK_STACK_BYTES)) {
+        s_spWarned = true;
+        ESP_LOGE("UI", "[SP] %s depth=%u B of %u B (headroom %u B) flush#%u",
+                 where, (unsigned)depth, (unsigned)UI_TASK_STACK_BYTES,
+                 (unsigned)((uint32_t)UI_TASK_STACK_BYTES - depth),
+                 (unsigned)s_flushCnt);
+    }
+}
+
 
 /* ======================== LVGL tick ======================== */
 
@@ -55,7 +149,47 @@ static void ui_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_m
 {
     int32_t w = area->x2 - area->x1 + 1;
     int32_t h = area->y2 - area->y1 + 1;
+    int64_t t0 = esp_timer_get_time();
     (void)disp;
+
+    /* flush 是从"屏幕重绘"这条链一路调进来的，处在渲染的比较深处，
+     * 在这里采 SP 最接近渲染期的真实最深点。 */
+    ui_sp_sample("flush");
+
+    /* 上一段 flush 结束 → 现在这段开始，这段时间就是"这一段的绘制耗时"。
+     * 首段没有前一次 flush（s_lastFlushEnd==0），不计入；
+     * 超过 2s 视为空闲间隔，不计入，避免污染平均/最大值。 */
+    if (s_lastFlushEnd != 0)
+    {
+        int64_t gap = t0 - s_lastFlushEnd;
+        if (gap > 0 && gap < 2000000)
+        {
+            s_renderUs += (uint32_t)gap;
+            if ((uint32_t)gap > s_renderMax)
+            {
+                s_renderMax = (uint32_t)gap;
+            }
+            s_renderCnt++;
+        }
+    }
+
+    /* 运行时兜底：虽然上面有 _Static_assert，但如果哪天 LVGL 传进来的区域
+     * 比缓冲还大（理论上不会），这里必须吭一声，否则就是"屏幕不动但程序正常"的悬案。 */
+    {
+        size_t bytes = (size_t)w * (size_t)h * sizeof(uint16_t);
+        if (bytes > (size_t)SPI_MAX_TRANSFER_SZ)
+        {
+            if (!s_oversizeWarned)
+            {
+                s_oversizeWarned = true;
+                ESP_LOGE("UI", "[FLUSH] area %dx%d = %u B > SPI_MAX_TRANSFER_SZ %u B，"
+                         "整笔事务会被 spi_master 拒收（屏幕不更新）",
+                         (int)w, (int)h, (unsigned)bytes, (unsigned)SPI_MAX_TRANSFER_SZ);
+            }
+            lv_display_flush_ready(disp);
+            return;
+        }
+    }
 
     /* ILI9341 SPI 按 big-endian 收 RGB565：发送前整块交换字节序 */
     lv_draw_rgb565_swap(px_map, (uint32_t)(w * h));
@@ -63,6 +197,10 @@ static void ui_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_m
     LCD_Set_Window((uint16_t)area->x1, (uint16_t)area->y1,
                    (uint16_t)area->x2, (uint16_t)area->y2);
     LCD_Write_PixelData((const uint16_t *)px_map, (uint32_t)(w * h));
+
+    s_flushUs += (uint32_t)(esp_timer_get_time() - t0);
+    s_flushCnt++;
+    s_lastFlushEnd = esp_timer_get_time();
 
     lv_display_flush_ready(disp);
 }
@@ -243,21 +381,14 @@ esp_err_t ui_hw_bringup(void)
     UI_LOGI( "stage: spiffs mount %u ms",
              (unsigned)((esp_timer_get_time() - t_stage) / 1000));
 
-    /* 2) I2C 总线（FT6336G 触摸用，引脚宏来自 bsp/i2c_driver.h） */
+    /* 2) LCD + 触摸初始化（内部注册 LCD SPI 设备、创建触摸轮询任务）。
+     *
+     * 注意：这里**不再创建 i2c_master 总线**。触摸已改为 GPIO 模拟 I2C
+     * （见 LCD_Touch.c 顶部说明）：IDF 的 i2c_master 在总线异常时会让中断
+     * 无限重入，触发 Interrupt WDT 直接重启（2026-10-29 实测 up=8453s 崩一次），
+     * 而那是 level-1 ISR，任何软件都救不回来。 */
     t_stage = esp_timer_get_time();
-    ret = I2c_Init_Bus(I2C_PORT, (gpio_num_t)I2C_SDA_GPIO,
-                       (gpio_num_t)I2C_SCL_GPIO, I2C_FREQ, &s_i2cBus);
-    if (ret != ESP_OK)
-    {
-        UI_LOGE( "I2c_Init_Bus failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    UI_LOGI( "stage: i2c bus %u ms",
-             (unsigned)((esp_timer_get_time() - t_stage) / 1000));
-
-    /* 3) LCD + 触摸初始化（内部注册 LCD SPI 设备、创建触摸轮询任务） */
-    t_stage = esp_timer_get_time();
-    LCD_TOUCH_Init(s_i2cBus);
+    LCD_TOUCH_Init();
     UI_LOGI( "LCD(%dx%d landscape) + FT6336G ready (%u ms)",
              LCD_WIDTH, LCD_HEIGHT,
              (unsigned)((esp_timer_get_time() - t_stage) / 1000));

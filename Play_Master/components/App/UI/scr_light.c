@@ -11,6 +11,7 @@
  */
 
 #include "ui_priv.h"
+#include "ui_font.h"
 #include "esp_log.h"
 #include <string.h>
 
@@ -183,10 +184,10 @@ static void card_build(light_card_t *card, lv_obj_t *page, int x)
         lv_obj_align(card->icon_lbl, LV_ALIGN_TOP_MID, 0, 20);
     }
 
-    card->name_lbl = ui_label_create(panel, card->name_cn, &ui_font_cn_16, UI_COLOR_TEXT);
+    card->name_lbl = ui_label_create(panel, card->name_cn, ui_font_text(UI_FONT_TEXT_16), UI_COLOR_TEXT);
     lv_obj_align(card->name_lbl, LV_ALIGN_TOP_MID, 0, 58);
 
-    card->state_lbl = ui_label_create(panel, "未知", &ui_font_cn_16, UI_COLOR_DISABLED);
+    card->state_lbl = ui_label_create(panel, "未知", ui_font_text(UI_FONT_TEXT_16), UI_COLOR_DISABLED);
     lv_obj_align(card->state_lbl, LV_ALIGN_TOP_MID, 0, 78);
 
     card->sw = lv_switch_create(panel);
@@ -207,7 +208,7 @@ void scr_light_build(lv_obj_t *page)
 
     note = ui_label_create(page,
                            (cfg->light != NULL) ? "状态以灯控回执为准" : "灯控未接线 · 本地演示模式",
-                           &ui_font_cn_16, UI_COLOR_DISABLED);
+                           ui_font_text(UI_FONT_TEXT_16), UI_COLOR_DISABLED);
     lv_obj_align(note, LV_ALIGN_BOTTOM_MID, 0, -4);
 
     /* 初始状态：有句柄用模块缓存恢复，否则未知 */

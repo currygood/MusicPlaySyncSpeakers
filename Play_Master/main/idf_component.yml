@@ -9,6 +9,11 @@
 dependencies:
   lvgl/lvgl: "^9"
   espressif/cjson: "^1.7.19"
+  # FreeType：LVGL 9 的运行时 TTF 渲染后端（ui_font.c 用 lv_freetype_font_create）。
+  # LVGL 自己的 idf_component.yml 里它是「带 $CONFIG{LV_USE_FREETYPE} 规则的条件私有依赖」，
+  # 在 sdkconfig 刚改成 y、组件管理器还没重算依赖时容易漏拉，这里显式声明为直接依赖。
+  # 注意：必须同时保证 sdkconfig 里 CONFIG_LV_USE_FREETYPE=y，否则只是拉了库不用。
+  espressif/freetype: "^2.14.3"
   # espressif/esp-sr: "^2.0.0"
   #   已移除（2026-10-25）：语音唤醒/麦克风整条链路下线，见 legacy_disabled/README.md。
   #   移除后 esp-sr 及其传递依赖（esp-dl / esp-dsp / dl_fft）不再参与构建与链接。

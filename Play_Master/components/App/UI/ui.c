@@ -9,6 +9,7 @@
  */
 
 #include "ui_priv.h"
+#include "ui_font.h"    /* 运行时中文字体（FreeType） */
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/task.h"
@@ -27,6 +28,10 @@ static QueueHandle_t s_otaEvtQueue = NULL;     /* OTA 事件队列（深度 4）
 
 /** 每个页面对应一个独立 screen（切页 = lv_screen_load 整屏重绘，无残影） */
 static lv_obj_t *s_pages[UI_PAGE_COUNT] = {0};
+
+/* PHASE2 临时打点：切页到首帧完成的耗时（Phase 6 长稳测试后删除） */
+static int64_t s_navT0 = -1;
+static int     s_navPage = -1;
 
 const ui_cfg_t *ui_cfg(void)
 {
@@ -48,6 +53,18 @@ static void ui_page_screen_build(ui_page_t page)
     lv_obj_set_style_bg_color(scr, UI_COLOR_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 运行期字体不能设成 LV_FONT_DEFAULT（那是编译期常量），
+     * 这里把 16px 中文字体挂在 screen 根对象上，靠继承覆盖那些"没有显式指定字体"
+     * 的控件：lv_textarea 的 placeholder、lv_keyboard 按键、主题生成的部件等。
+     * 显式传了字体的 label 不受影响。 */
+    {
+        lv_font_t *base = ui_font_get(UI_FONT_TEXT_16);
+        if (base != NULL)
+        {
+            lv_obj_set_style_text_font(scr, base, 0);
+        }
+    }
     s_pages[page] = scr;
 
     ui_statusbar_create(scr);
@@ -72,10 +89,19 @@ static void ui_page_screen_build(ui_page_t page)
 
 static void ui_pages_create(void)
 {
+    /* 每建完一页让出 2ms。整段建页累计约 2.5s（每页 ~600ms），本任务在 CPU0
+     * prio=10，期间 WiFi 的 ppTask（prio 23）随传随到，IDLE0 反而一直排不上队
+     * → 开机日志里出现 `task_wdt: IDLE0 did not reset`（该告警未开 PANIC，
+     *   只打印不重启，属噪声，但会掩盖以后的真问题）。
+     * 让出 2ms 而不是 1ms：1ms 时 WiFi 的 TX burst 往往还没结束，IDLE0 仍轮不到。 */
     ui_page_screen_build(UI_PAGE_PLAYER);
+    vTaskDelay(2);
     ui_page_screen_build(UI_PAGE_LIGHT);
+    vTaskDelay(2);
     ui_page_screen_build(UI_PAGE_SETTINGS);
+    vTaskDelay(2);
     ui_page_screen_build(UI_PAGE_PLAYLIST);
+    vTaskDelay(2);
 
     /* 首屏加载播放页（lv_screen_load 触发整屏重绘，再加显式失效双保险） */
     lv_screen_load(s_pages[UI_PAGE_PLAYER]);
@@ -92,10 +118,145 @@ void ui_nav_goto(ui_page_t page)
     if (lv_screen_active() != s_pages[page])
     {
         UI_LOGI( "nav -> page %d", (int)page);   /* 诊断：与画面切换时刻对照 */
+        ui_disp_stat_take(NULL);                   /* 清零统计，只统计本次切页 */
+        s_navT0   = esp_timer_get_time();        /* PHASE2 打点：切页起点 */
+        s_navPage = (int)page;
         lv_screen_load(s_pages[page]);     /* 内部已 invalidate 新屏 */
         lv_obj_invalidate(s_pages[page]);  /* 双保险：显式强制整屏重绘 */
     }
     ui_tabbar_set_active(page);
+}
+
+/* ======================== 栈余量诊断 ========================
+ * ESP-IDF 的 uxTaskGetStackHighWaterMark() 返回**字节**（不是标准 FreeRTOS 的字），
+ * 且是"自任务创建以来的最小剩余"——只会变小，所以在多个点采样就能拿到峰值。
+ * headroom = 返回值；used = 栈大小 - 返回值。 */
+static void ui_log_stack(const char *when)
+{
+    const unsigned stack  = (unsigned)UI_TASK_STACK_BYTES;
+    const unsigned free_b = (unsigned)uxTaskGetStackHighWaterMark(NULL);
+
+    if (free_b > stack) {
+        ESP_LOGW("UI", "stack[%s]: hwm=%u > stack=%u (unexpected unit), skip",
+                 when, free_b, stack);
+        return;
+    }
+    ESP_LOGI("UI", "stack[%s]: headroom=%u B, used<=%u B, stack=%u B",
+             when, free_b, stack - free_b, stack);
+}
+
+/* ======================== 栈深度变化监视（诊断） ========================
+ * uxTaskGetStackHighWaterMark 是"历史最小剩余"，只会单调变浅。
+ * 因此每次调用只要发现它变深了，就说明"刚跑完的那段代码"刷新了最深记录。
+ * 用它做二分：先判断 23.4KB 是不是整个 lv_timer_handler（渲染 + 全部 lv_timer），
+ * 是的话再往内逐个回调收窄。找到后就删掉这段。
+ * 代价：hwm 要扫一遍未使用的填充字节（32KB 量级），所以只在诊断期间开。 */
+static unsigned s_hwmUsed;
+
+static void ui_deep_watch(const char *tag)
+{
+    unsigned stack = (unsigned)UI_TASK_STACK_BYTES;
+    unsigned freeB = (unsigned)uxTaskGetStackHighWaterMark(NULL);
+    unsigned used;
+
+    if (freeB > stack) {
+        return;
+    }
+    used = stack - freeB;
+    if (used > s_hwmUsed + 256U) {          /* 只报明显变深，避免刷屏 */
+        ESP_LOGI("UI", "[DEEP] %-24s used=%u B (+%u)", tag, used, used - s_hwmUsed);
+        s_hwmUsed = used;
+    }
+}
+
+/* 一屏真正刷完的时刻（LVGL 9 的 LV_EVENT_REFR_READY）。
+ * 用它统计"切页→首帧完成"，比 lv_refr_now() 好：不阻塞、不饿死同核其它任务。 */
+static void ui_on_render_ready(lv_event_t *e)
+{
+    ui_disp_stat_t st;
+    int64_t total;
+    uint32_t drawAvg = 0;
+    (void)e;
+
+    if (s_navT0 < 0) {
+        return;
+    }
+    total = esp_timer_get_time() - s_navT0;
+    ui_disp_stat_take(&st);
+
+    /* 一屏 = st.flush_calls 个渲染窗口（PARTIAL 模式按缓冲高度切段）。
+     *   flush_us   : SPI 物理传输，不可压缩（15MHz 下全屏理论下限 ~82ms）
+     *   render_us  : 各窗口之间空档累计 = LVGL 软件绘制（可优化）
+     *   render_max : 单个窗口最慢值。若 max 远大于平均 → 某几段有重对象/文字；
+     *                若 max ≈ 平均 → 每段固定开销（对象树重遍历）占主导。
+     * 注意 depth_peak 的口径：flush 回调是在"这一块已画完"之后才被调用，
+     * 那时绘制栈早已展开，所以它只反映 flush 自身深度（~1.7KB），不是渲染峰值。 */
+    if (st.render_count > 0) {
+        drawAvg = st.render_us / st.render_count;
+    }
+    ESP_LOGI("UI", "[REFR] page %d total %lld us | flush %u us / %u win | "
+             "draw %u us / %u win (avg %u, max %u) | flush depth %u B",
+             s_navPage, (long long)total, (unsigned)st.flush_us, (unsigned)st.flush_calls,
+             (unsigned)st.render_us, (unsigned)st.render_count,
+             (unsigned)drawAvg, (unsigned)st.render_max_us, (unsigned)st.depth_peak);
+    ui_log_stack("after render");
+    s_navT0   = -1;
+    s_navPage = -1;
+}
+
+/* ======================== 降级：英文错误页 ========================
+ * 字体链路任一环失败（storage 挂载失败 / 文件缺失 / 尺寸或魔数不符 / PSRAM 不足 /
+ * FreeType 创建失败）时，**不构建 4 个中文页面**——固件里已经没有任何中文字库，
+ * 硬撑下去只会满屏 □，比明确报错更难查。
+ * 这里用 LVGL 内置 Montserrat 14（纯 ASCII）把失败原因摊在屏上，现场就能看出是哪一环。
+ * 注意：不引入任何中文字库来"兜底"，这是刻意设计。 */
+static void ui_show_fatal_error(const char *err_name, const char *detail)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *lbl;
+
+    if (scr == NULL) {
+        ESP_LOGE("UI", "no active screen; cannot render error page");
+        return;
+    }
+
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, UI_COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lbl = lv_label_create(scr);
+    lv_label_set_text(lbl, "UI FONT ERROR");
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, UI_COLOR_ERR, 0);
+    lv_obj_set_pos(lbl, 8, 10);
+
+    lbl = lv_label_create(scr);
+    lv_label_set_text(lbl, err_name != NULL ? err_name : "-");
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
+    lv_obj_set_pos(lbl, 8, 34);
+
+    lbl = lv_label_create(scr);
+    lv_label_set_text(lbl, detail != NULL ? detail : "-");
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, LCD_WIDTH - 16);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT_SUB, 0);
+    lv_obj_set_pos(lbl, 8, 56);
+
+    lbl = lv_label_create(scr);
+    lv_label_set_text(lbl, "Font: /storage/font/ui_font.ttf\n"
+                           "Fix the storage partition (reflash full image)\n"
+                           "or the font file, then reboot.");
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, LCD_WIDTH - 16);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, UI_COLOR_DISABLED, 0);
+    lv_obj_set_pos(lbl, 8, 120);
+
+    ESP_LOGE("UI", "fatal: %s | %s (English error page shown, UI pages NOT built)",
+             err_name != NULL ? err_name : "-", detail != NULL ? detail : "-");
 }
 
 /* ======================== UI_Task 与事件队列 ======================== */
@@ -110,12 +271,58 @@ void ui_run(void)
     music_event_t mevt;
 
     s_taskHandle = xTaskGetCurrentTaskHandle();
+
+    /* 栈深基准：必须在建字体/建页面之前采，此时栈基本是空的。
+     * 后面 flush 回调里读 SP 与这个基准相减，就是渲染期的真实峰值用量
+     * （uxTaskGetStackHighWaterMark 会因大块"只写一部分"的局部缓冲而虚报）。 */
+    ui_disp_sp_probe_init();
+
     UI_LOGI( "UI task running (core=%d, prio=%d, hwm_words=%u)",
              (int)xPortGetCoreID(), (int)uxTaskPriorityGet(NULL),
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
+    /* 中文字体：必须在 lv_init() 之后、页面构建之前。
+     * 内部会把 /storage/font/ui_font.ttf 整块预载进 PSRAM（避免 SPIFFS 随机读把
+     * UI_Task 卡到看门狗），再创建 12/16/20 三档字号的 FreeType 字体。
+     * 失败则切英文错误页并停在这里：固件里没有中文字库可用，继续建页面只会满屏 □。 */
+    {
+        int64_t t0 = esp_timer_get_time();
+        esp_err_t ferr = ui_font_init();
+        ESP_LOGI("UIFONT", "ui_font_init -> %s (%lld ms)%s%s",
+                 esp_err_to_name(ferr), (long long)((esp_timer_get_time() - t0) / 1000),
+                 (ferr == ESP_OK) ? "" : ", reason: ",
+                 (ferr == ESP_OK) ? "" : ui_font_last_error());
+
+        if (ferr != ESP_OK)
+        {
+            ui_show_fatal_error(esp_err_to_name(ferr), ui_font_last_error());
+            /* LVGL 还要继续跑，否则错误页根本刷新不出去；
+             * 事件队列不再排空——此时业务回调引用的控件都不存在。 */
+            for (;;)
+            {
+                lv_timer_handler();
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+    }
+
     ui_theme_init();
     ui_pages_create();
+
+    /* 注册"整屏刷完"回调，用于统计切页耗时 + 采样渲染期栈峰值（不阻塞） */
+    {
+        lv_display_t *disp = lv_display_get_default();
+        if (disp != NULL) {
+            lv_display_add_event_cb(disp, ui_on_render_ready, LV_EVENT_REFR_READY, NULL);
+        } else {
+            ESP_LOGW("UI", "no default display, render timing disabled");
+        }
+    }
+
+    /* 栈水位必须在 4 个页面全部构建完之后再采一次：
+     * 上面那次是"空任务"水位，测不到布局/LVGL 对象创建的真实峰值。 */
+    ui_log_stack("after pages built");
+    ui_deep_watch("base after pages");
 
     for (;;)
     {
@@ -144,7 +351,14 @@ void ui_run(void)
             }
         }
 
+        /* 注意：这里绝对不能调 lv_refr_now() 强制同步刷完。
+         * 一屏 320x240 走 10MHz SPI 光传输就 ~123ms，加上首次字形光栅化，
+         * 一次性渲染完实测 744ms —— 期间 UI_Task（core0/prio10）完全不让 CPU，
+         * 把同核的 wifi_mcast_rx（prio6）饿死，实测直接把它的栈顶穿
+         * （stack overflow in task wifi_mcast_rx）。
+         * 切页耗时改由 display 的 LV_EVENT_REFR_READY 回调统计，零阻塞。 */
         lv_timer_handler();
+        ui_deep_watch("lv_timer_handler");
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

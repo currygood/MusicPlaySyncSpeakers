@@ -24,8 +24,15 @@
 #include "fw_version.h"
 #include "OTA_Update.h"
 #include "esp_log.h"
+#include "ui_font.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+/* 取运行时中文字体，未就绪时回退烘焙字体（实现在文件后部"构建辅助"处）。
+ * 前向声明：WiFi 对话框等早期函数也要用到。 */
+static const lv_font_t *s_ui_font(ui_font_id_t id);
 
 /* 动态标签（句柄注入后由 1s 轮询刷新） */
 static lv_obj_t *s_lblNetState;
@@ -36,10 +43,12 @@ static lv_obj_t *s_btnOta;        /* "检查更新"按钮（OTA 期间禁用） 
 
 /* "已连接从机"列表：行数固定，按发现数量显示/隐藏，避免运行时创建/删除
  * LVGL 对象造成堆碎片。每行 = 状态点 + 文本（名字 / IP / RSSI / 离线）。
- * 行距 19 = ui_font_cn_16 的 line_height；同步页顶部只留一行汇总，
- * 43 + 8×19 = 195（略超176，底部自动裁剪）。 */
-#define SYNC_ROW_H     19
-#define SYNC_LIST_TOP  43
+ * Noto Sans SC 行高（hhea 1000/200/0，upem 1000）：12px=14、16px=19、20px=24，
+ * 与启动日志 UIFONT 的 line_height 一致。
+ * 行距取 15 = 14+1；顶部一行 16px 汇总 y=16..35，
+ * 37 + 8×15 = 157，176 的内容区还剩 19px 余量（旧字体 8×19 会裁掉最后一行）。 */
+#define SYNC_ROW_H     15
+#define SYNC_LIST_TOP  37
 static lv_obj_t *s_syncDots[SYNC_MAX_SLAVES];
 static lv_obj_t *s_syncRows[SYNC_MAX_SLAVES];
 
@@ -245,11 +254,11 @@ static void wifi_config_dlg_create(wifi_manager_handle_t wifi)
     s_wifiDlg = dlg;
 
     /* 2) 标题栏 */
-    lbl = ui_label_create(dlg, "WiFi 配网", &ui_font_cn_16, UI_COLOR_TEXT);
+    lbl = ui_label_create(dlg, "WiFi 配网", s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT);
     lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 10);
 
     /* 3) 状态提示（扫描中/出错/无结果） */
-    s_wifiStatusLbl = ui_label_create(dlg, "正在扫描...", &ui_font_cn_16, UI_COLOR_ACCENT);
+    s_wifiStatusLbl = ui_label_create(dlg, "正在扫描...", s_ui_font(UI_FONT_TEXT_16), UI_COLOR_ACCENT);
     lv_obj_align(s_wifiStatusLbl, LV_ALIGN_TOP_MID, 0, 40);
 
     /* 4) AP 列表容器（可滚动） */
@@ -276,7 +285,7 @@ static void wifi_config_dlg_create(wifi_manager_handle_t wifi)
     lv_obj_set_style_bg_color(btn, UI_COLOR_DISABLED, 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(btn, 6, 0);
-    lbl = ui_label_create(btn, "取消", &ui_font_cn_16, UI_COLOR_TEXT);
+    lbl = ui_label_create(btn, "取消", s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT);
     lv_obj_center(lbl);
     lv_obj_add_event_cb(btn, wifi_dlg_close_cb, LV_EVENT_CLICKED, NULL);
 
@@ -341,13 +350,13 @@ static void wifi_config_dlg_create(wifi_manager_handle_t wifi)
                 ssid_text = "(隐藏)";
             }
             ssid_lbl = ui_label_create(row, ssid_text,
-                                       &ui_font_cn_16, UI_COLOR_TEXT);
+                                       s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT);
         }
         lv_obj_align(ssid_lbl, LV_ALIGN_LEFT_MID, 28, 0);
 
         /* 认证方式 */
         snprintf(buf, sizeof(buf), "%s", auth_mode_name(ap->authmode));  /* ESP-IDF 6.0.1 字段名 */
-        auth_lbl = ui_label_create(row, buf, &ui_font_cn_16, UI_COLOR_DISABLED);  /* 使用已有字体 */
+        auth_lbl = ui_label_create(row, buf, s_ui_font(UI_FONT_TEXT_16), UI_COLOR_DISABLED);  /* 使用已有字体 */
         lv_obj_align(auth_lbl, LV_ALIGN_RIGHT_MID, -8, 0);
     }
 }
@@ -396,24 +405,27 @@ static void wifi_pwd_dlg_create(const char *ssid)
     s_wifiPwdDlg = dlg;
 
     /* 标题 */
-    lbl = ui_label_create(dlg, "输入密码", &ui_font_cn_16, UI_COLOR_TEXT);
+    lbl = ui_label_create(dlg, "输入密码", s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT);
     lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 5);
 
     /* SSID 提示 */
     {
         char ssid_buf[64];
         snprintf(ssid_buf, sizeof(ssid_buf), "网络: %s", ssid);
-        lbl = ui_label_create(dlg, ssid_buf, &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+        lbl = ui_label_create(dlg, ssid_buf, s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT_SUB);
     }
-    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 25);
+    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 28);
 
     /* 密码输入框 */
     ta = lv_textarea_create(dlg);
     lv_obj_set_size(ta, LCD_WIDTH - 40, 32);
-    lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, 48);
+    lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, 52);
     lv_textarea_set_one_line(ta, true);
     lv_textarea_set_password_mode(ta, true);
     lv_textarea_set_placeholder_text(ta, "请输入 WiFi 密码");
+    /* placeholder 属于独立 part，不会继承控件自身的 text_font，必须单独设中文 */
+    lv_obj_set_style_text_font(ta, s_ui_font(UI_FONT_TEXT_16), 0);
+    lv_obj_set_style_text_font(ta, s_ui_font(UI_FONT_TEXT_16), LV_PART_TEXTAREA_PLACEHOLDER);
     s_wifiPwdTa = ta;
 
     /* 屏幕键盘（填充剩余空间） */
@@ -422,6 +434,8 @@ static void wifi_pwd_dlg_create(const char *ssid)
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_keyboard_set_textarea(kb, ta);
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    /* 按键是 LV_PART_ITEMS，同样不继承父对象字体 */
+    lv_obj_set_style_text_font(kb, s_ui_font(UI_FONT_TEXT_16), LV_PART_ITEMS);
     lv_obj_add_event_cb(kb, wifi_pwd_kb_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, wifi_pwd_close_cb, LV_EVENT_CANCEL, NULL);
 }
@@ -848,7 +862,7 @@ static void settings_timer_cb(lv_timer_t *timer)
                     lv_obj_set_style_bg_color(dot, UI_COLOR_DISABLED, 0);
                 }
 
-                lv_obj_set_pos(dot, 8, SYNC_LIST_TOP + shown * SYNC_ROW_H + 5);
+                lv_obj_set_pos(dot, 8, SYNC_LIST_TOP + shown * SYNC_ROW_H + 3);
                 lv_obj_set_pos(row, 24, SYNC_LIST_TOP + shown * SYNC_ROW_H);
                 lv_obj_set_hidden(dot, false);
                 lv_obj_set_hidden(row, false);
@@ -865,15 +879,26 @@ static void settings_timer_cb(lv_timer_t *timer)
 
 /* ======================== 构建辅助 ======================== */
 
-/** 分区标题 + 卡片面板，返回面板（调用方往里放行控件） */
-static lv_obj_t *section_add(lv_obj_t *page, int y, const char *title, int panel_h)
+/** 取运行时中文字体——直接复用 ui_font_text()，避免"回退到烘焙字体"这套逻辑
+ *  在设置页里再实现一遍（Phase 5 移除烘焙字体时只改 ui_font.c 一处）。 */
+static const lv_font_t *s_ui_font(ui_font_id_t id)
 {
-    lv_obj_t *lbl = ui_label_create(page, title, &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+    return ui_font_text(id);
+}
+
+/* 分区标题占高：16px 中文字体 line_height=19，标题到卡片的间距取 20（19+1） */
+#define SEC_TITLE_H    20
+
+/** 分区标题 + 卡片面板，返回面板（调用方往里放行控件） */
+static lv_obj_t *section_add(lv_obj_t *page, int y, const char *title, int panel_h,
+                             const lv_font_t *font)
+{
+    lv_obj_t *lbl = ui_label_create(page, title, font, UI_COLOR_TEXT_SUB);
     lv_obj_t *panel = lv_obj_create(page);
 
     lv_obj_set_pos(lbl, 8, y);
     ui_style_card(panel);               /* 先剥离主题并设卡片样式（内含 remove_style_all） */
-    lv_obj_set_pos(panel, 8, y + 20);   /* pos/size 属样式属性，须在其后设置 */
+    lv_obj_set_pos(panel, 8, y + SEC_TITLE_H);   /* pos/size 属样式属性，须在其后设置 */
     lv_obj_set_size(panel, PAGE_CONTENT_W - 16, panel_h);
     lv_obj_set_style_radius(panel, 6, 0);
     return panel;
@@ -895,7 +920,7 @@ static lv_obj_t *text_btn(lv_obj_t *parent, int x, int y, int w, int h,
     lv_obj_set_style_bg_color(btn, UI_COLOR_PRIMARY, LV_STATE_PRESSED);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
 
-    lbl = ui_label_create(btn, text, &ui_font_cn_16, UI_COLOR_TEXT);
+    lbl = ui_label_create(btn, text, s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT);
     lv_obj_center(lbl);
     return btn;
 }
@@ -934,7 +959,7 @@ static lv_obj_t *pager_btn_add(lv_obj_t *parent, int x, const char *sym,
     lv_obj_set_ext_click_area(btn, 6);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
 
-    lbl = ui_label_create(btn, sym, &ui_font_cn_16, UI_COLOR_TEXT);
+    lbl = ui_label_create(btn, sym, s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT);
     lv_obj_center(lbl);
     return btn;
 }
@@ -998,20 +1023,20 @@ void scr_settings_build(lv_obj_t *page)
     p = s_setPages[0];
     y = 4;
 
-    panel = section_add(p, y, "播放源", 44);
+    panel = section_add(p, y, "播放源", 44, s_ui_font(UI_FONT_TEXT_16));
     text_btn(panel, 8, 6, 70, 32, "蓝牙", src_bt_click_cb);
     text_btn(panel, 86, 6, 70, 32, "本地", src_local_click_cb);
-    y += 20 + 44 + 8;   /* = 76 */
+    y += SEC_TITLE_H + 44 + 8;   /* = 72，y 起点 4 → 第二个分区 76 */
 
-    panel = section_add(p, y, "网络", 70);
+    panel = section_add(p, y, "网络", 70, s_ui_font(UI_FONT_TEXT_16));
     s_lblNetState = ui_label_create(panel,
         (cfg->wifi != NULL) ? "状态: --" : "状态: 未接线（传入 wifi 句柄后生效）",
-        &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+        s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblNetState, 8, 8);
     lv_obj_set_width(s_lblNetState, 120);
     lv_label_set_long_mode(s_lblNetState, LV_LABEL_LONG_MODE_DOTS);
     text_btn(panel, 136, 6, 96, 30, "WiFi 配网", wifi_cfg_click_cb);
-    s_lblNetIp = ui_label_create(panel, "IP:-- RSSI:--dBm", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+    s_lblNetIp = ui_label_create(panel, "IP:-- RSSI:--dBm", s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblNetIp, 8, 42);
     lv_obj_set_width(s_lblNetIp, 224);
     lv_label_set_long_mode(s_lblNetIp, LV_LABEL_LONG_MODE_DOTS);
@@ -1021,8 +1046,8 @@ void scr_settings_build(lv_obj_t *page)
      * 行距取字体行高 19，23 + 8×19 = 175。 */
     p = s_setPages[1];
     s_lblSyncState = ui_label_create(p, "正在扫描从机...",
-                          &ui_font_cn_16, UI_COLOR_TEXT_SUB);
-    lv_obj_set_pos(s_lblSyncState, 8, 22);
+                          s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT_SUB);
+    lv_obj_set_pos(s_lblSyncState, 8, 16);
     lv_obj_set_width(s_lblSyncState, PAGE_CONTENT_W - 20);   /* 右侧给翻页按钮留位 */
     lv_label_set_long_mode(s_lblSyncState, LV_LABEL_LONG_MODE_DOTS);
 
@@ -1040,7 +1065,7 @@ void scr_settings_build(lv_obj_t *page)
         lv_obj_set_hidden(dot, true);
         s_syncDots[i] = dot;
 
-        row = ui_label_create(p, "", &ui_font_cn_16, UI_COLOR_TEXT);
+        row = ui_label_create(p, "", s_ui_font(UI_FONT_TEXT_12), UI_COLOR_TEXT);
         lv_obj_set_pos(row, 24, SYNC_LIST_TOP + i * SYNC_ROW_H);
         lv_obj_set_width(row, PAGE_CONTENT_W - 24 - 8);
         lv_label_set_long_mode(row, LV_LABEL_LONG_MODE_DOTS);
@@ -1052,27 +1077,27 @@ void scr_settings_build(lv_obj_t *page)
     p = s_setPages[2];
     y = 4;
 
-    panel = section_add(p, y, "固件", 44);
+    panel = section_add(p, y, "固件", 44, s_ui_font(UI_FONT_TEXT_16));
     s_lblFwVersion = ui_label_create(panel, "版本: " FW_VERSION,
-                          &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+                          s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblFwVersion, 8, 12);
     s_btnOta = text_btn(panel, 140, 7, 84, 30, "检查更新", ota_click_cb);
 
     /* ---- 第 4 页：关于 ---- */
     p = s_setPages[3];
-    panel = section_add(p, 4, "关于", 56);
+    panel = section_add(p, 4, "关于", 56, s_ui_font(UI_FONT_TEXT_16));
     lbl = ui_label_create(panel,
         SD_Card_Is_Mounted() ? "SD 卡: 已挂载" : "SD 卡: 未挂载",
-        &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+        s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(lbl, 8, 6);
     lbl = ui_label_create(panel, "LVGL 9.6",
-                          &ui_font_cn_16, UI_COLOR_DISABLED);
+                          s_ui_font(UI_FONT_TEXT_16), UI_COLOR_DISABLED);
     lv_obj_set_pos(lbl, 8, 30);
 
     /* ---- 翻页控件：最后创建，保证绘制在 4 个页面容器之上 ---- */
     pager_btn_add(page, PAGER_LEFT_X, "←", pager_prev_cb);
     pager_btn_add(page, PAGER_RIGHT_X, "→", pager_next_cb);
-    s_lblPageNum = ui_label_create(page, "1/4", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+    s_lblPageNum = ui_label_create(page, "1/4", s_ui_font(UI_FONT_TEXT_16), UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblPageNum, PAGER_LABEL_X,
                    PAGER_LABEL_Y);
 

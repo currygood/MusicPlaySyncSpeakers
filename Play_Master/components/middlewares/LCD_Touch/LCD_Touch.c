@@ -7,18 +7,24 @@
 #include <string.h>
 #include <stdio.h>
 
-#if LCD_TOUCH_DEBUG_LOGS
 static const char *TAG = "LCD_Touch";
+
+/* 错误级日志永远保留：LCD 写屏失败属于"屏幕不动但程序照跑"的隐性故障，
+ * 一旦被调试开关一起编译掉，就只剩 spi_master 那一头报错，极难定位
+ * （实际踩过：SPI_MAX_TRANSFER_SZ 比刷屏缓冲小，整笔事务被拒收，
+ *   这里本来是唯一的告警点，却被 LCD_TOUCH_DEBUG_LOGS=false 吞掉了）。 */
 #define LCD_TOUCH_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
+
+#if LCD_TOUCH_DEBUG_LOGS
 #define LCD_TOUCH_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
 #define LCD_TOUCH_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
 #else
-#define LCD_TOUCH_LOGE(...) do { } while (0)
 #define LCD_TOUCH_LOGW(...) do { } while (0)
 #define LCD_TOUCH_LOGI(...) do { } while (0)
 #endif
 static Spi_Handle_t LcdSpiHandle;
-static i2c_master_dev_handle_t Ft6336I2cHandle = NULL;
+/* 触摸走 GPIO 模拟 I2C（见下方"软件 I2C"），不再持有 i2c_master 设备句柄；
+ * 就绪标志 s_ftI2cReady 定义在软件 I2C 一节里。 */
 static TaskHandle_t TouchTaskHandle = NULL;
 static Touch_Point_t LastTouchData = {0};
 static uint32_t s_touchReadFailCount = 0;   /* 连续读失败计数，用于限流打印与慢探测 */
@@ -30,28 +36,20 @@ static const char *TOUCH_TAG = "Touch";
 
 /* 触摸采样策略 -------------------------------------------------------------
  * 2026-10-27 起 CTP_INT 已飞线到 GPIO2（见 LCD_Touch.h），采样改为：
- *   INT 边沿（实时性） + 兜底轮询（补 NACK 吃掉的边沿与松手事件）。
+ *   INT 边沿（实时性） + 兜底轮询（补丢失的边沿与松手事件）。
  *
- * 轮询频率曾经是这个系统最大的风险敞口：一次 I2c_Read_Bytes 在 IDF 6.0 的
- * i2c_master 里是"队列 + 信号量 + ISR"，读 6 字节要 2~3 次 ISR 进出，每次
- * ISR 都要抢 intr_alloc 的全局 spinlock；而 ~6% 的 NACK 率会把驱动推进
- * "任务与硬件 FSM 脱同步"的状态，之后中断在派发层"关中断 + 无限等锁"
- * = Interrupt WDT（i2c_driver.c 顶部注释 + 2026-10-27 的 IDF 本地补丁）。
- * 接 INT 后静止时事务量 ≈ 兜底轮询频率（200ms 一次，5 次/s），只有真正
- * 摸屏才产生额外事务 —— 比纯轮询 25 次/s 低一个数量级。
+ * 2026-10-29 起 **不再使用 IDF 的 i2c_master**，改为纯 GPIO 模拟 I2C（见下方
+ * "软件 I2C" 一节）。原因是 i2c_master 的每次传输都是「命令队列 + 事件队列 +
+ * 信号量 + 异步 ISR」，实测 8.5% 的读失败率（i2c f=3128 / ok=33402）会把驱动
+ * 偶发推进"任务与硬件 FSM 脱同步"状态，之后中断在派发层被无限重入：
+ *   2026-10-29 up=8453s 崩在 `Interrupt wdt timeout on CPU0`，
+ *   PC 停在 i2c_master_isr_handler_default 的函数序言（= 反复重入，不是死循环）。
+ * level-1 ISR 占着 CPU 时任何任务都跑不了，所以退避、总线复位、看门狗回调
+ * 这些软件手段全都够不着它，只能 abort 重启 —— 那就只能从根上不用它。
  *
- * **绝不复位总线**：
- *   I2c_Reset_Bus() → i2c_master_bus_reset() → s_i2c_hw_fsm_reset(clear_bus=true)
- * 会把 GPIO 从 I2C 外设手里抢过来、手动敲 9 个 SCL、再切回去、复位 FSM 寄存器。
- * 而 2026-10-26 那次崩溃（i2c f=2195 / r=0）已经证明：一次总线复位都没做过
- * 照样崩 —— 说明这条路径既不是必要条件、也没有任何收益，直接删掉。
- * （IDF 侧 s_i2c_hw_fsm_reset 内部的自动 reset 无法由应用关闭，已用本地
- *   补丁给它套上 esp_intr_disable/enable，见 IDF i2c_master.c 顶部注释。）
- *
- * 失败策略只剩两条：退避 + 慢探测，目标都是"故障期间把事务量压到最低"。
+ * 失败策略仍然是"退避 + 慢探测"，目标是把故障期间的事务量压到最低：
  *   - 首次失败起：40 → 80 → … → 1000ms；
- *   - 连续失败 >= LCD_TOUCH_DEAD_AFTER_FAILS（配合退避约 3 分钟读不到）：
- *     认为总线长期不通，降到 5s 慢探测 —— 只保留"总线是否恢复"的探针；
+ *   - 连续失败 >= LCD_TOUCH_DEAD_AFTER_FAILS：认为总线长期不通，降到 5s 慢探测；
  *   - 一旦读成功：INT 模式回到 200ms 兜底（有触摸期间 40ms），轮询模式 40ms。 */
 #define LCD_TOUCH_POLL_MS                 40
 #define LCD_TOUCH_FALLBACK_POLL_MS        200   /* INT 模式下的静止兜底轮询周期 */
@@ -59,6 +57,241 @@ static const char *TOUCH_TAG = "Touch";
 #define LCD_TOUCH_DEAD_AFTER_FAILS        200   /* 连续失败到此数 → 进入慢探测 */
 #define LCD_TOUCH_BACKOFF_DEAD_MS         5000  /* 慢探测周期（约 5s 一次事务） */
 #define LCD_TOUCH_WARN_FAILS              20    /* 连续失败到此数量时告警一次 */
+
+/* ======================== 软件 I2C（GPIO 模拟） ========================
+ * 设计取舍：
+ *   1. 没有外设、没有中断、没有队列 —— 最坏情况只是一次读多花几毫秒然后
+ *      超时返回，**不可能把 CPU 卡死**，也就不会再有 Interrupt WDT。
+ *   2. 因为引脚完全归我们管，总线恢复（9 个 SCL 时钟踢醒拉死 SDA 的从设备）
+ *      变成安全操作。以前 i2c_master_bus_reset() 要从外设手里抢引脚，属于
+ *      危险窗口，那条路径已经在 2026-10-26 被证明"不做也照样崩"，已删除。
+ *   3. 速率取 50kHz（半周期 10µs）。板子只开了内部上拉（约 45kΩ），上升沿
+ *      需要几 µs —— 100kHz + 弱上拉本来就不合规，这里主动降速换稳定。
+ *      一次 6 字节读 ≈ 7 字节 × 9 bit × 20µs ≈ 1.3ms，触摸任务 prio=3、
+ *      40ms 轮询下约占 3% CPU（且随时可被高优先级任务抢占），可以接受。
+ *   4. 引脚号沿用 bsp/i2c_driver.h 的 I2C_SDA_GPIO / I2C_SCL_GPIO（32/33），
+ *      避免两处定义漂移。 */
+#define FT_I2C_SDA_GPIO            ((gpio_num_t)I2C_SDA_GPIO)   /* 32 */
+#define FT_I2C_SCL_GPIO            ((gpio_num_t)I2C_SCL_GPIO)   /* 33 */
+#define FT_I2C_HALF_US             10      /* 半周期 µs → ≈50kHz */
+#define FT_I2C_RECOVER_SCL_CLOCKS  9       /* 总线恢复时敲的 SCL 个数 */
+
+static bool s_ftI2cReady = false;
+
+static inline void ft_i2c_delay(void) { esp_rom_delay_us(FT_I2C_HALF_US); }
+
+/* 开漏输出：写 1 = 释放总线（靠上拉拉高），写 0 = 主动拉低。
+ * 读 SDA 时读的是引脚真实电平（GPIO_MODE_INPUT_OUTPUT_OD 支持回读）。 */
+static inline void ft_sda_release(void) { gpio_set_level(FT_I2C_SDA_GPIO, 1); }
+static inline void ft_sda_low(void)     { gpio_set_level(FT_I2C_SDA_GPIO, 0); }
+static inline void ft_scl_release(void) { gpio_set_level(FT_I2C_SCL_GPIO, 1); }
+static inline void ft_scl_low(void)     { gpio_set_level(FT_I2C_SCL_GPIO, 0); }
+static inline int  ft_sda_read(void)    { return gpio_get_level(FT_I2C_SDA_GPIO); }
+
+/** 把 SDA/SCL 配成开漏 + 上拉，总线置空闲（两根线都释放） */
+static esp_err_t ft_i2c_bus_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << I2C_SDA_GPIO) | (1ULL << I2C_SCL_GPIO),
+        .mode         = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&cfg);
+    if(err != ESP_OK)
+    {
+        return err;
+    }
+    ft_sda_release();
+    ft_scl_release();
+    vTaskDelay(pdMS_TO_TICKS(2));   /* 让上拉把线拉稳再开始 */
+    return ESP_OK;
+}
+
+/** 总线恢复：从设备把 SDA 拉死时，敲 9 个 SCL 让它把剩下的位移完，再补一个 STOP。
+ *  只在连续失败若干次后调用（见轮询任务），正常路径不进这里。 */
+static void ft_i2c_bus_recover(void)
+{
+    ft_sda_release();
+    for(int i = 0; i < FT_I2C_RECOVER_SCL_CLOCKS; i++)
+    {
+        ft_scl_low();
+        ft_i2c_delay();
+        ft_scl_release();
+        ft_i2c_delay();
+    }
+    /* 手工补一个 STOP：SCL 高电平期间 SDA 由低变高 */
+    ft_scl_low();
+    ft_i2c_delay();
+    ft_sda_low();
+    ft_i2c_delay();
+    ft_scl_release();
+    ft_i2c_delay();
+    ft_sda_release();
+    ft_i2c_delay();
+}
+
+/** START：SCL 高期间 SDA 由高变低。
+ *  @return false = SDA 一直是低（从设备把总线拉死），本次传输放弃 */
+static bool ft_i2c_start(void)
+{
+    ft_sda_release();
+    ft_scl_release();
+    ft_i2c_delay();
+    if(ft_sda_read() == 0)
+    {
+        return false;
+    }
+    ft_sda_low();
+    ft_i2c_delay();
+    ft_scl_low();
+    ft_i2c_delay();
+    return true;
+}
+
+/** STOP：SCL 高期间 SDA 由低变高 */
+static void ft_i2c_stop(void)
+{
+    ft_sda_low();
+    ft_i2c_delay();
+    ft_scl_release();
+    ft_i2c_delay();
+    ft_sda_release();
+    ft_i2c_delay();
+}
+
+/** 发一个字节并读 ACK；@return true = 从机 ACK */
+static bool ft_i2c_write_byte(uint8_t b)
+{
+    for(int i = 0; i < 8; i++)
+    {
+        if((b & 0x80U) != 0)
+        {
+            ft_sda_release();
+        }
+        else
+        {
+            ft_sda_low();
+        }
+        b = (uint8_t)(b << 1);
+        ft_i2c_delay();
+        ft_scl_release();
+        ft_i2c_delay();
+        ft_scl_low();
+    }
+
+    /* 第 9 个时钟：释放 SDA，从机若在则拉低 = ACK */
+    ft_sda_release();
+    ft_i2c_delay();
+    ft_scl_release();
+    ft_i2c_delay();
+    bool ack = (ft_sda_read() == 0);
+    ft_scl_low();
+    ft_i2c_delay();
+    return ack;
+}
+
+/** 读一个字节；ack=true 回 ACK（还要继续读），false 回 NAK（最后一个字节） */
+static uint8_t ft_i2c_read_byte(bool ack)
+{
+    uint8_t v = 0;
+
+    ft_sda_release();
+    for(int i = 0; i < 8; i++)
+    {
+        v = (uint8_t)(v << 1);
+        ft_i2c_delay();
+        ft_scl_release();
+        ft_i2c_delay();
+        if(ft_sda_read() != 0)
+        {
+            v |= 1U;
+        }
+        ft_scl_low();
+        ft_i2c_delay();
+    }
+
+    if(ack)
+    {
+        ft_sda_low();
+    }
+    else
+    {
+        ft_sda_release();
+    }
+    ft_i2c_delay();
+    ft_scl_release();
+    ft_i2c_delay();
+    ft_scl_low();
+    ft_i2c_delay();
+    ft_sda_release();
+    return v;
+}
+
+/** 写寄存器 + 连续读 n 字节（FT6336G 的读时序：ADDR+W, REG, SR, ADDR+R, DATA…） */
+static esp_err_t ft_i2c_read_reg(uint8_t reg, uint8_t *buf, size_t n)
+{
+    if(buf == NULL || n == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if(!ft_i2c_start())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if(!ft_i2c_write_byte((uint8_t)(LCD_TOUCH_FT6336G_DEV_ADDR << 1)))
+    {
+        ft_i2c_stop();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if(!ft_i2c_write_byte(reg))
+    {
+        ft_i2c_stop();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if(!ft_i2c_start())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if(!ft_i2c_write_byte((uint8_t)((LCD_TOUCH_FT6336G_DEV_ADDR << 1) | 1U)))
+    {
+        ft_i2c_stop();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    for(size_t i = 0; i < n; i++)
+    {
+        buf[i] = ft_i2c_read_byte(i + 1 < n);
+    }
+    ft_i2c_stop();
+    return ESP_OK;
+}
+
+/** 写单个寄存器 */
+static esp_err_t ft_i2c_write_reg(uint8_t reg, uint8_t val)
+{
+    if(!ft_i2c_start())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if(!ft_i2c_write_byte((uint8_t)(LCD_TOUCH_FT6336G_DEV_ADDR << 1)))
+    {
+        ft_i2c_stop();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if(!ft_i2c_write_byte(reg))
+    {
+        ft_i2c_stop();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if(!ft_i2c_write_byte(val))
+    {
+        ft_i2c_stop();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    ft_i2c_stop();
+    return ESP_OK;
+}
 
 
 /**
@@ -223,7 +456,7 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
         /* CTP_INT 未接（轮询模式）：定时唤醒读点；以后若接上 INT，notify 仍可立即唤醒 */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(poll_ms));
 
-        if(Ft6336I2cHandle == NULL)
+        if(!s_ftI2cReady)
         {
             continue;
         }
@@ -232,7 +465,7 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
 
         memset(touchBuf, 0, sizeof(touchBuf));
 
-        esp_err_t ret = I2c_Read_Bytes(Ft6336I2cHandle, LCD_TOUCH_FT6336G_REG_TD_STATUS, touchBuf, sizeof(touchBuf));
+        esp_err_t ret = ft_i2c_read_reg(LCD_TOUCH_FT6336G_REG_TD_STATUS, touchBuf, sizeof(touchBuf));
         if(ret != ESP_OK)
         {
             /* 读失败（总线被从设备拉死 / 芯片未就绪）：清除假的按下状态 */
@@ -255,11 +488,15 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
                          (int)LCD_TOUCH_BACKOFF_MAX_MS);
             }
 
-            /* 失败时只做一件事：退避。**绝不动总线**（原因见文件头注释：
-             * clear_bus 是最危险窗口，而实测"一次都不复位也照样崩"，说明
-             * 它既不是必要条件、也没有收益）。
-             * 退避目标是把故障期间的 I2C 事务量压到最低 —— 事务数就是撞上
-             * ISR 自锁的样本数。 */
+            /* 失败处理：退避 + 定期总线恢复。
+             * 现在引脚完全归我们管（没有 I2C 外设要抢），9 个 SCL 时钟踢醒
+             * 拉死 SDA 的从设备是安全的、也是唯一能真正自愈的手段。
+             * 间隔取 20 次（配合退避约 1~20s 一次），恢复本身只花 ~200µs。 */
+            if(s_touchReadFailCount % 20 == 0)
+            {
+                ft_i2c_bus_recover();
+            }
+
             uint32_t cap = (s_touchReadFailCount >= LCD_TOUCH_DEAD_AFTER_FAILS)
                            ? (uint32_t)LCD_TOUCH_BACKOFF_DEAD_MS
                            : (uint32_t)LCD_TOUCH_BACKOFF_MAX_MS;
@@ -335,7 +572,7 @@ static void LCD_TOUCH_FT6336G_Process_Task(void *pvParam)
  * 
  * @note 此函数仅供LCD_TOUCH_Init()内部调用
  */
-static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
+static void LCD_TOUCH_FT6336G_Init(void)
 {
 #if LCD_TOUCH_FT6336_RST != LCD_TOUCH_SPI_RST
     LCD_TOUCH_LOGI("[FT6336G] Step 1: Hardware reset...");
@@ -356,25 +593,21 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
     LCD_TOUCH_LOGI("[FT6336G] Step 1: reset shared with LCD_RST, skip");
 #endif
 
-    if(i2cBusHandle == NULL)
+    LCD_TOUCH_LOGI("[FT6336G] Step 2: init soft I2C on SDA=%d SCL=%d (~50kHz)...",
+                   (int)I2C_SDA_GPIO, (int)I2C_SCL_GPIO);
+    esp_err_t ret = ft_i2c_bus_init();
+    if(ret != ESP_OK)
     {
-        LCD_TOUCH_LOGE("[FT6336G] Error: I2C bus handle is NULL");
+        LCD_TOUCH_LOGE("[FT6336G] Error: soft I2C gpio init failed (%s)", esp_err_to_name(ret));
         return;
     }
-
-    LCD_TOUCH_LOGI("[FT6336G] Step 2: Adding I2C device (addr: 0x%02X)...", LCD_TOUCH_FT6336G_DEV_ADDR);
-    esp_err_t ret = I2c_Add_Device(i2cBusHandle, LCD_TOUCH_FT6336G_DEV_ADDR, I2C_FREQ, &Ft6336I2cHandle);
-    if(ret != ESP_OK || Ft6336I2cHandle == NULL)
-    {
-        LCD_TOUCH_LOGE("[FT6336G] Error: Failed to add FT6336G device");
-        return;
-    }
-    LCD_TOUCH_LOGI("[FT6336G] Step 2: Device added successfully");
+    s_ftI2cReady = true;
+    LCD_TOUCH_LOGI("[FT6336G] Step 2: soft I2C ready");
 
     vTaskDelay(pdMS_TO_TICKS(30));
 
     uint8_t chipId = 0xFF;
-    ret = I2c_Read_Bytes(Ft6336I2cHandle, LCD_TOUCH_FT6336G_REG_FOCALTECH_ID, &chipId, 1);
+    ret = ft_i2c_read_reg(LCD_TOUCH_FT6336G_REG_FOCALTECH_ID, &chipId, 1);
     
     if(ret == ESP_OK && chipId == 0x36)
     {
@@ -382,23 +615,30 @@ static void LCD_TOUCH_FT6336G_Init(i2c_master_bus_handle_t i2cBusHandle)
     }
     else
     {
-        LCD_TOUCH_LOGW("[FT6336G] Step 3: Chip ID = 0x%02X (continuing...)", chipId);
+        LCD_TOUCH_LOGW("[FT6336G] Step 3: Chip ID = 0x%02X (%s, continuing...)",
+                       chipId, esp_err_to_name(ret));
     }
 
     LCD_TOUCH_LOGI("[FT6336G] Step 4: Configuring registers...");
-    ret = I2c_Write_Reg(Ft6336I2cHandle, LCD_TOUCH_FT6336G_REG_G_MODE, 0x01);
+    ret = ft_i2c_write_reg(LCD_TOUCH_FT6336G_REG_G_MODE, 0x01);
     if(ret != ESP_OK)
     {
         LCD_TOUCH_LOGE("[FT6336G] Error: Failed to write G_MODE register (%s)", esp_err_to_name(ret));
         return;
     }
 
-    ret = I2c_Write_Reg(Ft6336I2cHandle, LCD_TOUCH_FT6336G_REG_PWR_MODE, 0x00);
+    ret = ft_i2c_write_reg(LCD_TOUCH_FT6336G_REG_PWR_MODE, 0x00);
     if(ret != ESP_OK)
     {
         LCD_TOUCH_LOGW("[FT6336G] Warning: Failed to write PWR_MODE register (%s)", esp_err_to_name(ret));
     }
     LCD_TOUCH_LOGI("[FT6336G] Step 4: Registers configured successfully");
+
+    /* 这条用 TOUCH_TAG，不受 LCD_TOUCH_DEBUG_LOGS 控制：
+     * 触摸链路是否真的跑在软件 I2C 上、Chip ID 读到没有，现场一眼就能确认。 */
+    ESP_LOGI(TOUCH_TAG, "FT6336G ready on soft I2C: SDA=%d SCL=%d ~%ukHz, chip id=0x%02X",
+             (int)I2C_SDA_GPIO, (int)I2C_SCL_GPIO,
+             (unsigned)(1000U / (FT_I2C_HALF_US * 2U)), (unsigned)chipId);
 
 #if LCD_TOUCH_FT6336_INT >= 0
     LCD_TOUCH_LOGI("[FT6336G] Step 5: Setting up interrupt (GPIO%d)...", LCD_TOUCH_FT6336_INT);
@@ -753,7 +993,7 @@ void LCD_Set_Backlight(bool state)
  * @see ILI9341数据手册第8章（命令列表）
  * @see datasheet/LCD屏幕方向调试指南.md（MADCTL配置说明）
  */
-void LCD_TOUCH_Init(i2c_master_bus_handle_t i2cBusHandle)
+void LCD_TOUCH_Init(void)
 {
     LCD_GPIO_Init();
     LCD_SPI_Init();
@@ -853,7 +1093,7 @@ void LCD_TOUCH_Init(i2c_master_bus_handle_t i2cBusHandle)
 
     LCD_TOUCH_LOGI("LCD initialized successfully");
 
-    LCD_TOUCH_FT6336G_Init(i2cBusHandle);
+    LCD_TOUCH_FT6336G_Init();
 }
 
 
@@ -867,7 +1107,7 @@ void LCD_TOUCH_Init(i2c_master_bus_handle_t i2cBusHandle)
  */
 bool LCD_TOUCH_FT6336G_Get_Touch_Points(Touch_Point_t *touchPoint)
 {
-    if(touchPoint == NULL || Ft6336I2cHandle == NULL)
+    if(touchPoint == NULL || !s_ftI2cReady)
     {
         return false;
     }
@@ -1070,16 +1310,8 @@ void Lcd_Touch_Test(void)
 {
     LCD_TOUCH_LOGI("=== LCD + Touch Test Start ===");
 
-    i2c_master_bus_handle_t i2cBus = NULL;
-    esp_err_t err = I2c_Init_Bus(I2C_PORT, (gpio_num_t)I2C_SDA_GPIO,
-                                 (gpio_num_t)I2C_SCL_GPIO, I2C_FREQ, &i2cBus);
-    if (err != ESP_OK || i2cBus == NULL)
-    {
-        LCD_TOUCH_LOGE("I2C bus init failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    LCD_TOUCH_Init(i2cBus);
+    /* 触摸走 GPIO 模拟 I2C，不再需要预先创建 i2c_master 总线 */
+    LCD_TOUCH_Init();
 
     const uint16_t colorBg   = RGB565(0, 0, 0);
     const uint16_t colorText = RGB565(255, 255, 255);

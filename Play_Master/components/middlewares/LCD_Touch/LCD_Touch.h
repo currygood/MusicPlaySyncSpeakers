@@ -135,8 +135,10 @@ typedef struct {
 
 // ==================== LCD_TOUCH 显示函数定义 ====================
 
-// 初始化LCD显示屏（需要传入已初始化的I2C总线句柄）
-void LCD_TOUCH_Init(i2c_master_bus_handle_t i2cBusHandle);
+// 初始化 LCD 显示屏 + FT6336G 触摸。
+// 触摸走 GPIO 模拟 I2C（SDA/SCL = 32/33），**不再需要外部传入 i2c_master 总线句柄**：
+// IDF 的 i2c_master 会在总线异常时把中断打成风暴并触发 Interrupt WDT（见 .c 顶部说明）。
+void LCD_TOUCH_Init(void);
 
 // 发送命令字节
 void LCD_Write_Cmd(uint8_t cmd);

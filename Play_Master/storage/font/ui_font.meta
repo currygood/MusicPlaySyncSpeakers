@@ -1,0 +1,20 @@
+# UI 中文字体资产元信息（ui_font.c 启动校验依据）
+# 生成脚本: tools/font/make_ui_font.py
+version=1
+source_path=C:/Windows/Fonts/NotoSansSC-VF.ttf
+source_sha256=763146584CF0710223441356B4395E279021B0806C196614377A7A0174AE074A
+source_size=17773244
+source_name=Noto Sans SC
+source_weight=400
+source_license=OFL-1.1
+size=2122276
+sha256=80B9AF11B6ECBAC13B282BF7EC4427CB3A6776320AB1312FD6D4CF2AE4AE2786
+glyphs=6876
+charset=GB2312+ASCII
+gb2312_cover=6763/6763
+ascii_cover=95/95
+line_height_12=14
+line_height_16=19
+line_height_20=24
+src_missing=U+23ED,U+23EE,U+23F8
+path=/storage/font/ui_font.ttf

@@ -16,6 +16,7 @@
  */
 
 #include "ui_priv.h"
+#include "ui_font.h"
 #include "esp_log.h"
 
 #include <stdio.h>
@@ -479,7 +480,7 @@ void scr_player_build(lv_obj_t *page)
     lv_obj_set_style_border_width(chip, 1, 0);
     lv_obj_set_style_bg_color(chip, UI_COLOR_PANEL_HI, LV_STATE_PRESSED);
     lv_obj_add_event_cb(chip, chip_click_cb, LV_EVENT_CLICKED, NULL);
-    s_lblSrcChip = ui_label_create(chip, "本地", &ui_font_cn_16, UI_COLOR_ACCENT);
+    s_lblSrcChip = ui_label_create(chip, "本地", ui_font_text(UI_FONT_TEXT_16), UI_COLOR_ACCENT);
     lv_obj_center(s_lblSrcChip);
 
     /* 列表入口按钮放大 1/3：32×26 -> 43×35 */
@@ -496,14 +497,14 @@ void scr_player_build(lv_obj_t *page)
     lv_obj_center(s_lblListIcon);
 
     /* ---- 标题 / 副标题（随 MUSIC_EVT_TRACK_* 更新，居中变长） ---- */
-    s_lblTitle = ui_label_create(page, "无曲目", &ui_font_cn_16, UI_COLOR_TEXT);
+    s_lblTitle = ui_label_create(page, "无曲目", ui_font_text(UI_FONT_TEXT_20), UI_COLOR_TEXT);
     lv_label_set_long_mode(s_lblTitle, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
-    lv_obj_set_pos(s_lblTitle, colX, 38);
+    lv_obj_set_pos(s_lblTitle, colX, 36);   /* 20px 行高 24：36..60 */
     lv_obj_set_width(s_lblTitle, colW);
     lv_obj_set_style_text_align(s_lblTitle, LV_TEXT_ALIGN_CENTER, 0);
 
-    s_lblSub = ui_label_create(page, "本地音乐", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
-    lv_obj_set_pos(s_lblSub, colX, 60);
+    s_lblSub = ui_label_create(page, "本地音乐", ui_font_text(UI_FONT_TEXT_12), UI_COLOR_TEXT_SUB);
+    lv_obj_set_pos(s_lblSub, colX, 61);    /* 12px 行高 14：61..75，与进度条 82 留 7px */
     lv_obj_set_width(s_lblSub, colW);
     lv_obj_set_style_text_align(s_lblSub, LV_TEXT_ALIGN_CENTER, 0);
 
@@ -518,7 +519,7 @@ void scr_player_build(lv_obj_t *page)
     lv_obj_set_style_bg_color(s_barProgress, UI_COLOR_PRIMARY, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(s_barProgress, LV_OPA_COVER, LV_PART_INDICATOR);
 
-    s_lblTime = ui_label_create(page, "00:00 / 00:00", &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+    s_lblTime = ui_label_create(page, "00:00 / 00:00", ui_font_text(UI_FONT_TEXT_16), UI_COLOR_TEXT_SUB);
     lv_obj_set_pos(s_lblTime, colX, 94);
     lv_obj_set_width(s_lblTime, colW);
     lv_obj_set_style_text_align(s_lblTime, LV_TEXT_ALIGN_CENTER, 0);

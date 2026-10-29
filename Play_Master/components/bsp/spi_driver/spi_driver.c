@@ -49,15 +49,9 @@ static const char *TAG = "SPI_Driver";
  */
 #define SPI_DMA_ALIGN_BYTES  4
 
-/**
- * 单笔 SPI 事务字节上限，必须覆盖最大的一笔传输：
- * 目前是 LCD 局部刷屏缓冲（LCD_WIDTH(320) × UI_FLUSH_ROWS_MAX(8) × 2B = 5120），
- * SD 扇区仅 512B。该值还决定总线初始化时预分配的 DMA 描述符数量
- * （spicommon_dma_desc_alloc：desc = ceil(max / 4092)，每个 12B，TX/RX 各一份），
- * 所以不要按整屏 240×320×2 设置——那会白占内部 RAM。
- * 注意：若调大 UI_FLUSH_ROWS_MAX，需同步调大这里。
- */
-#define SPI_MAX_TRANSFER_SZ  (320 * 8 * 2 + 8)
+/* 单笔事务上限 SPI_MAX_TRANSFER_SZ 已移到 spi_driver.h：
+ * 它必须与 UI 的刷屏缓冲高度匹配（否则 spi_master 会拒收整笔事务，
+ * 屏幕就画不出来），所以放在头文件里让 UI 侧用 _Static_assert 交叉校验。 */
 
 /* ======================== 会话仲裁默认参数 ====================================== */
 

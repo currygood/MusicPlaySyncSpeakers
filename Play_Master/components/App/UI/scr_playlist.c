@@ -16,6 +16,7 @@
  */
 
 #include "ui_priv.h"
+#include "ui_font.h"
 #include "sd_card.h"
 #include "esp_log.h"
 
@@ -62,8 +63,9 @@ static void row_click_cb(lv_event_t *e)
 
 /**
  * 建一行曲目（当前曲高亮 + ▶ 标记）。
- * 注意：图标字形在 ui_icons_16/24 字体里（PUA 码位），中文文案在 ui_font_cn_16，
- * 两者不能混在同一个 label 上——所以 ▶ 单独建一个 label。
+ * 注意：图标字形在 ui_icons_16/24 字体里（PUA 码位），中文文案走运行时
+ * ui_font_text()，两者不能混在同一个 label 上——所以 ▶ 单独建一个 label。
+ * 行高：16px = 19px，行高 28（PLAYLIST_ROW_H-2）留上下各 4.5px，不会裁切。
  */
 static void playlist_row_add(const music_track_t *t, uint16_t index, bool cur)
 {
@@ -85,7 +87,7 @@ static void playlist_row_add(const music_track_t *t, uint16_t index, bool cur)
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 0);
     }
 
-    lbl = ui_label_create(row, t->display_name, &ui_font_cn_16,
+    lbl = ui_label_create(row, t->display_name, ui_font_text(UI_FONT_TEXT_16),
                           cur ? UI_COLOR_TEXT : UI_COLOR_TEXT_SUB);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
     lv_obj_set_width(lbl, PLAYLIST_ROW_W - PLAYLIST_TEXT_X - 6);
@@ -104,12 +106,12 @@ static void playlist_empty_add(const char *line1, const char *line2)
     lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
-    lbl = ui_label_create(box, line1, &ui_font_cn_16, UI_COLOR_TEXT_SUB);
+    lbl = ui_label_create(box, line1, ui_font_text(UI_FONT_TEXT_16), UI_COLOR_TEXT_SUB);
     lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -14);
 
     if (line2 != NULL)
     {
-        lbl = ui_label_create(box, line2, &ui_font_cn_16, UI_COLOR_DISABLED);
+        lbl = ui_label_create(box, line2, ui_font_text(UI_FONT_TEXT_16), UI_COLOR_DISABLED);
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 10);
     }
 }
@@ -224,7 +226,7 @@ void scr_playlist_build(lv_obj_t *page)
     lbl = ui_label_create(back, UI_ICON_BACK, &ui_icons_24, UI_COLOR_TEXT);
     lv_obj_center(lbl);
 
-    s_lblCount = ui_label_create(page, "本地音乐 (0)", &ui_font_cn_16, UI_COLOR_TEXT);
+    s_lblCount = ui_label_create(page, "本地音乐 (0)", ui_font_text(UI_FONT_TEXT_16), UI_COLOR_TEXT);
     lv_obj_set_pos(s_lblCount, 56, 12);
 
     /* 列表容器：可滚动 flex 纵列 */

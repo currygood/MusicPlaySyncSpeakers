@@ -861,3 +861,35 @@ LCD_TOUCH_FT6336G_Process_Task（任务上下文读触摸）
 - 电气治本未做：SDA/SCL 外挂 4.7kΩ 上拉（100kHz + 仅内部 45kΩ 仍 ~5% NACK）；
 - GPIO2 为 ESP32 strapping 引脚，下载模式需为高 —— **进不了下载先拔飞线**；
 - IDF 补丁属本地魔改，升级 IDF 时必须复核（见 note 文档第六节检查清单）。
+
+---
+
+## 触摸 I2C 自锁 —— 最终定案：整体改 GPIO 模拟 I2C（2026-10-29）
+
+上一节的判据"连续 1~2 天无 `Interrupt wdt` 即视为断根"**被第 7 次崩溃否定**：
+打完 IDF 补丁 + 启用 CTP_INT 后，在 **up=8453s（2.35h）** 处仍然崩，形态与之前一致
+（`Interrupt wdt timeout on CPU0`，两核都在 IDLE，崩溃前 15 分钟无任何 UI 活动）。
+
+第 7 次的新证据：**PC 停在 `i2c_master_isr_handler_default` 的函数序言**
+（`i2c_master.c:805`，该行是 `portBASE_TYPE HPTaskAwoken = pdFALSE;`），
+说明中断在**反复重入**——清掉中断后外设立刻再置位，而不是卡在循环里。
+本地补丁只护住了 `s_i2c_hw_fsm_reset` 那一个窗口，还有别的入口。
+
+**结论：`i2c_master` 这条路只能降概率，不能断根。** 于是整体搬出：
+
+| 项 | 改动 |
+| --- | --- |
+| `LCD_Touch.c` | 触摸改 **GPIO 模拟 I2C**（SDA=32/SCL=33，开漏 + 内部上拉，半周期 10µs ≈ 50kHz）；新增 `ft_i2c_bus_init/bus_recover/start/stop/write_byte/read_byte/read_reg/write_reg`；删掉 `Ft6336I2cHandle` → `s_ftI2cReady` |
+| `LCD_Touch.h` / `ui_disp.c` | `LCD_TOUCH_Init(i2c_master_bus_handle_t)` → **`LCD_TOUCH_Init(void)`**（两处必须同步改） |
+| `ui_disp.c` | 删除 `I2c_Init_Bus()` 与 `s_i2cBus` —— 全工程不再有任何 `i2c_master` 中断被注册 |
+
+代价与结果：一次 6 字节读 ≈ 9 字节 × 9 bit × 20µs ≈ **1.6ms 忙等**，
+任务 prio 3 可被抢占，40ms 轮询下约 3% CPU；实测**触摸更跟手**，
+心跳 `i2c f=0 ok=0`（`i2c_driver` 计数器彻底不再被触碰），连续运行无 `Interrupt wdt`。
+
+完整证据链（7 次崩溃时间线、为什么 ISR 里崩的软件救不回来、时序实现要点、回退方法）
+见 `note/触摸I2C间歇NACK-InterruptWDT自锁-软件侧降暴露.md`；
+实现说明见 `docs/03-开发/触摸I2C改为GPIO模拟.md`。
+
+**遗留**：电气治本仍未做（SDA/SCL 无外部 4.7kΩ 上拉，实测累计 NACK 率 8.5%）。
+GPIO 模拟把"总线异常"与"自锁"解耦了，但信号完整性本身还是靠软件让出来的裕量。

@@ -46,8 +46,9 @@ extern "C" {
 #define UI_COLOR_OK        lv_color_hex(0x51CF66)   /* 成功（浅色版 0x2F9E44） */
 #define UI_COLOR_ERR       lv_color_hex(0xFF5C5C)   /* 错误（浅色版 0xE03131） */
 
-/* ======================== 字体（lv_font_conv 生成产物，编译进固件） ======================== */
-extern const lv_font_t ui_font_cn_16;   /* 界面中文 16px（覆盖界面全部用字 + ASCII） */
+/* ======================== 字体 ========================
+ * 中文走运行时 FreeType 字体（ui_font.h 的 ui_font_text()），不再有编译进固件的
+ * 中文字库；图标字体仍是 lv_font_conv 产物（PUA 码位，不是中文，保留）。 */
 extern const lv_font_t ui_icons_16;     /* 控件图标 16px（状态栏） */
 extern const lv_font_t ui_icons_24;     /* 控件图标 24px（Tab 栏/大按钮） */
 
@@ -95,6 +96,35 @@ esp_err_t ui_lvgl_port_init(void);  /* lv_init + tick + lv_fs('F') + 显示/触�
  * @return true 存在可加载；false 不存在/SPIFFS 未挂载（调用方使用占位显示）
  */
 bool ui_img_file_ok(const char *lv_path);
+
+/**
+ * @brief 建立"渲染期栈深"基准（必须在 ui_run() 最开头、建页面之前调用一次）
+ */
+void ui_disp_sp_probe_init(void);
+
+/**
+ * @brief 一次整屏刷新的耗时拆解（诊断用）
+ *
+ * 为什么需要 render_* 这组数：flush 回调只在「这一段已经画完」之后被调用，
+ * 所以单个 flush 的耗时只包含 SPI 传输，不含绘制。相邻两次 flush 之间的空档
+ * 恰好就是「下一段窗口的绘制耗时」，把它单独统计才能判断 550ms 到底花在
+ * SPI 上还是花在 LVGL 软件绘制上，以及是不是每段耗时均匀
+ * （均匀 = 每段固定开销大，抖动 = 某类对象/文字特别贵）。
+ */
+typedef struct {
+    uint32_t flush_us;       /* 本次刷新累计 SPI 耗时 */
+    uint32_t flush_calls;    /* flush 次数 = 渲染窗口数 */
+    uint32_t render_us;      /* 各渲染窗口的绘制耗时累计（flush 之间的空档） */
+    uint32_t render_count;   /* 参与统计的窗口数（首段无前一次 flush，不计） */
+    uint32_t render_max_us;  /* 单窗口最长绘制耗时 */
+    uint32_t depth_peak;     /* 渲染期峰值栈用量（含 ui_run 入口已用量） */
+} ui_disp_stat_t;
+
+/**
+ * @brief 取走「自上次调用以来」的刷新统计（取走后清零）
+ * @param st 输出；可为 NULL（仅清零）
+ */
+void ui_disp_stat_take(ui_disp_stat_t *st);
 
 /* ======================== 页面构造（各 scr_*.c / statusbar / tabbar） ======================== */
 void ui_statusbar_create(lv_obj_t *parent);

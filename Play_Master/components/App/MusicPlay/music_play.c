@@ -251,6 +251,41 @@ static void Music_Switch_Source_Msg(music_play_handle_t h, music_source_t src);
 static void Music_Poll_Source(music_play_handle_t h);
 static void Music_Scan_Local_Msg(music_play_handle_t h);
 static void Music_Handle_Msg(music_play_handle_t h, const music_msg_t *msg);
+
+/* ==================== 文本工具 ================================== */
+
+/**
+ * @brief 计算 UTF-8 安全截断长度：不超过 max_bytes，且不切开多字节字符
+ *
+ * 为什么需要：music_track_t 的 path/display_name 是 UTF-8 字节流
+ * （FATFS API 编码 = UTF-8，LVGL 文本编码 = UTF-8）。如果按
+ * "数组容量 - 1" 直接切字节，汉字（3 字节）被切在中间时末尾会留下半个
+ * 字符，LVGL 把它当非法序列，显示成一个乱码字或空白。
+ *
+ * 实现：从 max_bytes 处回退，跳过所有 10xxxxxx 续字节，停在字符首字节。
+ * 对非法 UTF-8（例如仍是 GBK 的旧数据）只会多回退几个字节，结果保守但安全。
+ *
+ * @param s          以 NUL 结尾的字符串（调用方保证）
+ * @param max_bytes  允许保留的最大字节数（不含结尾 NUL）
+ * @return 可安全拷贝的字节数，<= max_bytes
+ */
+static size_t Music_Utf8_Clip(const char *s, size_t max_bytes)
+{
+    size_t len = strlen(s);
+    size_t cut;
+
+    if (len <= max_bytes)
+    {
+        return len;
+    }
+    cut = max_bytes;
+    while (cut > 0 && ((unsigned char)s[cut] & 0xC0u) == 0x80u)
+    {
+        cut--;      /* s[cut] 是续字节 → 切点在字符中间，继续回退 */
+    }
+    return cut;
+}
+
 /* ==================== 事件与视图发布 ============================ */
 
 /** 事件投递（锁内拷贝视图快照，回调在锁外执行） */
@@ -932,7 +967,9 @@ static void Music_Handle_Bt_Event(music_play_handle_t h,
         h->bt_track.format      = MUSIC_TRACK_FMT_MP3;
         h->bt_track.duration_ms = ti->duration_ms;
         snprintf(h->bt_track.path, sizeof(h->bt_track.path), "bt://");
-        /* 手工按字节限长拼"标题 - 歌手"（避免 -Wformat-truncation） */
+        /* 手工按字节限长拼"标题 - 歌手"（避免 -Wformat-truncation）。
+         * AVRCP 元数据是手机下发的 UTF-8，截断必须按字符边界，
+         * 否则超长标题会在末尾留半个汉字（"绝大部数字不会乱码"里那一个）。 */
         if (ti->title[0] != '\0')
         {
             const char *title = ti->title;
@@ -941,24 +978,18 @@ static void Music_Handle_Bt_Event(music_play_handle_t h,
             size_t used = 0;
             size_t part;
 
-            part = strlen(title);
-            if (part > room)
-            {
-                part = room;
-            }
+            part = Music_Utf8_Clip(title, room);
             memcpy(h->bt_track.display_name, title, part);
             used = part;
 
-            if (artist[0] != '\0' && used < room)
+            /* +3 是 " - " 三个字节，必须整段放得下才拼，否则写越界
+             * （旧版只判 used < room，标题占满时正好越界 2 字节） */
+            if (artist[0] != '\0' && used + 3 <= room)
             {
                 h->bt_track.display_name[used++] = ' ';
                 h->bt_track.display_name[used++] = '-';
                 h->bt_track.display_name[used++] = ' ';
-                part = strlen(artist);
-                if (part > room - used)
-                {
-                    part = room - used;
-                }
+                part = Music_Utf8_Clip(artist, room - used);
                 memcpy(&h->bt_track.display_name[used], artist, part);
                 used += part;
             }
@@ -966,11 +997,8 @@ static void Music_Handle_Bt_Event(music_play_handle_t h,
         }
         else if (ti->artist[0] != '\0')
         {
-            size_t part = strlen(ti->artist);
-            if (part >= sizeof(h->bt_track.display_name))
-            {
-                part = sizeof(h->bt_track.display_name) - 1;
-            }
+            size_t part = Music_Utf8_Clip(ti->artist,
+                                          sizeof(h->bt_track.display_name) - 1);
             memcpy(h->bt_track.display_name, ti->artist, part);
             h->bt_track.display_name[part] = '\0';
         }
@@ -1303,26 +1331,37 @@ static void Music_Scan_Local_Msg(music_play_handle_t h)
         memset(&tracks[count], 0, sizeof(tracks[count]));
         tracks[count].format = MUSIC_TRACK_FMT_MP3;
         {
-            /* 手工拼 /sdcard/music/xxx.mp3（避免 -Wformat-truncation） */
+            /* 手工拼 /sdcard/music/xxx.mp3（避免 -Wformat-truncation）。
+             * path 会被直接喂给 f_open()，所以必须**完整**：UTF-8 下一个汉字
+             * 3 字节，FAT 长名上限 255 字节，装不下就跳过这一首并告警——
+             * 截断只会得到一个"看起来正常但打不开"的路径，比丢歌更难查。
+             * room 已扣掉目录后的 '/' 和结尾 NUL（旧版少扣了 1 字节，会写越界
+             * 到 display_name[0]，这里一并修正）。 */
             size_t base_len = strlen(MP_MUSIC_DIR);
-            size_t name_len = nlen;
-            size_t room = sizeof(tracks[count].path) - 1 - base_len;
+            size_t room = sizeof(tracks[count].path) - 2 - base_len;
             char *dst_path = tracks[count].path;
+
+            if (nlen > room)
+            {
+                MUSIC_PLAY_LOGW( "scan: name too long (%u B > %u B), skipped",
+                                 (unsigned)nlen, (unsigned)room);
+                continue;
+            }
 
             memcpy(dst_path, MP_MUSIC_DIR, base_len);
             dst_path[base_len] = '/';
-            if (name_len > room)
-            {
-                name_len = room;
-            }
-            memcpy(&dst_path[base_len + 1], ent->d_name, name_len);
-            dst_path[base_len + 1 + name_len] = '\0';
+            memcpy(&dst_path[base_len + 1], ent->d_name, nlen);
+            dst_path[base_len + 1 + nlen] = '\0';
         }
         {
-            size_t dlen = nlen - 4;
-            if (dlen > sizeof(tracks[count].display_name) - 1)
+            size_t dlen = nlen - 4;      /* 去掉 ".mp3" */
+            size_t name_cap = sizeof(tracks[count].display_name) - 1;
+
+            if (dlen > name_cap)
             {
-                dlen = sizeof(tracks[count].display_name) - 1;
+                /* 超长名只在显示侧收缩，且按 UTF-8 字符边界收，
+                 * 避免末尾留下半个汉字 */
+                dlen = Music_Utf8_Clip(ent->d_name, name_cap);
             }
             memcpy(tracks[count].display_name, ent->d_name, dlen);
             tracks[count].display_name[dlen] = '\0';

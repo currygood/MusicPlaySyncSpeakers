@@ -33,7 +33,7 @@ EPC1 : uart_hal_write_txfifo
 - 轮询任务里的退避（40 → 80 → … → 5000ms）根本没机会执行
 - `i2c_master_bus_reset()`（要在任务里跑）也执行不了
 - 之前给 `s_i2c_hw_fsm_reset` 套的 `esp_intr_disable/enable` 本地补丁只护住那个窗口，
-  而崩溃时走的根本不是那条路径
+  而崩溃时走的根本不是那条路径（该补丁已于 2026-10-29 随 IDF 恢复官方源码而回退）
 
 结论：**只要还用 `i2c_master`，就只能靠看门狗重启。** 所以改成纯 GPIO 模拟 I2C。
 

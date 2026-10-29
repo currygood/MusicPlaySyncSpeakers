@@ -1,10 +1,27 @@
 # ESP-IDF 6.0.1 本地补丁：`i2c_master` FSM reset 期间关中断
 
+> ## ⛔ 已回退（2026-10-29）—— 本文仅作备查
+>
+> 触摸已整体改为 **GPIO 模拟 I2C**（见
+> `note/触摸I2C间歇NACK-InterruptWDT自锁-软件侧降暴露.md`
+> 与 `docs/03-开发/触摸I2C改为GPIO模拟.md`），工程内**已没有任何 `i2c_master` 调用者**，
+> 所以这个补丁护住的那段代码已经走不到。留在共用工具链上只会变成
+> "看不见的差异"——换机器/重装 IDF 后它静默消失，谁也不知道。
+>
+> **当前状态**：`F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf` 工作区与官方 v6.0.1
+> **完全一致**（`git -C <IDF> status --porcelain` 输出为空即可验证，该目录是 git 仓库，
+> HEAD = `8c19b1560 change(version): Update version to 6.0.1`）。
+>
+> **什么时候需要重新打**：只有当某个工程重新开始用 `i2c_master` 时
+> （接传感器、第二块触摸、或改用官方 `esp_lcd_touch` 驱动）。打之前先读上面那份笔记的
+> 2.3 节——它只护住"FSM reset"一个窗口，第 7 次崩溃就是换了个入口。
+> 重打步骤见本文第五节。
+
 > 位置：`F:/esp_idf_6.0.1/esp_tool/v6.0.1/esp-idf/components/esp_driver_i2c/i2c_master.c`
-> 补丁文件：`note/patch/esp-idf-6.0.1-i2c-fsm-reset-intr.patch`
-> 建立日期：2026-10-27
-> **这份 IDF 是共用工具链**（Play_Master / Play_Slave 都编译在它上面），补丁影响所有工程；
-> 升级 / 重装 / 换机器时**必须重新应用**，否则触摸偶发 `Interrupt wdt timeout on CPU0` 会复发。
+> 补丁文件：`note/patch/esp-idf-6.0.1-i2c-fsm-reset-intr.patch`（标准 git diff，可重打）
+> 建立日期：2026-10-27 · 回退日期：2026-10-29
+> **这份 IDF 是共用工具链**（Play_Master / Play_Slave 都编译在它上面），
+> 所以当时才需要写这份文档：影响面不止一个工程。
 
 ---
 

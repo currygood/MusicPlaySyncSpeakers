@@ -104,8 +104,15 @@ typedef enum {
 
 typedef struct {
     music_track_format_t format;
-    char path[128];
-    char display_name[64];
+    /* 两个字段都是 **UTF-8** 字节流：
+     *   - path 直接喂 f_open()，必须与 CONFIG_FATFS_API_ENCODING_UTF_8 一致，
+     *     GBK 路径会 f_open 失败（文件名对不上）；
+     *   - display_name 直接喂 lv_label_set_text()，LVGL 按 UTF-8 解析。
+     * UTF-8 汉字 3 字节，所以容量按"字节"给足：path 192 ≈ 59 汉字，
+     * display_name 96 ≈ 31 汉字。截断一律走 Music_Utf8_Clip()，
+     * 绝不能按字节硬切，否则末尾会多出半个字符的乱码。 */
+    char path[192];
+    char display_name[96];
     uint32_t duration_ms;
 } music_track_t;
 

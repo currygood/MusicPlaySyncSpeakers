@@ -60,7 +60,12 @@ Core 0: IDLE0        Core 1: IDLE1        ← 两个核都空闲，UI_Task 根�
 | 轮询 20 → 40ms、失败退避到 5s 慢探测 | 事务量降一个量级，`f=` 速率 3.1 → 0.94 次/s | **单次失败率没变（~4.9%）**，降的是样本数 |
 | 删掉应用层 `I2c_Reset_Bus` | 不再占最危险窗口 | `r=0` 仍崩，说明不是它 |
 | CTP_INT 飞线（GPIO2，负边沿 + 兜底轮询） | 静止事务量 25 → 5 次/s | 同上，只是降概率 |
-| **IDF 本地补丁**：`s_i2c_hw_fsm_reset` 进出各加 `esp_intr_disable/enable` | 第 7 次崩溃推迟到 2.35h | **只护住 reset 那一个窗口**，还有别的入口 |
+| **IDF 本地补丁**：`s_i2c_hw_fsm_reset` 进出各加 `esp_intr_disable/enable` | 第 7 次崩溃推迟到 2.35h | **只护住 reset 那一个窗口**，还有别的入口。**已于 2026-10-29 回退**（见下） |
+
+> 补丁已于 2026-10-29 **回退**：触摸改 GPIO 模拟后工程内再无 `i2c_master` 调用者，
+> 留着只会让共用工具链与官方不一致且毫无收益。IDF 现为**官方原样** v6.0.1
+> （`git -C <IDF> status --porcelain` 为空）。补丁文件仍保留在
+> `note/patch/esp-idf-6.0.1-i2c-fsm-reset-intr.patch`，将来重新启用 `i2c_master` 时再打。
 
 补丁本身是对的（`note/ESP-IDF6.0.1本地补丁-i2c_fsm_reset关中断.md`），
 但它的作用是"拆掉一颗已知的雷"，不是"排掉所有雷"。

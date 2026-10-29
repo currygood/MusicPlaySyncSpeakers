@@ -833,7 +833,10 @@ LCD_TOUCH_FT6336G_Process_Task（任务上下文读触摸）
 - 补丁文件：`note/patch/esp-idf-6.0.1-i2c-fsm-reset-intr.patch`
 - 说明文档：`note/ESP-IDF6.0.1本地补丁-i2c_fsm_reset关中断.md`
 - **⚠ 环境依赖**：补丁打在 `F:/esp_idf_6.0.1/.../esp-idf`，**所有用这份 IDF 的工程
-  都受影响**；升级/重装/换机器必须重打（先查新版是否已修），否则本崩溃会复发。
+  都受影响**；**当时**的要求是升级/重装/换机器必须重打（先查新版是否已修），否则本崩溃会复发。
+- **⛔ 已于 2026-10-29 回退**（本节保留为历史记录）：触摸改 GPIO 模拟后工程内再无
+  `i2c_master` 调用者，IDF 已恢复官方 v6.0.1 原样，上述"环境依赖"不再成立。
+  详见文末「最终定案」一节。
 - 改了 IDF 组件，建议 `idf.py fullclean` 后全量重编，避免旧对象残留。
 
 **修复 ②：CTP_INT 飞线接入 GPIO2（治标·降暴露）**
@@ -860,7 +863,11 @@ LCD_TOUCH_FT6336G_Process_Task（任务上下文读触摸）
 
 - 电气治本未做：SDA/SCL 外挂 4.7kΩ 上拉（100kHz + 仅内部 45kΩ 仍 ~5% NACK）；
 - GPIO2 为 ESP32 strapping 引脚，下载模式需为高 —— **进不了下载先拔飞线**；
-- IDF 补丁属本地魔改，升级 IDF 时必须复核（见 note 文档第六节检查清单）。
+- ~~IDF 补丁属本地魔改，升级 IDF 时必须复核~~ → **已于 2026-10-29 回退**：
+  触摸改 GPIO 模拟后工程内再无 `i2c_master` 调用者，IDF 已恢复官方 v6.0.1 原样
+  （`git -C <IDF> status --porcelain` 为空）。补丁文件保留在
+  `note/patch/esp-idf-6.0.1-i2c-fsm-reset-intr.patch`，仅当以后重新启用 `i2c_master`
+  时才需要按 `note/ESP-IDF6.0.1本地补丁-i2c_fsm_reset关中断.md` 重打。
 
 ---
 

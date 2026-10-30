@@ -136,6 +136,36 @@
  */
 #define BT_A2DP_TARGET_RATE         44100u
 
+/**
+ * 采样率未知时的兜底值（只在"mcc 解析失败且实测还没出结果"的那不到 1 秒里用到）。
+ *
+ * 取 48000 而不是 44100：SBC sink 的实际场景里，解析不出采样率的基本只有
+ * Windows（蓝牙栈固定 48k，SBC 协商也走 48k）。而**猜错方向的代价是不对称的**
+ * ——猜成 44.1 会把 48k 数据直接当 44.1k 播，音调降 8.1% + 时长拉长 8.8%，
+ * 是"一听就知道坏了"的级别；猜成 48k 而实际是 44.1k 同样会升调，但这种情况
+ * 的 mcc 一定是解析成功的（Android 从不省略），走不到这个兜底。
+ *
+ * 换句话说：这个值只用于 Windows 兜底，而 Windows 就是 48k。
+ */
+#define BT_A2DP_FALLBACK_RATE       48000u
+
+/** 实测采样率的统计窗口（us）：太短会被包间隔抖动带偏，太长则纠错太慢 */
+#define BT_RATE_PROBE_WINDOW_US     1000000ll
+
+/** 实测值与 mcc 声明值偏差超过这个比例（千分比）就判定声明错误并纠正 */
+#define BT_RATE_MISMATCH_PERMILLE   25u     /* 2.5%：44.1k/48k 差 88‰，同值噪声 <5‰ */
+
+/** 实测值归一到标准采样率时允许的最大相对误差（千分比）。
+ *  44.1k 与 48k 的中点约 46.05k，取 4% 能保证"测出 46k 附近"这种中间值
+ *  直接判为无法确定，而不是硬塞进某一档（硬塞就可能把好流改坏）。 */
+#define BT_RATE_SNAP_PERMILLE       40u
+
+/** 连续多少个窗口都测出同一个"不一致值"才真正纠正。
+ *  丢包会让实测值系统性偏低（1 秒掉 2 个 SBC 包就低 3%），单窗口判定
+ *  容易把"丢包"误判成"采样率更高"。隔一秒再确认一次，几乎不增加延迟
+ *  （本来前 1 秒也已经用 mcc 声明的值在播）。 */
+#define BT_RATE_MISMATCH_HITS       2u
+
 /** 重采样输出缓冲容量（int16 个数）。
  *  单次从 FIFO 最多取 BT_PCM_CHUNK_SAMPLES 个 int16；按 16k 单声道升采样最坏
  *  放大 2.76 倍 ⇒ 需要 ≥5650，这里留 3 倍余量。 */
@@ -240,6 +270,23 @@ struct bt_audio_s
     int64_t              a2dp_rs_pos;       /* 插值相位（32.32，单位=源采样帧，可跨块为负） */
     int16_t              a2dp_rs_last[2];   /* 上一块最后一帧（跨块插值用，按声道） */
     uint32_t             a2dp_rs_rate;      /* 相位当前对应的源采样率（0=需复位） */
+    bool                 a2dp_rs_no_buf_warned; /* "没有重采样缓冲"只报一次，别刷屏 */
+
+    /* ---- 采样率实测校正 ----
+     * mcc 声明的采样率是**信任但不能盲信**的：解析失败会被兜底成某个值，
+     * 个别蓝牙栈也会声明 44.1k 却实际送 48k。而采样率错一个档位，听感就是
+     * 整首歌变调（48k 当 44.1k 播 = 降 8.1%，约 1.5 个半音）并且时长拉长
+     * 8.8%，偏偏日志里"看起来一切正常"，是最难查的一类故障。
+     *
+     * 所以这里直接测**每秒实际收到多少个采样**，用物理事实去校正声明值：
+     *   a2dp_data_cb（core 0）只累加样本数，bt_audio_task（core 1）每秒结算一次。
+     *   rate_win_samples 用 uint32：1 秒最多 96k 个 int16，远不到溢出，
+     *   跨核读写即使被撕裂也就差几十个样本（<0.05%），不影响判定。 */
+    uint64_t             rate_win_start_us; /* 本统计窗口起点（0=窗口未开） */
+    uint32_t             rate_win_samples;  /* 本窗口累计 int16 个数（含各声道） */
+    uint32_t             a2dp_rate_measured;/* 最近一次实测并归一的采样率（0=还没测出） */
+    uint32_t             rate_bad_hits;     /* 连续多少个窗口测出同一个不一致值 */
+    uint32_t             rate_bad_cand;     /* 上述不一致值对应的采样率 */
 
     /* ---- 活体检测（卡死定位用，只增不减） ----
      * a2dp_cb_cnt 在协议栈数据回调里自增，task_beat 在模块任务循环里自增。
@@ -488,6 +535,11 @@ static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len)
         return;
     }
 
+    /* 实测采样率统计：累加**到达**的采样数（而不是写进 FIFO 的数量）。
+     * FIFO 满导致丢弃属于消费端跟不上，不代表源速率变了，不能计入，
+     * 否则会把"卡顿"误判成"采样率更高"。 */
+    s_bt_audio.rate_win_samples += (uint32_t)(whole / sizeof(int16_t));
+
     space = xStreamBufferSpacesAvailable(fifo);
     room  = space - (space % BT_A2DP_FRAME_BYTES);
     n     = (whole < room) ? whole : room;
@@ -642,7 +694,16 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 
         if (rate == 0)
         {
-            rate = 44100;   /* 解析失败兜底 */
+            /* 解析失败**绝不猜** 44100。
+             *
+             * 这里曾经无条件写 rate = 44100，而 mcc 解析失败恰恰多发在
+             * Windows（SBC 走 48k）上 —— 一猜就是整首歌降 8.1%（约 1.5 个
+             * 半音）+ 时长拉长 8.8%，而且日志还打印 44100，看着毫无异常，
+             * 等于把故障藏起来。
+             *
+             * 现在留 0（未知），由 bt_audio_rate_probe() 用实测样本速率判定；
+             * 若实测也还没出结果，播放侧兜底到 BT_A2DP_FALLBACK_RATE。 */
+            BT_AUDIO_LOGW("A2DP mcc has no usable rate, defer to measurement");
         }
 
         BT_AUDIO_LOCK();
@@ -1353,6 +1414,8 @@ static StreamBufferHandle_t bt_audio_sbuf_create(size_t bytes,
  * 48k→44.1k 的实际比例偏 13ppm（10 秒多出 4 帧），长期会把入口环慢慢灌满；
  * 32.32 的误差在 2^-32 量级，可以忽略。
  *
+ * @param src_rate   输入 PCM 的采样率（调用方从 a2dp.sample_rate 取快照后传入，
+ *                   不在函数内重读结构体——否则和调用方的判定可能读到不同的值）
  * @param in         输入 PCM（源采样率，交错）
  * @param in_frames  输入帧数（一帧 = 所有声道各一个样点）
  * @param ch         声道数（1..2）
@@ -1360,10 +1423,10 @@ static StreamBufferHandle_t bt_audio_sbuf_create(size_t bytes,
  * @param out_cap    输出缓冲能放的**帧**数
  * @return 实际输出帧数（0 表示不需要重采样或参数非法）
  */
-static size_t bt_a2dp_resample_to_44k(const int16_t *in, size_t in_frames,
+static size_t bt_a2dp_resample_to_44k(uint32_t src_rate, const int16_t *in, size_t in_frames,
                                       uint8_t ch, int16_t *out, size_t out_cap)
 {
-    uint32_t src = s_bt_audio.a2dp.sample_rate;
+    uint32_t src = src_rate;
     uint64_t step;
     int64_t  pos;
     size_t   out_n = 0;
@@ -1432,6 +1495,138 @@ static size_t bt_a2dp_resample_to_44k(const int16_t *in, size_t in_frames,
     return out_n;
 }
 
+/* ======================== 采样率实测校正 ===================================== */
+
+/** 把实测帧率归一到标准采样率；偏离所有候选太远则返回 0（本轮不采纳） */
+static uint32_t bt_audio_snap_rate(uint32_t fps)
+{
+    static const uint32_t cand[] = { 16000u, 32000u, 44100u, 48000u };
+    uint32_t best     = 0;
+    uint32_t best_err = 0xFFFFFFFFu;
+    size_t   i;
+
+    for (i = 0; i < sizeof(cand) / sizeof(cand[0]); i++)
+    {
+        uint32_t err = (fps > cand[i]) ? (fps - cand[i]) : (cand[i] - fps);
+
+        if (err < best_err)
+        {
+            best_err = err;
+            best     = cand[i];
+        }
+    }
+    if (best == 0 ||
+        (uint64_t)best_err * 1000u > (uint64_t)best * BT_RATE_SNAP_PERMILLE)
+    {
+        return 0;
+    }
+    return best;
+}
+
+/**
+ * @brief 每秒结算一次：用实测样本速率校正 a2dp.sample_rate（bt_audio_task 上下文）
+ *
+ * 只在"流已开且已预灌"之后开窗，起流/预灌阶段速率本来就不对。
+ * 判定到偏差 > 2.5% 才改，避免同值噪声（实测抖动 < 1%）触发来回跳。
+ */
+static void bt_audio_rate_probe(void)
+{
+    uint64_t now;
+    uint64_t elapsed_us;
+    uint64_t frames;
+    uint32_t ch;
+    uint32_t measured;
+    uint32_t snapped;
+    uint32_t declared;
+    uint32_t diff;
+    bool     rate_changed;
+
+    if (!s_bt_audio.stream_started || !s_bt_audio.a2dp_primed)
+    {
+        s_bt_audio.rate_win_start_us = 0;   /* 关窗：等下一段稳定播放 */
+        s_bt_audio.rate_win_samples  = 0;
+        return;
+    }
+
+    now = (uint64_t)esp_timer_get_time();
+    if (s_bt_audio.rate_win_start_us == 0)
+    {
+        s_bt_audio.rate_win_start_us = now;
+        s_bt_audio.rate_win_samples  = 0;
+        return;
+    }
+    elapsed_us = now - s_bt_audio.rate_win_start_us;
+    if (elapsed_us < (uint64_t)BT_RATE_PROBE_WINDOW_US)
+    {
+        return;
+    }
+
+    ch = s_bt_audio.a2dp.channels;
+    if (ch == 0 || ch > 2)
+    {
+        ch = 2;
+    }
+    frames   = (uint64_t)(s_bt_audio.rate_win_samples / ch);
+    measured = (uint32_t)(frames * 1000000ull / elapsed_us);
+
+    /* 结算并重新开窗（无论本轮是否采纳，窗口都要推进） */
+    s_bt_audio.rate_win_start_us = now;
+    s_bt_audio.rate_win_samples  = 0;
+
+    snapped = bt_audio_snap_rate(measured);
+    if (snapped == 0)
+    {
+        return;   /* 窗口内有过起停/丢包，测不准：等下个窗口 */
+    }
+    rate_changed = (snapped != s_bt_audio.a2dp_rate_measured);
+    s_bt_audio.a2dp_rate_measured = snapped;
+
+    declared = s_bt_audio.a2dp.sample_rate;
+    if (declared == 0)
+    {
+        /* 未知值只在"测出来的值变了"时打一次，别每秒刷屏 */
+        if (rate_changed)
+        {
+            BT_AUDIO_LOGW("A2DP rate unknown -> measured %" PRIu32 " Hz", snapped);
+        }
+        return;
+    }
+
+    diff = (declared > snapped) ? (declared - snapped) : (snapped - declared);
+    if ((uint64_t)diff * 1000u <= (uint64_t)declared * BT_RATE_MISMATCH_PERMILLE)
+    {
+        s_bt_audio.rate_bad_hits = 0;   /* 一致：清掉累计 */
+        return;
+    }
+
+    /* 不一致：先累计，连续 BT_RATE_MISMATCH_HITS 个窗口都指向同一个值才动手。
+     * 单窗口判定扛不住丢包——跌 3% 的实测值会被误当成"采样率更高"。 */
+    if (snapped != s_bt_audio.rate_bad_cand)
+    {
+        s_bt_audio.rate_bad_cand = snapped;
+        s_bt_audio.rate_bad_hits = 1;
+        return;
+    }
+    if (s_bt_audio.rate_bad_hits < BT_RATE_MISMATCH_HITS)
+    {
+        s_bt_audio.rate_bad_hits++;
+    }
+    if (s_bt_audio.rate_bad_hits < BT_RATE_MISMATCH_HITS)
+    {
+        return;
+    }
+    s_bt_audio.rate_bad_hits = 0;
+
+    BT_AUDIO_LOCK();
+    s_bt_audio.a2dp.sample_rate = snapped;
+    s_bt_audio.a2dp_rs_rate     = 0;   /* 比例变了：相位作废，下一块重起 */
+    BT_AUDIO_UNLOCK();
+
+    BT_AUDIO_LOGE("A2DP rate mismatch: declared %" PRIu32 ", measured %" PRIu32
+                  ", corrected to %" PRIu32,
+                  declared, measured, snapped);
+}
+
 /* ======================== 模块任务 =========================================== */
 
 /** bt_audio 任务：在安全上下文调用 on_event / on_pcm，参数在栈上取值 */
@@ -1454,6 +1649,10 @@ static void bt_audio_task(void *arg)
     {
         (void)esp_task_wdt_reset();
         s_bt_audio.task_beat++;        /* 活体检测：本任务主循环还在转 */
+
+        /* 每秒结算一次实测采样率：mcc 声明错/解析失败时靠它纠正。
+         * 放在最前，保证任何 continue 分支都不会漏掉这一轮。 */
+        bt_audio_rate_probe();
 
         /* 事件优先：非阻塞取一条 */
         if (xQueueReceive(s_bt_audio.evt_q, &evt, 0) == pdTRUE)
@@ -1573,6 +1772,7 @@ static void bt_audio_task(void *arg)
         bt_audio_pcm_cb_t cb = s_bt_audio.on_pcm;
         void *ctx = s_bt_audio.pcm_ctx;
         uint32_t rate = 0;
+        uint32_t src_rate;
         uint8_t  ch   = 2;
 
         BT_AUDIO_LOCK();
@@ -1589,39 +1789,75 @@ static void bt_audio_task(void *arg)
             continue;
         }
 
+        /* 采样率取值优先级：mcc 声明 > 实测 > 兜底。
+         * 只有解析失败才会走到后两级；实测要满 1 秒窗口才出结果，
+         * 这段空窗期用 BT_A2DP_FALLBACK_RATE —— 宁可按 48k 多插值，
+         * 也绝不能按 44.1k 直通（那是整首歌变调）。 */
+        src_rate = rate;
+        if (src_rate == 0)
+        {
+            src_rate = s_bt_audio.a2dp_rate_measured;
+        }
+        if (src_rate == 0)
+        {
+            src_rate = BT_A2DP_FALLBACK_RATE;
+        }
+
         /* 源不是 44.1k（Windows 笔记本常见 48k）时先重采样再交给下游。
          * 下游全部写死 44.1k，直接灌 48k 会以 8.16% 的速率盈余把 sync 的
          * 入口环灌满，之后每 15ms 丢一段样点 → 持续"吱吱"。 */
-        if (rate != 0 && rate != BT_A2DP_TARGET_RATE && s_bt_audio.task_rs_buf != NULL)
+        if (src_rate != BT_A2DP_TARGET_RATE)
         {
-            size_t frames;
-            size_t out_n;
-
-            if (rate != s_bt_audio.a2dp_rs_rate)
+            if (s_bt_audio.task_rs_buf == NULL)
             {
-                /* 新采样率/新流：相位与历史帧清零，避免沿用上一条流的位置 */
-                s_bt_audio.a2dp_rs_pos     = 0;
-                s_bt_audio.a2dp_rs_last[0] = 0;
-                s_bt_audio.a2dp_rs_last[1] = 0;
-                s_bt_audio.a2dp_rs_rate    = rate;
-                ESP_LOGI("BT_PCM", "A2DP resample %u -> %u Hz (%uch, linear)",
-                         (unsigned)rate, (unsigned)BT_A2DP_TARGET_RATE, (unsigned)ch);
+                /* 缓冲没分配出来 ⇒ 只能直通，音调和速度都会偏 8% 以上。
+                 * 这是**听得出来但看不出来**的故障，所以必须显式报错，
+                 * 绝不能像以前那样静默降级成直通。 */
+                if (!s_bt_audio.a2dp_rs_no_buf_warned)
+                {
+                    s_bt_audio.a2dp_rs_no_buf_warned = true;
+                    BT_AUDIO_LOGE("no resample buf: %" PRIu32 " Hz source plays "
+                                  "off-pitch, check PSRAM/internal heap",
+                                  src_rate);
+                }
+                s_bt_audio.a2dp_rs_rate = src_rate;
+                cb(BT_AUDIO_PCM_SOURCE_A2DP, pcm_buf, bytes / sizeof(int16_t),
+                   src_rate, ctx);
+                continue;
             }
 
-            frames = (size_t)(bytes / ((size_t)ch * sizeof(int16_t)));
-            out_n  = bt_a2dp_resample_to_44k(pcm_buf, frames, ch,
-                                             s_bt_audio.task_rs_buf,
-                                             BT_RS_BUF_SAMPLES / (size_t)ch);
-            if (out_n > 0)
             {
-                cb(BT_AUDIO_PCM_SOURCE_A2DP, s_bt_audio.task_rs_buf,
-                   out_n * ch, BT_A2DP_TARGET_RATE, ctx);
+                size_t frames;
+                size_t out_n;
+
+                if (src_rate != s_bt_audio.a2dp_rs_rate)
+                {
+                    /* 新采样率/新流：相位与历史帧清零，避免沿用上一条流的位置 */
+                    s_bt_audio.a2dp_rs_pos     = 0;
+                    s_bt_audio.a2dp_rs_last[0] = 0;
+                    s_bt_audio.a2dp_rs_last[1] = 0;
+                    s_bt_audio.a2dp_rs_rate    = src_rate;
+                    ESP_LOGI("BT_PCM", "A2DP resample %u -> %u Hz (%uch, linear)",
+                             (unsigned)src_rate, (unsigned)BT_A2DP_TARGET_RATE,
+                             (unsigned)ch);
+                }
+
+                frames = (size_t)(bytes / ((size_t)ch * sizeof(int16_t)));
+                out_n  = bt_a2dp_resample_to_44k(src_rate, pcm_buf, frames, ch,
+                                                 s_bt_audio.task_rs_buf,
+                                                 BT_RS_BUF_SAMPLES / (size_t)ch);
+                if (out_n > 0)
+                {
+                    cb(BT_AUDIO_PCM_SOURCE_A2DP, s_bt_audio.task_rs_buf,
+                       out_n * ch, BT_A2DP_TARGET_RATE, ctx);
+                }
             }
         }
         else
         {
-            s_bt_audio.a2dp_rs_rate = rate;   /* 44.1k 原生：相位无意义 */
-            cb(BT_AUDIO_PCM_SOURCE_A2DP, pcm_buf, bytes / sizeof(int16_t), rate, ctx);
+            s_bt_audio.a2dp_rs_rate = src_rate;   /* 44.1k 原生：相位无意义 */
+            cb(BT_AUDIO_PCM_SOURCE_A2DP, pcm_buf, bytes / sizeof(int16_t),
+               src_rate, ctx);
         }
     }
 

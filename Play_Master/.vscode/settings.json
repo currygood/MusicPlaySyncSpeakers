@@ -16,6 +16,6 @@
     "--compile-commands-dir=f:\\EmbeddedProject\\MusicPlaySyncSpeakers\\Play_Master\\build"
 ],
 "idf.flashType": "UART",
-"idf.currentSetup": "D:\\v6.0.3\\v6.0.3\\esp-idf",
-"idf.port": "COM8"
+"idf.currentSetup": "F:\\esp_idf_6.0.1\\esp_tool\\v6.0.1\\esp-idf",
+"idf.port": "COM17"
 }

@@ -23,6 +23,7 @@
  */
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -51,7 +52,11 @@
 #include "light_control.h"
 #include "ui.h"
 
+#define APP_MAIN_LOG (false)
+
+#if APP_MAIN_LOG
 static const char *TAG = "AppMain";
+#endif
 
 /* ======================== 任务就绪事件位 ======================== */
 /* 各模块初始化在独立任务里完成，依赖方用事件组等待上游就绪 */
@@ -150,6 +155,7 @@ static int16_t *s_hfpDnStereoBuf = NULL;
  */
 static void App_Log_Heap(const char *stage)
 {
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "[heap] %s: int free=%u largest=%u | dma free=%u largest=%u | psram free=%u",
              stage,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -157,6 +163,7 @@ static void App_Log_Heap(const char *stage)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+#endif
 }
 
 /**
@@ -173,16 +180,21 @@ static EventBits_t App_Wait_Bits(EventBits_t bits, uint32_t timeout_ms, const ch
     EventBits_t got = xEventGroupWaitBits(s_app.evt, bits, pdFALSE, pdFALSE,
                                           pdMS_TO_TICKS(timeout_ms));
     uint32_t    elapsed_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    (void)elapsed_ms;
     if ((got & bits) == 0)
     {
+#if APP_MAIN_LOG
         ESP_LOGW(TAG, "wait %s timeout after %u ms (%u ms budget)",
                  what, (unsigned)elapsed_ms, (unsigned)timeout_ms);
+#endif
     }
     else
     {
         /* 就绪耗时打点：启动期瓶颈定位（哪个模块/哪段等待拖慢了 UI） */
+#if APP_MAIN_LOG
         ESP_LOGI(TAG, "wait %s ok in %u ms (bits=0x%lx)", what,
                  (unsigned)elapsed_ms, (unsigned long)(got & bits));
+#endif
     }
     return got;
 }
@@ -203,10 +215,12 @@ static bool App_Boot_Task_Create(TaskFunction_t entry, const char *name,
     {
         return true;
     }
+#if APP_MAIN_LOG
     ESP_LOGE(TAG, "[boot] %s create failed (stack=%u, int free=%u largest=%u)",
              name, (unsigned)stack_bytes,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+#endif
     xEventGroupSetBits(s_app.evt, failed_bit);
     return false;
 }
@@ -225,16 +239,24 @@ static void App_Wifi_Evt_Cb(const wifi_mgr_event_t *evt, void *ctx)
     switch (evt->id)
     {
     case WIFI_EVT_CONNECTED:
+#if APP_MAIN_LOG
         ESP_LOGI(TAG, "[wifi] CONNECTED ip=%s rssi=%d", evt->ip, evt->rssi);
+#endif
         break;
     case WIFI_EVT_DISCONNECTED:
+#if APP_MAIN_LOG
         ESP_LOGW(TAG, "[wifi] DISCONNECTED");
+#endif
         break;
     case WIFI_EVT_RECONNECTING:
+#if APP_MAIN_LOG
         ESP_LOGI(TAG, "[wifi] RECONNECTING");
+#endif
         break;
     case WIFI_EVT_IP_CHANGED:
+#if APP_MAIN_LOG
         ESP_LOGI(TAG, "[wifi] IP_CHANGED ip=%s", evt->ip);
+#endif
         break;
     default:
         break;
@@ -252,7 +274,9 @@ static void App_Wifi_Start(void)
     s_app.wifi = wifi_manager_create(&cfg);
     if (s_app.wifi == NULL)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "wifi_manager_create failed");
+#endif
         return;
     }
     wifi_manager_register_event_cb(s_app.wifi, App_Wifi_Evt_Cb, NULL);
@@ -260,10 +284,14 @@ static void App_Wifi_Start(void)
     err = wifi_manager_start(s_app.wifi);
     if (err != ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "wifi_manager_start failed: %s", esp_err_to_name(err));
+#endif
         return;
     }
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "connecting to AP, waiting for IP ...");
+#endif
 
     for (int i = 0; i < APP_WIFI_WAIT_TRIES; i++)
     {
@@ -273,8 +301,10 @@ static void App_Wifi_Start(void)
             size_t ip_len = sizeof(ip);
             if (wifi_manager_get_ip(s_app.wifi, ip, &ip_len) == ESP_OK)
             {
+#if APP_MAIN_LOG
                 ESP_LOGI(TAG, "wifi connected: ip=%s rssi=%d",
                          ip, wifi_manager_get_rssi(s_app.wifi));
+#endif
             }
             xEventGroupSetBits(s_app.evt, APP_EVT_WIFI_READY);
             return;
@@ -282,11 +312,14 @@ static void App_Wifi_Start(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
+#if APP_MAIN_LOG
     ESP_LOGE(TAG, "wait IP timeout (请检查 NVS 中的 SSID/密码)");
+#endif
 }
 
 /* ======================== OTA ======================== */
 
+#if APP_MAIN_LOG
 static const char *App_Ota_Evt_Name(ota_update_event_t evt)
 {
     switch (evt)
@@ -302,6 +335,7 @@ static const char *App_Ota_Evt_Name(ota_update_event_t evt)
     default:                               return "?";
     }
 }
+#endif
 
 /** OTA 事件回调：打印状态/进度（正式 UI 展示后续接入） */
 static void App_Ota_Evt_Cb(const ota_update_event_info_t *info, void *ctx)
@@ -311,9 +345,11 @@ static void App_Ota_Evt_Cb(const ota_update_event_info_t *info, void *ctx)
     {
         return;
     }
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "[ota] %s version=%s progress=%d%% http=%d",
              App_Ota_Evt_Name(info->event), info->version,
              info->progress_percent, info->http_status);
+#endif
 }
 
 /**
@@ -331,19 +367,27 @@ static void App_Ota_Check(void)
     err = OTA_Update_Init(&cfg);
     if (err != ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "OTA_Update_Init failed: %s", esp_err_to_name(err));
+#endif
         return;
     }
 
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "checking OTA ...");
+#endif
     err = OTA_Update_CheckAndUpgrade();
     if (err == ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGI(TAG, "OTA: firmware up to date, continue boot");
+#endif
     }
     else
     {
+#if APP_MAIN_LOG
         ESP_LOGW(TAG, "OTA check failed (%s), continue boot", esp_err_to_name(err));
+#endif
     }
 }
 
@@ -478,10 +522,13 @@ static void App_Bt_Diag_Print(void)
 
     blk_s  = (uint32_t)(((uint64_t)d_blocks  * 1000000ull) / (uint64_t)span_us);
     samp_s = (uint32_t)(((uint64_t)d_samples * 1000000ull) / (uint64_t)span_us);
+    (void)blk_s;
+    (void)samp_s;
 
     if (s_btDiag.raw_ready)
     {
         s_btDiag.raw_ready = false;
+#if APP_MAIN_LOG
         ESP_LOGI(TAG, "[btpcm] raw: %04x %04x %04x %04x %04x %04x %04x %04x "
                       "%04x %04x %04x %04x %04x %04x %04x %04x (n=%u peak=%d)",
                  (unsigned)((uint16_t)s_btDiag.raw[0]),  (unsigned)((uint16_t)s_btDiag.raw[1]),
@@ -493,11 +540,13 @@ static void App_Bt_Diag_Print(void)
                  (unsigned)((uint16_t)s_btDiag.raw[12]), (unsigned)((uint16_t)s_btDiag.raw[13]),
                  (unsigned)((uint16_t)s_btDiag.raw[14]), (unsigned)((uint16_t)s_btDiag.raw[15]),
                  (unsigned)s_btDiag.raw_n, (int)s_btDiag.raw_peak);
+#endif
     }
 
     memset(&st, 0, sizeof(st));
     (void)sync_protocol_master_get_status(&st);
 
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "[btpcm %ums] %u blk/s %u samp/s peak=%d | drop=%u resync=%u un=%u idle=%u gap=%ums | "
                   "sync st=%d %luHz %uch ingress=%u/%u dq=%u tx=%u dropPkt=%u sil=%u",
              (unsigned)(span_us / 1000), blk_s, samp_s,
@@ -511,6 +560,7 @@ static void App_Bt_Diag_Print(void)
              (unsigned)st.ingress_used, (unsigned)APP_BT_INGRESS_CAP,
              (unsigned)st.delay_queue_used, (unsigned)st.tx_pkts,
              (unsigned)st.dropped_pkts, (unsigned)st.silence_frames);
+#endif
 
     s_btDiag.peak_win  = 0;
     s_prev_blocks      = s_btDiag.blocks;
@@ -564,8 +614,10 @@ static void App_Heartbeat_Task(void *arg)
 
     (void)arg;
 
+#if APP_MAIN_LOG
     ESP_LOGW(TAG, "[hb] start: reset_reason=%d (1=poweron 3=sw 4=panic 5=int_wdt 6=task_wdt)",
              (int)esp_reset_reason());
+#endif
 
     for (;;)
     {
@@ -591,6 +643,7 @@ static void App_Heartbeat_Task(void *arg)
         memset(&i2c, 0, sizeof(i2c));
         I2c_Get_Err_Stats(&i2c);
 
+#if APP_MAIN_LOG
         ESP_LOGW(TAG,
                  "[hb] up=%us reset=%d heap=%u psram=%u int=%u/%u | "
                  "a2dp_cb=%u beat=%u fifo=%uB | "
@@ -617,6 +670,7 @@ static void App_Heartbeat_Task(void *arg)
                  (unsigned)i2c.ok_cnt,
                  (unsigned)i2c.reset_cnt,
                  esp_err_to_name(i2c.last_err));
+#endif
     }
 }
 
@@ -656,7 +710,9 @@ static void App_Bt_Pcm_Cb(bt_audio_pcm_source_t source, const int16_t *pcm,
         }
         if (samples > APP_HFP_DN_STEREO_SAMPLES)
         {
+#if APP_MAIN_LOG
             ESP_LOGW(TAG, "HFP mono chunk too large: %u", (unsigned)samples);
+#endif
             return;
         }
         for (size_t i = 0; i < samples; i++)
@@ -699,12 +755,16 @@ static void App_MusicPlay_Task(void *arg)
     bool             bt_ready = false;
     esp_err_t        err;
 
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "[MusicPlay] boot: SD card / mcast / bt_audio / music_play");
+#endif
 
     /* 1) SD 卡（本地播放依赖；失败仅告警，蓝牙源仍可用） */
     if (SD_Card_Init() != ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGW(TAG, "[MusicPlay] SD_Card_Init failed, 本地列表将为空");
+#endif
     }
 
     /* 2) 通道：音频通道只用来**单播**发数据（绑定本机端口，不收）；
@@ -715,7 +775,9 @@ static void App_MusicPlay_Task(void *arg)
     err = wifi_manager_mcast_open(s_app.wifi, &mc, &s_app.audio_chan);
     if (err != ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "[MusicPlay] mcast_open audio failed: %s", esp_err_to_name(err));
+#endif
         goto fail;
     }
 
@@ -726,7 +788,9 @@ static void App_MusicPlay_Task(void *arg)
     err = wifi_manager_mcast_open(s_app.wifi, &mc, &s_app.control_chan);
     if (err != ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "[MusicPlay] mcast_open ctrl failed: %s", esp_err_to_name(err));
+#endif
         goto fail;
     }
 
@@ -737,13 +801,17 @@ static void App_MusicPlay_Task(void *arg)
     s_app.bt = bt_audio_create(&bcfg);
     if (s_app.bt == NULL)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "[MusicPlay] bt_audio_create failed");
+#endif
         goto fail;
     }
     err = bt_audio_start(s_app.bt);
     if (err != ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "[MusicPlay] bt_audio_start failed: %s", esp_err_to_name(err));
+#endif
         goto fail;
     }
 
@@ -761,7 +829,9 @@ static void App_MusicPlay_Task(void *arg)
     s_app.music = music_play_create(&mcfg);
     if (s_app.music == NULL)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "[MusicPlay] music_play_create failed");
+#endif
         goto fail;
     }
 
@@ -769,7 +839,9 @@ static void App_MusicPlay_Task(void *arg)
     music_play_scan_local(s_app.music);
 
     xEventGroupSetBits(s_app.evt, APP_EVT_MUSIC_READY);
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "[MusicPlay] boot done");
+#endif
     vTaskDelete(NULL);
     return;
 
@@ -795,12 +867,16 @@ static void App_LightControl_Task(void *arg)
     light_control_cfg_t lcfg = {0};
     esp_err_t           err;
 
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "[LightControl] boot: waiting for wifi ready ...");
+#endif
     App_Wait_Bits(APP_EVT_WIFI_READY, APP_DEP_WAIT_MS, "wifi ready");
 
     if (s_app.wifi == NULL || !wifi_manager_is_connected(s_app.wifi))
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "[LightControl] wifi not ready, skip");
+#endif
         xEventGroupSetBits(s_app.evt, APP_EVT_LIGHT_FAILED);
         vTaskDelete(NULL);
         return;
@@ -813,7 +889,9 @@ static void App_LightControl_Task(void *arg)
     err = wifi_manager_mcast_open(s_app.wifi, &mc, &s_app.light_chan);
     if (err != ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "[LightControl] mcast_open failed: %s", esp_err_to_name(err));
+#endif
         xEventGroupSetBits(s_app.evt, APP_EVT_LIGHT_FAILED);
         vTaskDelete(NULL);
         return;
@@ -824,13 +902,17 @@ static void App_LightControl_Task(void *arg)
     s_app.light = light_control_create(&lcfg);
     if (s_app.light == NULL)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "[LightControl] light_control_create failed");
+#endif
         xEventGroupSetBits(s_app.evt, APP_EVT_LIGHT_FAILED);
         vTaskDelete(NULL);
         return;
     }
 
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "[LightControl] boot done");
+#endif
     xEventGroupSetBits(s_app.evt, APP_EVT_LIGHT_READY);
     vTaskDelete(NULL);
 }
@@ -846,7 +928,9 @@ static void App_UI_Task(void *arg)
     ui_cfg_t  ucfg = {0};
     esp_err_t err;
 
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "[UI] boot: waiting for module handles ...");
+#endif
     /* 逐个等 READY|FAILED：某模块挂了立刻继续，UI 按占位降级显示；
      * 若只等 READY 位，模块失败会空等满超时导致长时间黑屏 */
     App_Wait_Bits(APP_EVT_MUSIC_READY | APP_EVT_MUSIC_FAILED,
@@ -862,12 +946,16 @@ static void App_UI_Task(void *arg)
     err = ui_init(&ucfg);
     if (err != ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "[UI] ui_init failed: %s", esp_err_to_name(err));
+#endif
         vTaskDelete(NULL);
         return;
     }
     App_Log_Heap("after ui_init");
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "[UI] boot done");
+#endif
     /* UI 任务常驻：进入主题/页面构建 + LVGL 渲染循环（不再返回） */
     ui_run();
 }
@@ -893,11 +981,15 @@ void app_main(void)
 
     if (esp_psram_is_initialized())
     {
+#if APP_MAIN_LOG
         ESP_LOGI(TAG, "PSRAM ready, size=%u bytes", (unsigned)esp_psram_get_size());
+#endif
     }
     else
     {
+#if APP_MAIN_LOG
         ESP_LOGW(TAG, "PSRAM not initialized");
+#endif
     }
 
     /* CPU / Flash 频率打点：解码吞吐（MP3 ~1x@160MHz）与 UI 流畅度直接相关 */
@@ -909,9 +1001,11 @@ void app_main(void)
         {
             cpu_hz = 0;
         }
+#if APP_MAIN_LOG
         ESP_LOGI(TAG, "clk: cpu=%u MHz flash=%s psram=%d MHz",
                  (unsigned)(cpu_hz / 1000000), CONFIG_ESPTOOLPY_FLASHFREQ,
                  CONFIG_SPIRAM_SPEED);
+#endif
     }
 
     /* 2. node_role：wifi_manager 启动时经 node_role_get() 读取 WiFi 凭据 */
@@ -921,7 +1015,9 @@ void app_main(void)
     s_app.evt = xEventGroupCreate();
     if (s_app.evt == NULL)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "event group create failed");
+#endif
         return;
     }
 
@@ -940,7 +1036,9 @@ void app_main(void)
      *    三个模块已移出构建，见 legacy_disabled/README.md）。 */
     if (Amplifier_Init() != ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGE(TAG, "Amplifier_Init failed (无音频输出)");
+#endif
     }
     if (node_role_get(&nr) == ESP_OK)
     {
@@ -958,7 +1056,9 @@ void app_main(void)
     }
     if (s_hfpDnStereoBuf == NULL)
     {
+#if APP_MAIN_LOG
         ESP_LOGW(TAG, "HFP stereo expand buffer alloc failed (通话下行无声)");
+#endif
     }
 
     /*
@@ -987,20 +1087,26 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(50));
     App_Log_Heap("after lc_boot");
 
+#if APP_MAIN_LOG
     ESP_LOGI(TAG, "all boot tasks dispatched");
+#endif
 
     /* 10. 卡死定位心跳：所有引导任务之后才创建，不参与任何启动时序。
      *     创建失败只是少一份诊断，不影响播放功能。 */
     if (xTaskCreatePinnedToCore(App_Heartbeat_Task, "app_hb", 3072,
                                 NULL, 2, NULL, 0) != pdPASS)
     {
+#if APP_MAIN_LOG
         ESP_LOGW(TAG, "heartbeat task create failed (diagnostics only)");
+#endif
     }
 
     /* 9. 新固件确认运行正常：取消自动回滚（仅 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 时生效） */
     if (OTA_Update_MarkAppValid() == ESP_OK)
     {
+#if APP_MAIN_LOG
         ESP_LOGI(TAG, "app marked valid (rollback cancelled)");
+#endif
     }
 
     /* app_main 返回后 IDF 主任务自删，回收其约 4KB 内部栈（内部 RAM 紧张时可观） */

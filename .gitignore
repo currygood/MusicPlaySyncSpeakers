@@ -1,0 +1,10 @@
+# 演示视频体积大，不入库（ProductShow 下的图片保留）
+ProductShow/Video/
+
+# ESP-IDF 构建产物与组件管理器下载内容（由 idf.py 按 dependencies.lock 还原）
+**/build/
+Play_Master/managed_components/
+Play_Slave/managed_components/
+
+# 本地工具缓存
+/.workbuddy/

@@ -1,0 +1,28 @@
+===== tcp_client.c
+62 
+63 /**
+64   * @brief 收到数据时往哪儿送。由 tcp_client_set_rx_handler() 填。
+65   */
+66 static tcp_rx_handler_t s_rx_handler = NULL;
+67 
+68 /**
+69   * @brief    本模块当前是不是"在用"
+70   *
+71   * @note     main.c 切链路时把它置成 false，任务在下一轮发现后自行关闭
+72   *           socket —— 关 socket 的动作【只由任务自己做】，别的任务不碰。
+73   */
+74 static volatile bool s_running = false;
+75 
+76 /**
+===== main.c
+88     /* ② 联网：连热点、断线重连、打印 IP。异步的，返回时还没连上。
+89 
+90           紧跟着的这一句是配网兜底：连 30 次都没成，就由 ap_prov.c 顶上来，
+91           把自己变成一个热点，等人用手机连上来填新凭据。注册得早晚无所谓 ——
+92           真要用到它是几分钟以后的事，不存在"注册晚了第一次没人接"。 */
+93     wifi_sta_init();
+94     wifi_sta_set_giveup_handler(ap_prov_run);
+95 
+96     /* ③ 注册回调 —— 必须在 link_init() 之前：后者会立刻把链路启动起来，
+97           注册晚了第一段到达的数据会因为回调还是 NULL 而被悄悄丢掉。
+98 

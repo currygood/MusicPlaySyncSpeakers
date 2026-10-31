@@ -1,0 +1,15 @@
+
+#esp8266工具链
+/esp8266_toochain
+
+#构建文件
+/build
+/.vscode
+/sdkconfig.old
+
+#doxygen 生成的文档（Doxyfile 本身要提交，生成物不要）
+/html
+/latex
+
+#助手的工作记忆（含本机绝对路径和调试流水账，不该进仓库）
+/.workbuddy

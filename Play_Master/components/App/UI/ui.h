@@ -87,6 +87,24 @@ void ui_run(void);
 void ui_deinit(void);
 
 /**
+ * @brief UI 首帧就绪回调（启动时序用）
+ *
+ * 触发时刻：页面构建完成 + 第一屏真正刷完（LVGL LV_EVENT_REFR_READY）之后，
+ * 只触发一次；若显示异常拿不到 REFR_READY，ui_run 内部 3s 兜底触发。
+ *
+ * 用途：App 在这里才放行 SD 卡音乐自动起播 —— 保证"先出界面，再出声"。
+ *
+ * 上下文：UI_Task，且处于 LVGL 渲染完成事件里。实现必须**非阻塞**
+ * （只投递消息/置事件位），禁止在这个回调里做文件 I/O、解码或阻塞等待。
+ */
+typedef void (*ui_ready_cb_t)(void *ctx);
+
+/**
+ * @brief 注册首帧就绪回调（ui_init 之后、ui_run 之前调用；传 NULL 取消）
+ */
+void ui_set_ready_cb(ui_ready_cb_t cb, void *ctx);
+
+/**
  * @brief 灯控事件接线入口（app_main 创建 LightControl 时把 cfg.on_event 指向本函数）
  *
  * 调用上下文：SmartHome_Task。内部仅入队，由 UI_Task 刷新灯卡片，禁止阻塞。

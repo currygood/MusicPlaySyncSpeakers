@@ -33,14 +33,14 @@
 | `play_mode` | uint8_t（`music_play_mode_t`） | 0（`MUSIC_PLAY_MODE_SEQUENTIAL`） | MusicPlay 播放模式：0 顺序播放、1 单曲循环，UI 修改时写入 |
 | `sync_delay_ms` | uint32_t | 200 | 组播同步延迟 D（ms），掉电恢复 |
 | `audio_sample_rate` | uint32_t | 44100 | 音频采样率，全链路固定 44.1kHz，保留字段 |
-| `multicast_group` | char[16] | `239.0.0.1` | 音频组播地址；固定默认，不提供 UI 修改入口 |
+| `multicast_group` | char[16] | `239.0.0.1` | 通道组地址（用于控制组播）；音频数据面已走单播，不占用该组 |
 
 ### 1.3 说明
 
 - `play_mode`、`version` 字段已并入主文档 §3.4.3 的 `node_role_cfg_t`（blob 结构带 `version` 头），字段顺序与本表一致；
-- 端口号（音频 5678/5679、灯控 8889）为代码常量，不入 NVS；
+- 端口号（音频单播 5680、控制组播 5679、灯控 8889）为代码常量，不入 NVS；
 - `device_name`（蓝牙广播名）不入 NVS，按 `PLAY_MASTER_BT` 自动生成；
-- 开发期默认 WiFi（`HW666` / `ADajLP691TY.`）由 `node_role` 内置默认宏（`NODE_ROLE_DEFAULT_SSID`/`NODE_ROLE_DEFAULT_PASSWORD`）提供并首次落盘，生产默认留空、由触摸屏配网填写；
+- 开发期默认 WiFi 由 `node_role` 内置默认宏（`NODE_ROLE_DEFAULT_SSID`/`NODE_ROLE_DEFAULT_PASSWORD`，值见 `node_role.h`）提供并首次落盘（主从宏值相同）；生产默认留空，由配网流程填写（当前尚无配网 UI）；
 - SD 续播（`last_track_*`）本期不实现，预留后续版本扩展；播放源与播放状态属运行态，不持久化；
 - 配置统一为整体 blob 存储（命名空间 `node_role`、Key `cfg`），NVS 中不单独建键（含 `ota_server_url`）；各业务模块一律经 `node_role_get()` 读取，不直接操作 NVS。
 
@@ -51,19 +51,19 @@
 ### 2.1 存储方式
 
 - 与主节点共用同一份 blob 结构（`node_role_cfg_t`），仅 `role = NODE_ROLE_SLAVE`，命名空间 / Key 相同；
-- 从节点无触摸屏，默认参数经由固件 `defaults` 写入。
+- 从节点无触摸屏、也没有配网 UI，默认参数经由固件 `defaults`（`NODE_ROLE_DEFAULT_*` 宏）首次落盘。
 
 ### 2.2 字段差异说明
 
 | 字段 | 说明 |
 | --- | --- |
 | `role` | 固定 `NODE_ROLE_SLAVE` |
-| `wifi_ssid` / `wifi_password` | 保存；从节点需接入同一局域网（同主节点配网）接收组播 |
-| `ota_server_url` | 保存；从节点同样支持 OTA 升级 |
-| `volume` | 运行期音量由主节点 `SYNC_VOLUME` 同步；该字段仍保留，作为开机初始音量（默认 80） |
-| `sync_delay_ms` | 保存（默认 200），从节点同步算法使用 |
+| `wifi_ssid` / `wifi_password` | 保存；从节点无配网 UI，当前由内置默认值落盘，需与主节点在同一局域网（控制组播 `239.0.0.1:5679`；音频为单播 5680） |
+| `ota_server_url` | 保存（共享结构保留）；从节点 OTA **尚未实现**，`ota_manager` 目前是空壳，仅分区表留了 `ota_0`/`ota_1` 槽位 |
+| `volume` | 运行期音量由主节点控制通道的 4 字节音量帧（`cmd=0x05`）同步；该字段作为开机初始音量，首次落盘取 `NODE_ROLE_DEFAULT_VOLUME`（当前 15） |
+| `sync_delay_ms` | 保存（默认 200）；从节点当前不参与同步换算——提前量以音频包头 `lead_ms` 为准，本字段仅保留 |
 | `play_mode` | 从节点无本地播放源，不使用；共享结构保留，写默认 0 |
-| `audio_sample_rate` / `multicast_group` | 与主节点一致（44100 / `239.0.0.1`） |
+| `audio_sample_rate` / `multicast_group` | 与主节点一致（44100 / `239.0.0.1`）；`multicast_group` 现在只用于控制组播，音频数据面是单播 5680 |
 
 ------
 

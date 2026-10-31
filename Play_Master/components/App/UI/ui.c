@@ -33,6 +33,43 @@ static lv_obj_t *s_pages[UI_PAGE_COUNT] = {0};
 static int64_t s_navT0 = -1;
 static int     s_navPage = -1;
 
+/* ======================== 首帧就绪回调（启动时序） ========================
+ * App 用它来放行 SD 卡自动起播：音乐必须等界面真正出屏之后再响，
+ * 否则开机几秒是"黑屏先出声"。触发点选 REFR_READY（第一屏真正刷完），
+ * 不是"页面对象建完"——建完到刷完还有一整屏的绘制 + SPI 传输（~150ms）。 */
+static ui_ready_cb_t s_readyCb     = NULL;
+static void         *s_readyCtx    = NULL;
+static bool          s_readyFired  = false;
+
+/** 首帧兜底时限：拿不到 REFR_READY（display 未注册/刷屏异常）也不能让音乐永不响 */
+#define UI_READY_FALLBACK_TICKS  300   /* 主循环 10ms 一拍 → 约 3s */
+
+/** 触发首帧就绪回调（只触发一次；调用方保证在 UI_Task 上下文） */
+static void ui_fire_ready(const char *why)
+{
+    ui_ready_cb_t cb = s_readyCb;
+
+    if (s_readyFired)
+    {
+        return;
+    }
+    s_readyFired = true;
+    if (cb == NULL)
+    {
+        return;
+    }
+    /* 用 ESP_LOGI 而不是 UI_LOGI：这条日志是启动时序的唯一观测点，
+     * 不能随 UI_DEBUG_LOGS 一起被关掉（同 ui_log_stack 的做法）。 */
+    ESP_LOGI("UI", "first frame ready (%s): release app start-up gate", why);
+    cb(s_readyCtx);
+}
+
+void ui_set_ready_cb(ui_ready_cb_t cb, void *ctx)
+{
+    s_readyCb  = cb;
+    s_readyCtx = ctx;
+}
+
 const ui_cfg_t *ui_cfg(void)
 {
     return &s_cfg;
@@ -178,6 +215,9 @@ static void ui_on_render_ready(lv_event_t *e)
     uint32_t drawAvg = 0;
     (void)e;
 
+    /* 第一屏真正刷完的这一刻 = UI 可用，放行 App 的启动动作（如 SD 卡起播） */
+    ui_fire_ready("REFR_READY");
+
     if (s_navT0 < 0) {
         return;
     }
@@ -269,6 +309,7 @@ void ui_run(void)
 {
     light_event_t evt;
     music_event_t mevt;
+    uint32_t      readyTicks = 0;   /* 首帧兜底计数（见 UI_READY_FALLBACK_TICKS） */
 
     s_taskHandle = xTaskGetCurrentTaskHandle();
 
@@ -326,6 +367,13 @@ void ui_run(void)
 
     for (;;)
     {
+        /* 首帧兜底：页面已建好但迟迟没有 REFR_READY（display 未注册/刷屏异常），
+         * 到点也要放行，否则 SD 卡音乐永远不会自动响 */
+        if (!s_readyFired && ++readyTicks >= UI_READY_FALLBACK_TICKS)
+        {
+            ui_fire_ready("timeout fallback");
+        }
+
         /* 先排空灯控事件队列（SmartHome_Task 上下文入队），再跑 LVGL */
         while (s_lightEvtQueue != NULL &&
                xQueueReceive(s_lightEvtQueue, &evt, 0) == pdTRUE)

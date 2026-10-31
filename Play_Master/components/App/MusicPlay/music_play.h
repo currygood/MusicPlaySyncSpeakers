@@ -8,6 +8,8 @@
  *     同步控制走 sync_protocol_master_broadcast_cmd() / start/stop/pause/resume；
  *   - 自动源选择：蓝牙优先级最高——内部按 source_poll_ms 轮询 A2DP，
  *     连接→MUSIC_SOURCE_BT，断开→MUSIC_SOURCE_LOCAL（create 后首次轮询即判定）；
+ *     首次自动切到本地源时**不自动起播**，等 App 收到 UI 首帧回调后
+ *     music_play_set_autoplay(true) 放行（启动时序：先出界面，再出声）；
  *   - UI 触摸、自动/手动源选择、手机 AVRCP、本地解码事件都进入同一个事件队列，
  *     由内部 MusicPlay_Task 状态机串行处理；
  *   - 手机与 UI 同时按键时，UI 指令作为"期望"，蓝牙源的最终状态以 bt_audio
@@ -173,6 +175,24 @@ esp_err_t music_play_command(music_play_handle_t player, music_cmd_t cmd);
 
 /* 查询当前播放源（UI 初始化/切页用） */
 music_source_t music_play_get_source(music_play_handle_t player);
+
+/**
+ * @brief 开机自播闸门（启动时序控制）
+ *
+ * 为什么需要：开机时自动源选择在 SD 列表扫描完的第一轮轮询就会落到本地源并
+ * 立刻起播，而 UI 此时还在建页面（整段建页 ~2.5s，首帧还要再刷一屏）——
+ * 结果音乐先响、屏幕还是黑的。本闸门让"自动源选择"只切源不起播：
+ *   create 后默认 false  → 自动源选择照常切到 LOCAL（UI 能正确显示源），
+ *                          但不自动 open/解码第一首；
+ *   App 在 UI 首帧刷完（ui_set_ready_cb 回调）后置 true → 若当前是本地源
+ *                          且没在播，就从 view.track_index 起播。
+ *
+ * 只影响**自动**起播：UI 手动 PLAY / 选曲 / 切源命令一律立即生效，
+ * 蓝牙源（手机推流）也不受闸门约束。
+ *
+ * @param enable true=放行自动起播
+ */
+esp_err_t music_play_set_autoplay(music_play_handle_t player, bool enable);
 
 /* 本地列表 */
 esp_err_t music_play_scan_local(music_play_handle_t player);

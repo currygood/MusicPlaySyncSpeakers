@@ -14,6 +14,13 @@
  *        LightControl : 等 wifi 就绪 → 灯控组播通道 + light_control_create（内部建 SmartHome_Task）
  *        UI           : 等各句柄就绪 → ui_init（LCD/触摸屏，内部建 UI_Task）
  *
+ * 启动时序（播放与显示的顺序，2026-10 调整）：
+ *   音乐模块只做"准备"不做"起播"——SD 卡挂载、蓝牙建链、列表扫描都在 UI 之前完成，
+ *   但自动源选择切到本地源时**不自动播放**（music_play_set_autoplay 闸门默认关闭）。
+ *   UI 页面构建完 + 首帧真正刷完时，ui_run 回调 ui_set_ready_cb 注册的
+ *   App_Ui_Ready_Cb，这里才放行 SD 卡起播。效果：屏幕先亮出播放页，音乐随后响起，
+ *   不再出现"黑屏先出声"。UI 不可用（ui_init 失败/任务建不起来）时直接放行兜底。
+ *
  * 线程/内存约定（见 note/MusicPlay调试笔记.md）：
  *   - main_task 栈仅 3584B，SD/蓝牙/LVGL 等重活一律单独起任务；
  *   - 内部 DRAM 是最稀缺资源（WiFi+BT 已占 ~90KB，见调试笔记 3.1 曲线）：
@@ -131,6 +138,7 @@ typedef struct {
     wifi_mcast_handle_t    light_chan;  /* 灯控通道 239.0.0.2:8889（收发） */
     music_play_handle_t    music;
     light_control_handle_t light;
+    bool                   ui_ready;    /* UI 首帧已出屏（放行 SD 卡自动起播的闸门） */
 } app_ctx_t;
 
 static app_ctx_t s_app;
@@ -838,6 +846,13 @@ static void App_MusicPlay_Task(void *arg)
     /* 5) 开机即扫描本地列表（自动源选择未连蓝牙时落本地源） */
     music_play_scan_local(s_app.music);
 
+    /* UI 首帧可能已经刷完（UI 任务在 mp_boot 之前创建）：补一次闸门放行。
+     * 消息排队在 SCAN 之后，任务上下文按序执行，起播时列表已就绪。 */
+    if (s_app.ui_ready)
+    {
+        (void)music_play_set_autoplay(s_app.music, true);
+    }
+
     xEventGroupSetBits(s_app.evt, APP_EVT_MUSIC_READY);
 #if APP_MAIN_LOG
     ESP_LOGI(TAG, "[MusicPlay] boot done");
@@ -918,6 +933,29 @@ static void App_LightControl_Task(void *arg)
 }
 
 /**
+ * @brief UI 首帧就绪 → 放行 SD 卡自动起播（启动时序：先出界面，再出声）
+ *
+ * 调用上下文：UI_Task 的 LVGL 首帧完成事件（或超时兜底 / UI 不可用降级）。
+ * 这里只投递一条消息给 MusicPlay_Task，不做任何阻塞操作。
+ *
+ * 幂等：MusicPlay 句柄可能还没建好（UI 任务在 mp_boot 之前创建），
+ * 先记 s_app.ui_ready，App_MusicPlay_Task 建好后自己补一次放行。
+ */
+static void App_Ui_Ready_Cb(void *ctx)
+{
+    (void)ctx;
+    s_app.ui_ready = true;
+    if (s_app.music != NULL)
+    {
+        (void)music_play_set_autoplay(s_app.music, true);
+    }
+#if APP_MAIN_LOG
+    ESP_LOGI(TAG, "[UI] ready -> release SD autoplay (music=%s)",
+             (s_app.music != NULL) ? "wired" : "not yet");
+#endif
+}
+
+/**
  * @brief UI 任务：等各模块句柄就绪 → ui_init（LCD / 触摸屏 / LVGL）
  *
  * 未就绪的句柄保持 NULL，UI 按"占位"降级显示；ui_init 内部自建 UI_Task。
@@ -949,10 +987,17 @@ static void App_UI_Task(void *arg)
 #if APP_MAIN_LOG
         ESP_LOGE(TAG, "[UI] ui_init failed: %s", esp_err_to_name(err));
 #endif
+        /* UI 起不来也不能让音乐永远不响：直接放行 SD 卡自动起播 */
+        App_Ui_Ready_Cb(NULL);
         vTaskDelete(NULL);
         return;
     }
     App_Log_Heap("after ui_init");
+
+    /* 启动时序：页面构建 + 首帧刷完（ui_run 内部回调）之后才放行 SD 卡起播。
+     * 注册必须在 ui_run 之前——页面是在 ui_run 里建的。 */
+    ui_set_ready_cb(App_Ui_Ready_Cb, NULL);
+
 #if APP_MAIN_LOG
     ESP_LOGI(TAG, "[UI] boot done");
 #endif
@@ -1068,8 +1113,12 @@ void app_main(void)
      *    任务跑完并退出后再建下一个；依赖 MusicPlay（建蓝牙）→ LightControl
      *    （等 WiFi）。（原 CallPhone 环节随语音唤醒下线一并删除）
      */
-    (void)App_Boot_Task_Create(App_UI_Task, "UI_Task",
-                               APP_UI_TASK_STACK, APP_UI_TASK_PRIO, 0, 0);
+    if (!App_Boot_Task_Create(App_UI_Task, "UI_Task",
+                              APP_UI_TASK_STACK, APP_UI_TASK_PRIO, 0, 0))
+    {
+        /* 连 UI 任务都建不起来（内部 RAM 被切碎）：不留闸门，直接放行起播 */
+        App_Ui_Ready_Cb(NULL);
+    }
 
     (void)App_Boot_Task_Create(App_MusicPlay_Task, "mp_boot",
                                APP_MUSIC_TASK_STACK, APP_MUSIC_TASK_PRIO, 1,

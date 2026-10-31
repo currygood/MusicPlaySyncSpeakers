@@ -135,6 +135,7 @@ typedef enum {
     MUSIC_MSG_SET_VOLUME,     /* 音量 */
     MUSIC_MSG_BT_EVENT,       /* bt_audio 事件（回调线程拷贝入队） */
     MUSIC_MSG_DEC_EVENT,      /* audio_decoder 事件（解码线程拷贝入队） */
+    MUSIC_MSG_SET_AUTOPLAY,   /* 开机自播闸门（UI 首帧后放行自动起播） */
     MUSIC_MSG_DESTROY,        /* 销毁模块 */
 } music_msg_type_t;
 
@@ -147,6 +148,7 @@ typedef struct {
         uint16_t           track_index;
         music_play_mode_t  mode;
         uint8_t            volume;
+        bool               enable;   /* MUSIC_MSG_SET_AUTOPLAY */
         bt_audio_event_t   bt_evt;
         struct {
             audio_decoder_event_id_t id;
@@ -196,6 +198,9 @@ struct music_play_s
     bool              sync_started; /* 当前 sync 流已 start */
     uint32_t          source_poll_ms;   /* 自动源选择轮询间隔（ms） */
     uint32_t          last_src_poll_ms; /* 上次轮询时刻（esp_timer ms；仅任务上下文访问） */
+    bool              autoplay_enabled; /* 自动起播闸门：false 时自动源选择只切源不起播
+                                         * （任务上下文读写；启动时由 UI 首帧回调打开） */
+    bool              autostart_pending;/* 闸门已开但列表还没扫出来，等扫描完再起播 */
 
     QueueHandle_t     cmd_q;
     TaskHandle_t      task;
@@ -247,7 +252,10 @@ static void Music_BT_Enter_Stopped(music_play_handle_t h);
 static void Music_Handle_Bt_Event(music_play_handle_t h,
                                   const bt_audio_event_t *evt);
 
-static void Music_Switch_Source_Msg(music_play_handle_t h, music_source_t src);
+static void Music_Switch_Source_Msg(music_play_handle_t h, music_source_t src,
+                                    bool autostart);
+static void Music_Set_Autoplay_Msg(music_play_handle_t h, bool enable);
+static void Music_Try_Autostart(music_play_handle_t h);
 static void Music_Poll_Source(music_play_handle_t h);
 static void Music_Scan_Local_Msg(music_play_handle_t h);
 static void Music_Handle_Msg(music_play_handle_t h, const music_msg_t *msg);
@@ -1176,8 +1184,13 @@ static void Music_Cmd_Local(music_play_handle_t h, music_cmd_t cmd)
 
 /* ==================== 源切换 / 扫描 ============================ */
 
-/** 源切换（手动指令与自动轮询共用）：停旧源 → 切状态 → 起新源 */
-static void Music_Switch_Source_Msg(music_play_handle_t h, music_source_t src)
+/** 源切换（手动指令与自动轮询共用）：停旧源 → 切状态 → 起新源
+ *
+ * @param autostart 切到本地源后是否自动 open 第一首：
+ *                  手动指令/选曲传 true；开机首轮自动轮询传 h->autoplay_enabled
+ *                  （UI 还没出屏时不起播，见 music_play_set_autoplay） */
+static void Music_Switch_Source_Msg(music_play_handle_t h, music_source_t src,
+                                    bool autostart)
 {
     if (src != MUSIC_SOURCE_BT && src != MUSIC_SOURCE_LOCAL)
     {
@@ -1221,9 +1234,18 @@ static void Music_Switch_Source_Msg(music_play_handle_t h, music_source_t src)
 
     if (src == MUSIC_SOURCE_LOCAL && h->track_count > 0)
     {
-        uint16_t idx = (h->view.track_index < h->track_count)
-                           ? h->view.track_index : 0;
-        Music_Start_Local_Track(h, idx);
+        if (autostart)
+        {
+            uint16_t idx = (h->view.track_index < h->track_count)
+                               ? h->view.track_index : 0;
+            Music_Start_Local_Track(h, idx);
+        }
+        else
+        {
+            /* 闸门未开（开机 UI 还没出屏）：只切源，保持 IDLE 等放行。
+             * UI 读到的 source 已是 LOCAL，界面不会显示"无源"占位。 */
+            MUSIC_PLAY_LOGI( "switch to LOCAL: autoplay gated (wait UI ready)");
+        }
     }
     else if (src == MUSIC_SOURCE_BT && h->cfg.bt_audio != NULL)
     {
@@ -1237,11 +1259,61 @@ static void Music_Switch_Source_Msg(music_play_handle_t h, music_source_t src)
 }
 
 /**
+ * @brief 闸门放行后的「该播就播」检查
+ *
+ * 只在三种条件同时成立时起播：闸门已开、当前本地源、既没在播也没暂停
+ * （用户抢先点了播放 / 蓝牙推流时不打断）。
+ */
+static void Music_Try_Autostart(music_play_handle_t h)
+{
+    uint16_t idx;
+
+    if (!h->autoplay_enabled || h->view.source != MUSIC_SOURCE_LOCAL ||
+        h->track_count == 0)
+    {
+        return;
+    }
+    if (h->view.state == MUSIC_STATE_PLAYING || h->view.state == MUSIC_STATE_PAUSED)
+    {
+        return;
+    }
+
+    idx = (h->view.track_index < h->track_count) ? h->view.track_index : 0;
+    MUSIC_PLAY_LOGI( "autoplay released (UI ready): start track[%u]", idx);
+    Music_Start_Local_Track(h, idx);
+}
+
+/**
+ * @brief 放行开机自动起播（UI 首帧刷完后由 App 调用，经队列进任务上下文）
+ *
+ * 列表还没扫出来时只记一笔 pending，由 Music_Scan_Local_Msg 扫完后接着起播
+ * （两个线程各自入队，SET_AUTOPLAY 可能先于 SCAN 被处理，不能假设顺序）。
+ */
+static void Music_Set_Autoplay_Msg(music_play_handle_t h, bool enable)
+{
+    h->autoplay_enabled = enable;
+    if (!enable)
+    {
+        h->autostart_pending = false;
+        return;
+    }
+    if (h->track_count == 0)
+    {
+        h->autostart_pending = true;
+        MUSIC_PLAY_LOGI( "autoplay released, but playlist not scanned yet: pending");
+        return;
+    }
+    Music_Try_Autostart(h);
+}
+
+/**
  * @brief 自动源选择轮询（原 PlayMode 3.3.4 并入）：蓝牙优先级最高
  *
  * A2DP 连接→MUSIC_SOURCE_BT，断开→MUSIC_SOURCE_LOCAL；仅在源变化时切换。
  * 任务循环每 tick 调用一次，内部按 source_poll_ms 限频（create 后首次即判定，
  * 因此开机时未连蓝牙会自动落到本地源）。轮询失败发 MUSIC_EVT_ERROR。
+ *
+ * 首次落到本地源时是否起播由 autoplay_enabled 决定（启动时序：先出 UI 再出声）。
  */
 static void Music_Poll_Source(music_play_handle_t h)
 {
@@ -1268,7 +1340,8 @@ static void Music_Poll_Source(music_play_handle_t h)
         MUSIC_PLAY_LOGI( "auto switch: a2dp %s -> source %s",
                  info.connected ? "connected" : "disconnected",
                  (want == MUSIC_SOURCE_BT) ? "BT" : "LOCAL");
-        Music_Switch_Source_Msg(h, want);
+        Music_Switch_Source_Msg(h, want,
+                                (want == MUSIC_SOURCE_BT) ? true : h->autoplay_enabled);
     }
 }
 
@@ -1397,6 +1470,13 @@ done:
     MUSIC_PLAY_LOGI( "scan: %u tracks under %s", count, MP_MUSIC_DIR);
     Music_Emit(h, MUSIC_EVT_PLAYLIST_CHANGED);
     Music_Publish_View(h);
+
+    /* 闸门已开但当时列表还没扫出来：现在补起播（一次性） */
+    if (h->autostart_pending)
+    {
+        h->autostart_pending = false;
+        Music_Try_Autostart(h);
+    }
 }
 
 /* ==================== 消息处理与任务 ============================ */
@@ -1435,7 +1515,8 @@ static void Music_Handle_Msg(music_play_handle_t h, const music_msg_t *msg)
         break;
 
     case MUSIC_MSG_SWITCH_SOURCE:
-        Music_Switch_Source_Msg(h, msg->u.source);
+        /* UI 手动切源 = 明确的用户意图，闸门不拦 */
+        Music_Switch_Source_Msg(h, msg->u.source, true);
         break;
 
     case MUSIC_MSG_SCAN:
@@ -1458,7 +1539,7 @@ static void Music_Handle_Msg(music_play_handle_t h, const music_msg_t *msg)
                 h->view.track_index = msg->u.track_index;
                 h->view.track       = &h->tracks[msg->u.track_index];
                 xSemaphoreGive(h->lock);
-                Music_Switch_Source_Msg(h, MUSIC_SOURCE_LOCAL);
+                Music_Switch_Source_Msg(h, MUSIC_SOURCE_LOCAL, true);
             }
             else
             {
@@ -1526,6 +1607,10 @@ static void Music_Handle_Msg(music_play_handle_t h, const music_msg_t *msg)
         {
             Music_On_Local_Error(h);
         }
+        break;
+
+    case MUSIC_MSG_SET_AUTOPLAY:
+        Music_Set_Autoplay_Msg(h, msg->u.enable);
         break;
 
     case MUSIC_MSG_DESTROY:
@@ -1636,6 +1721,9 @@ music_play_handle_t music_play_create(const music_play_cfg_t *cfg)
     h->view.track_count = 0;
     h->view.track       = NULL;
     h->view.pending_cmd = false;
+    /* 开机自播闸门默认关闭：自动源选择仍会切到本地源，但不起播；
+     * App 在 UI 首帧刷完后调 music_play_set_autoplay(true) 放行 */
+    h->autoplay_enabled = false;
     Amplifier_Set_Volume(volume);
 
     /* sync_protocol 由本模块接管初始化/反初始化 */
@@ -1777,6 +1865,21 @@ esp_err_t music_play_command(music_play_handle_t player, music_cmd_t cmd)
     memset(&msg, 0, sizeof(msg));
     msg.type  = MUSIC_MSG_CMD;
     msg.u.cmd = cmd;
+    return (xQueueSend(player->cmd_q, &msg, pdMS_TO_TICKS(MP_QUEUE_TIMEOUT_MS))
+            == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t music_play_set_autoplay(music_play_handle_t player, bool enable)
+{
+    music_msg_t msg;
+
+    if (player == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.type     = MUSIC_MSG_SET_AUTOPLAY;
+    msg.u.enable = enable;
     return (xQueueSend(player->cmd_q, &msg, pdMS_TO_TICKS(MP_QUEUE_TIMEOUT_MS))
             == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
 }

@@ -1,0 +1,59 @@
+#The partition table must strictly adhere to two principles:
+#1. It must be entirely in English. 2. The annotations should be on a separate line.
+
+# Name,   Type, SubType, Offset,   Size, Flags
+#
+# Custom 1MB layout for ESP-01S. Single app slot, no OTA.
+#
+# WHY 1MB AND NOT 2MB:
+#   This board was configured for 2MB for a long time, and the SDK happily
+#   agreed - because spi_flash_get_chip_size() does NOT probe the chip, it
+#   just returns CONFIG_SPI_FLASH_SIZE (spi_flash.c:67-74). So the "2MB
+#   external flash" line in the boot log was echoing sdkconfig back at us.
+#   The real chip answers 0x14 to a JEDEC RDID (0x9F) command, which is 1MB:
+#       esptool.py --port COM8 flash_id
+#       -> Manufacturer: 68, Device: 4014, Detected flash size: 1MB
+#
+#   With a 2MB config on 1MB silicon, ota_1 sat at 0x108000 - past the end of
+#   the chip. A 1MB flash only decodes A0-A19, so the erase address aliased:
+#       0x108000 & 0xFFFFF = 0x008000
+#   which is this partition table. The erase then ran upward and wiped nvs,
+#   otadata, phy_init and ~95% of the running app, crashing the chip.
+#
+#   The guard in spi_flash_erase_sector() (spi_flash.c:465) compares the
+#   sector number against chip_size / sector_size - both of which come from
+#   the same wrong config. It validated the mistake against itself.
+#
+# WHY NO OTA / NO SECOND SLOT:
+#   Two app slots do not fit here, either way you cut them:
+#     - halve the 960KB available for apps -> 480KB per slot
+#     - Espressif's own 1MB dual-OTA table
+#       (components/partition_table/partitions_two_ota.1MB.csv) -> 448KB
+#         per slot, tighter still because otadata takes a slice
+#   The firmware measures 496448 bytes (~485KB) as of 2026-09-29, and that
+#   build has NO OTA in it. So "does not fit" holds without even counting the
+#   OTA code itself - putting ota.c back only makes the number bigger, and a
+#   slot has to hold the whole firmware, upgrade code included.
+#   OTA is a way to replace the firmware over the network; it is NOT how you
+#   change WiFi credentials. Credentials live in nvs and can be pushed over
+#   TCP while the node is reachable, or rewritten from its own setup web page
+#   when it is not (main/ap_prov.c, entered after 30 failed reconnects).
+#
+# Layout (offset + size == next offset, and the last entry ends at 0x100000):
+#
+#   0x000000  bootloader         32K  (implicit, not listed here)
+#   0x008000  partition table     4K  (implicit, not listed here)
+#   0x009000  nvs                24K
+#   0x00F000  phy_init            4K
+#   0x010000  factory/app       960K  <- the only app slot
+#   0x100000  end of 1MB flash         (0x10000 + 0xF0000 = 0x100000)
+#
+# nvs is 24K because it holds two things: the WiFi driver's PHY calibration
+# data, and our own SSID/password (namespace "app_cfg"). It is kept at the
+# same span the old 2MB table used for nvs+otadata, so nothing shifts.
+#
+nvs,       data, nvs,     0x9000,   0x6000,
+phy_init,  data, phy,     0xf000,   0x1000,
+# Single app slot. SubType "factory" (not "ota_0") - with no otadata
+# partition the bootloader boots factory directly, no boot-selection logic.
+app,       app,  factory, 0x10000,  0xF0000,

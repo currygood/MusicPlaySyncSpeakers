@@ -98,6 +98,7 @@
 | [`docs/05-用户`](docs/05-用户) | 操作手册、配网与灯控、故障排查 |
 | [`docs/07-许可`](docs/07-许可) | 第三方组件许可与修改记录 |
 | [`note/`](note) | 调试笔记：蓝牙、I2S、功放、触摸、电源那些事 |
+| [`LightControl/`](LightControl) | 灯控固件（ESP-01S）：独立工程，编译与配网说明看它的 README |
 
 ## 三个组件名称
 
@@ -105,11 +106,11 @@
 
 从节点：Play_Slave
 
-灯控：LightConrol
+灯控：LightControl（ESP-01S）
 
 ## 快速开始
 
-需要 **ESP-IDF 6.0.1**，两个工程分别编译：
+### 主节点 / 从节点（ESP-IDF 6.0.1）
 
 ```bash
 # 主节点
@@ -121,13 +122,32 @@ cd Play_Slave && idf.py set-target esp32s3 && idf.py build flash monitor
 
 烧之前把 `node_role` 里的默认 Wi-Fi 名和密码改成自己家的（两个工程要一致，代码里现在是开发期的测试值）。音乐放 SD 卡 `/music` 下，只认 `.mp3`。
 
-完整步骤见 [`docs/03-开发/音频节点构建与烧录指南.md`](docs/03-开发/音频节点构建与烧录指南.md)。
+音频节点的完整步骤见 [`docs/03-开发/音频节点构建与烧录指南.md`](docs/03-开发/音频节点构建与烧录指南.md)。
+
+### 灯控节点（ESP-01S，另一套工具链）
+
+灯控**不是** ESP-IDF 工程，是冻结的 **ESP8266_RTOS_SDK v3.4** + `xtensa-lx106-elf` 交叉编译器，只能在 MSYS2 的 `mingw32.exe` 里编（Git Bash / PowerShell 里没有工具链）：
+
+```bash
+cd LightControl
+make menuconfig                          # 串口在这里设，形如 //./COM8
+make -j10                                # 编译
+make ESPPORT=COM8 ESPBAUD=921600 flash   # 烧录（COM8 换成你自己的口）
+make monitor                             # 串口监视器，74880 波特率，Ctrl+] 退出
+```
+
+- 板子是 **ESP-01S（ESP8266，1MB Flash）**，分区表用 `partitions_1mb.csv`（单 app 槽，没有 OTA）；
+- **下载模式**：GPIO0 接地；**运行模式**：GPIO0 悬空；
+- Wi-Fi 凭据存在 NVS，烧一次之后发 `wifi <SSID>,<密码>` 命令就能换网，不用重烧；连不上会自动开热点进配网模式。
+
+工具链放哪、32 位 Python 和 `setuptools < 71` 这些环境细节见 [`LightControl/README.md`](LightControl/README.md)。
 
 ## 已知限制
 
-- **还没有配网界面**，换 Wi-Fi 得改代码重新烧
+- **主从节点还没有配网界面**，换 Wi-Fi 得改 `node_role` 重新烧（灯控有 AP 配网，不受此限）
 - **一个主节点一套网**，不支持多个主节点组大网
 - **从节点 OTA 还没接上**，升级要插线
+- **灯控也不支持 OTA**，1MB Flash 放不下双槽，换固件要插线
 - **灯控是继电器**，只能开 / 关，调不了亮度，目前只接了一盏
 
 ## 许可
@@ -151,3 +171,9 @@ cd Play_Slave && idf.py set-target esp32s3 && idf.py build flash monitor
 - [ESP-IDF](https://github.com/espressif/esp-idf) — 框架与协议栈
 
 > 本项目为个人学习与验证性质，硬件与音质未做产品级认证；自行复刻请注意功放供电与散热。
+
+## 项目版本：
+
+> data:2026-10-31
+
+0.1
